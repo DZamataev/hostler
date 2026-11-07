@@ -1,17 +1,22 @@
 //! The shared client of the hostler service (plan Task 6). It reports failures as
 //! `HostlerError`s; the policy of what to do about them (e.g. heavy fail-open) lives in callers.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use interprocess::local_socket::tokio::{Stream, prelude::*};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use zeroize::Zeroizing;
 
 use crate::contract::wire::{ClientFrame, Event, Request, ServerFrame};
 use crate::contract::{CONTRACT_VERSION, ErrorCode, HostlerError};
@@ -22,6 +27,10 @@ use crate::service::server::{MAX_FRAME_BYTES, socket_name};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// `secrets.unlock`: the KDF of opening (or creating) the database, maybe calibrated to seconds.
+pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Methods that may open, re-read or save the KDBX (one KDF each).
+pub const VAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// The whole start-and-retry window of `connect_or_start`, every attempt included.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const START_RETRY_EVERY: Duration = Duration::from_millis(100);
@@ -29,14 +38,46 @@ const START_RETRY_EVERY: Duration = Duration::from_millis(100);
 /// (keeping only the newest) but still reads our requests.
 const FRAME_BUFFER: usize = 64;
 
-type Incoming = Result<ServerFrame, HostlerError>;
+/// What the background reader hands the client.
+enum Incoming {
+    Frame(ServerFrame),
+    /// The raw answer line to a call registered as sensitive; never parsed into a `Value`.
+    Sensitive(u64, Zeroizing<String>),
+}
+
+type Item = Result<Incoming, HostlerError>;
+
+/// Ids of every sensitive call made on this connection. They are never removed: a late or a
+/// duplicated answer is still routed as raw and erased, never parsed into a `Value`.
+type SensitiveIds = Arc<Mutex<HashSet<u64>>>;
+
+/// `sensitive_answer` for a typed request: these answers carry values.
+fn answer_is_sensitive(req: &Request) -> bool {
+    matches!(req, Request::SecretMaterialize(_))
+}
+
+/// How long a call may wait for its answer.
+pub fn call_bound(req: &Request) -> Duration {
+    match req {
+        Request::SecretsUnlock(_) => UNLOCK_TIMEOUT,
+        Request::SecretList { .. }
+        | Request::SecretSet(_)
+        | Request::SecretRemove { .. }
+        | Request::SecretImport(_)
+        | Request::SecretRequest(_)
+        | Request::SecretShare(_)
+        | Request::SecretMaterialize(_) => VAULT_CALL_TIMEOUT,
+        _ => CALL_TIMEOUT,
+    }
+}
 
 pub struct Client {
     writer: FramedWrite<WriteHalf<Stream>, LinesCodec>,
     /// Filled by a background reader that keeps draining the socket while we write, so a large
     /// request and a large pushed snapshot never wait on each other.
-    frames: mpsc::Receiver<Incoming>,
+    frames: mpsc::Receiver<Item>,
     reader: JoinHandle<()>,
+    sensitive: SensitiveIds,
     /// The first transport error; every later read reports it again.
     broken: Option<HostlerError>,
     next_id: u64,
@@ -68,10 +109,63 @@ pub fn socket_display(socket: &SocketName) -> String {
     }
 }
 
+/// How the reader routes a line.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// An answer to a sensitive call: forwarded raw, never parsed into a frame.
+    Sensitive(u64),
+    /// An event, or an answer to an ordinary call.
+    Frame,
+    /// After a sensitive call, a line that is neither of the above: truncated, an answer
+    /// (`result`/`error`) without a numeric id (missing, `null`, a string, duplicated), or no
+    /// envelope at all. It may hold values, so it is never handed to the frame parser.
+    Unreadable,
+}
+
+/// Whether a key is in the envelope at all — `null` included; its payload is skipped unread.
+#[derive(Default)]
+struct Present(bool);
+
+impl<'de> Deserialize<'de> for Present {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| Present(true))
+    }
+}
+
+/// Routes by the envelope's shape and id only; no payload is ever built.
+fn route(ids: &SensitiveIds, line: &str) -> Route {
+    #[derive(Deserialize)]
+    struct Head {
+        id: Option<u64>,
+        #[serde(default)]
+        result: Present,
+        #[serde(default)]
+        error: Present,
+        #[serde(default)]
+        event: Present,
+    }
+    let ids = ids.lock().unwrap_or_else(PoisonError::into_inner);
+    if ids.is_empty() {
+        return Route::Frame;
+    }
+    let Ok(head) = serde_json::from_str::<Head>(line) else {
+        return Route::Unreadable;
+    };
+    match head.id {
+        Some(id) if ids.contains(&id) => Route::Sensitive(id),
+        // An answer to an ordinary call.
+        Some(_) if head.result.0 || head.error.0 => Route::Frame,
+        // An event: no id, no answer keys.
+        None if head.event.0 && !head.result.0 && !head.error.0 => Route::Frame,
+        _ => Route::Unreadable,
+    }
+}
+
 async fn read_frames(
     mut reader: FramedRead<ReadHalf<Stream>, LinesCodec>,
-    tx: mpsc::Sender<Incoming>,
+    tx: mpsc::Sender<Item>,
     socket: SocketName,
+    sensitive: SensitiveIds,
 ) {
     loop {
         let item = match reader.next().await {
@@ -85,13 +179,23 @@ async fn read_frames(
                 format!("reading from the service failed: {e}"),
                 &socket,
             )),
-            Some(Ok(line)) => serde_json::from_str(&line).map_err(|e| {
-                unavailable(
-                    "protocol",
-                    format!("unreadable frame from the service: {e}"),
-                    &socket,
-                )
-            }),
+            Some(Ok(line)) => {
+                // Erased once routed: after a sensitive call any line may carry values.
+                let line = Zeroizing::new(line);
+                match route(&sensitive, &line) {
+                    Route::Sensitive(id) => Ok(Incoming::Sensitive(id, line)),
+                    Route::Unreadable => Err(unreadable_answer()),
+                    Route::Frame => serde_json::from_str(&line)
+                        .map(Incoming::Frame)
+                        .map_err(|e| {
+                            unavailable(
+                                "protocol",
+                                format!("unreadable frame from the service: {e}"),
+                                &socket,
+                            )
+                        }),
+                }
+            }
         };
         let last = item.is_err();
         if tx.send(item).await.is_err() || last {
@@ -140,15 +244,18 @@ impl Client {
         };
         let (recv, send) = tokio::io::split(stream);
         let (tx, frames) = mpsc::channel(FRAME_BUFFER);
+        let sensitive = SensitiveIds::default();
         let reader = tokio::spawn(read_frames(
             FramedRead::new(recv, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
             tx,
             socket.clone(),
+            sensitive.clone(),
         ));
         Ok(Client {
             writer: FramedWrite::new(send, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
             frames,
             reader,
+            sensitive,
             broken: None,
             next_id: 1,
             event: None,
@@ -251,15 +358,56 @@ impl Client {
         Err(error)
     }
 
-    /// Sends one request and waits up to 5 s for its answer.
+    /// Sends one request and waits for its answer within `call_bound`.
+    /// `sensitive_answer` methods are refused without sending anything: their answers go
+    /// through `call_sensitive` only.
     pub async fn call(&mut self, req: Request) -> Result<Value, HostlerError> {
-        self.call_within(req, CALL_TIMEOUT).await
+        if answer_is_sensitive(&req) {
+            return Err(wrong_call_path(
+                "this method's answer carries secret values; use Client::call_sensitive",
+            ));
+        }
+        let limit = call_bound(&req);
+        self.call_within(req, limit).await
+    }
+
+    /// For `sensitive_answer` methods only (others are refused without sending anything): the
+    /// answer line is decoded straight into `T`, never into a `Value`; an undecodable answer
+    /// gets a fixed text (serde's quotes the input).
+    pub async fn call_sensitive<T: DeserializeOwned>(
+        &mut self,
+        req: Request,
+    ) -> Result<T, HostlerError> {
+        if !answer_is_sensitive(&req) {
+            return Err(wrong_call_path(
+                "this method's answer carries no secret values; use Client::call",
+            ));
+        }
+        let limit = call_bound(&req);
+        match self.round_trip(req, limit, true).await? {
+            Answer::Raw(line) => decode_sensitive(&line),
+            Answer::Value(_) => Err(unreadable_answer()),
+        }
     }
 
     async fn call_within(&mut self, req: Request, limit: Duration) -> Result<Value, HostlerError> {
+        match self.round_trip(req, limit, false).await? {
+            Answer::Value(value) => Ok(value),
+            Answer::Raw(_) => Err(unreadable_answer()),
+        }
+    }
+
+    async fn round_trip(
+        &mut self,
+        req: Request,
+        limit: Duration,
+        sensitive: bool,
+    ) -> Result<Answer, HostlerError> {
         let id = self.next_id;
         self.next_id += 1;
+        // The frame may carry a value (unlock, set, import): erased once sent.
         let frame = serde_json::to_string(&ClientFrame { id, request: req })
+            .map(Zeroizing::new)
             .map_err(|e| bad_request(format!("cannot encode the request: {e}")))?;
         if frame.len() > MAX_FRAME_BYTES {
             return Err(bad_request(format!(
@@ -267,7 +415,13 @@ impl Client {
                 frame.len()
             )));
         }
-        match timeout(limit, self.exchange(id, frame)).await {
+        if sensitive {
+            self.sensitive
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id);
+        }
+        match timeout(limit, self.exchange(id, &frame)).await {
             Ok(result) => result,
             Err(_) => Err(unavailable(
                 "timeout",
@@ -277,7 +431,7 @@ impl Client {
         }
     }
 
-    async fn exchange(&mut self, id: u64, frame: String) -> Result<Value, HostlerError> {
+    async fn exchange(&mut self, id: u64, frame: &str) -> Result<Answer, HostlerError> {
         if let Err(e) = self.writer.send(frame).await {
             return Err(unavailable(
                 "io",
@@ -287,16 +441,21 @@ impl Client {
         }
         loop {
             match self.read_frame().await? {
-                ServerFrame::Response { id: got, result } if got == id => return Ok(result),
-                ServerFrame::Error { id: got, error } if got == id => return Err(error),
-                ServerFrame::Event { event } => self.event = Some(event),
-                // A late answer to a call that timed out earlier.
+                Incoming::Frame(ServerFrame::Response { id: got, result }) if got == id => {
+                    return Ok(Answer::Value(result));
+                }
+                Incoming::Frame(ServerFrame::Error { id: got, error }) if got == id => {
+                    return Err(error);
+                }
+                Incoming::Sensitive(got, line) if got == id => return Ok(Answer::Raw(line)),
+                Incoming::Frame(ServerFrame::Event { event }) => self.event = Some(event),
+                // A late answer to a call that timed out earlier (a sensitive one is erased).
                 _ => {}
             }
         }
     }
 
-    async fn read_frame(&mut self) -> Result<ServerFrame, HostlerError> {
+    async fn read_frame(&mut self) -> Result<Incoming, HostlerError> {
         if let Some(e) = &self.broken {
             return Err(e.clone());
         }
@@ -321,7 +480,7 @@ impl Client {
         }
         loop {
             match self.read_frame().await {
-                Ok(ServerFrame::Event { event }) => return Some(event),
+                Ok(Incoming::Frame(ServerFrame::Event { event })) => return Some(event),
                 Ok(_) => {}
                 Err(_) => return None,
             }
@@ -373,6 +532,50 @@ fn manager_start_failed(e: anyhow::Error, paths: &Paths) -> HostlerError {
     );
     error.recovery = Some("hostler service status".into());
     error
+}
+
+/// A call's answer: parsed, or the raw line of a sensitive one.
+enum Answer {
+    Value(Value),
+    Raw(Zeroizing<String>),
+}
+
+/// `{"id":…,"result":T}` or `{"id":…,"error":…}`, without ever building a `Value`.
+fn decode_sensitive<T: DeserializeOwned>(line: &str) -> Result<T, HostlerError> {
+    #[derive(Deserialize)]
+    struct Frame<T> {
+        result: Option<T>,
+        error: Option<HostlerError>,
+    }
+    match serde_json::from_str::<Frame<T>>(line) {
+        Ok(Frame {
+            result: Some(result),
+            error: None,
+        }) => Ok(result),
+        Ok(Frame {
+            result: None,
+            error: Some(error),
+        }) => Err(error),
+        _ => Err(unreadable_answer()),
+    }
+}
+
+fn wrong_call_path(message: &str) -> HostlerError {
+    HostlerError {
+        code: ErrorCode::Internal,
+        message: message.into(),
+        details: json!({}),
+        recovery: None,
+    }
+}
+
+fn unreadable_answer() -> HostlerError {
+    HostlerError {
+        code: ErrorCode::Internal,
+        message: "unreadable answer from the service".into(),
+        details: json!({}),
+        recovery: None,
+    }
 }
 
 fn bad_request(message: String) -> HostlerError {
@@ -561,9 +764,11 @@ fn spawn_service(exe: &Path, paths: &Paths) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-        DETACHED_PROCESS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
     let exe: Vec<u16> = exe.as_os_str().encode_wide().collect();
@@ -583,27 +788,42 @@ fn spawn_service(exe: &Path, paths: &Paths) -> std::io::Result<()> {
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: NUL-terminated, writable command line; NUL-terminated cwd; a double-NUL
-    // terminated UTF-16 environment block (CREATE_UNICODE_ENVIRONMENT); valid in/out structs.
-    let created = unsafe {
-        CreateProcessW(
-            std::ptr::null(),
-            command_line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            DETACHED_PROCESS
-                | CREATE_NO_WINDOW
-                | CREATE_NEW_PROCESS_GROUP
-                | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            cwd.as_ptr(),
-            &startup,
-            &mut info,
-        )
-    } != 0;
+    let base =
+        DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+    // Break away from the caller's job first: a kill-on-close job (an OpenSSH session, some IDE
+    // terminals) would otherwise end the service — and an unlocked secrets database — with the
+    // session (W-5). A job that forbids breakaway answers ACCESS_DENIED: start inside it then.
+    let mut created = false;
+    for flags in [base | CREATE_BREAKAWAY_FROM_JOB, base] {
+        // SAFETY: NUL-terminated, writable command line; NUL-terminated cwd; a double-NUL
+        // terminated UTF-16 environment block (CREATE_UNICODE_ENVIRONMENT); valid in/out
+        // structs.
+        created = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                flags,
+                environment.as_ptr().cast(),
+                cwd.as_ptr(),
+                &startup,
+                &mut info,
+            )
+        } != 0;
+        if created {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) || flags == base {
+            return Err(error);
+        }
+    }
     if !created {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::other(
+            "the hostler service could not be started",
+        ));
     }
     // SAFETY: both handles were returned open by CreateProcessW and are closed once; closing
     // them does not affect the detached process.
@@ -712,5 +932,289 @@ mod tests {
             environment_block(Vec::new(), &wide("h")),
             wide("HOSTLER_HOME=h\0\0")
         );
+    }
+
+    fn project() -> crate::contract::secrets::ProjectRef {
+        crate::contract::secrets::ProjectRef {
+            common_dir: "/work/app/.git".into(),
+            name: "app".into(),
+        }
+    }
+
+    #[test]
+    fn call_bound_per_method() {
+        use crate::contract::secrets::{SecretSet, Unlock};
+        use crate::secrets::value::SecretValue;
+        let unlock = Request::SecretsUnlock(Unlock {
+            password: SecretValue::new("pw-12345".into()),
+            key_file: None,
+            forget_key_file: false,
+            create: false,
+        });
+        assert_eq!(call_bound(&unlock), Duration::from_secs(120));
+        let set = Request::SecretSet(SecretSet {
+            project: project(),
+            name: "API_KEY".into(),
+            value: SecretValue::new("value-1".into()),
+        });
+        assert_eq!(call_bound(&set), Duration::from_secs(60));
+        let list = Request::SecretList {
+            project: project(),
+            declared: Vec::new(),
+        };
+        assert_eq!(call_bound(&list), VAULT_CALL_TIMEOUT);
+        assert_eq!(call_bound(&Request::SecretRequests), Duration::from_secs(5));
+        assert_eq!(call_bound(&Request::QueueSnapshot), CALL_TIMEOUT);
+        assert_eq!(call_bound(&Request::SecretsStatus), CALL_TIMEOUT);
+    }
+
+    /// A one-connection service stand-in: answers `hello`, then, for each request it reads,
+    /// waits the given time and writes the next answer (which may hold several lines). Returns
+    /// the methods of the requests it read after `hello`.
+    async fn fake_service(
+        listener: interprocess::local_socket::tokio::Listener,
+        answers: Vec<(Duration, String)>,
+    ) -> Vec<String> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = listener.accept().await.unwrap();
+        let (recv, mut send) = tokio::io::split(stream);
+        let mut lines = BufReader::new(recv).lines();
+        let hello = lines.next_line().await.unwrap().unwrap();
+        assert!(hello.contains("\"hello\""), "{hello}");
+        send.write_all(
+            b"{\"id\":1,\"result\":{\"contract_version\":2,\"service_version\":\"t\"}}\n",
+        )
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        for (delay, answer) in answers {
+            let Ok(Some(request)) = lines.next_line().await else {
+                return seen;
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            seen.push(request["method"].as_str().unwrap().to_owned());
+            tokio::time::sleep(delay).await;
+            if send.write_all(answer.as_bytes()).await.is_err()
+                || send.write_all(b"\n").await.is_err()
+            {
+                return seen;
+            }
+        }
+        // Keep the connection open until the client goes away.
+        let _ = lines.next_line().await;
+        seen
+    }
+
+    fn materialize() -> Request {
+        use crate::contract::secrets::Materialize;
+        use crate::secrets::value::RawCommand;
+        Request::SecretMaterialize(Materialize {
+            run_id: "run-1".into(),
+            project: project(),
+            names: vec!["API_KEY".into()],
+            command: RawCommand::new("make".into()),
+            workspace: "/work/app".into(),
+        })
+    }
+
+    const GOOD: &str = r#"{"id":2,"result":[{"name":"API_KEY","value":"hunter2-canary"}]}"#;
+    const SNAPSHOT: &str = r#"{"capacity":1,"running":[],"waiting":[],"foreign_running":[]}"#;
+
+    /// A fake service with `answers` and a client connected to it.
+    async fn connected(
+        answers: Vec<(Duration, String)>,
+    ) -> (
+        Client,
+        tokio::task::JoinHandle<Vec<String>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("h"), true);
+        paths.ensure_dirs().unwrap();
+        let listener = crate::service::server::bind(&paths.socket).unwrap();
+        let service = tokio::spawn(fake_service(listener, answers));
+        let client = Client::connect(&paths).await.unwrap();
+        (client, service, dir)
+    }
+
+    fn now(answer: &str) -> (Duration, String) {
+        (Duration::ZERO, answer.to_owned())
+    }
+
+    #[tokio::test]
+    async fn call_sensitive_decodes_without_value_and_hides_decode_errors() {
+        use crate::contract::secrets::MaterializedSecret;
+
+        let (mut client, service, _dir) = connected(vec![
+            // A pushed event between the request and its answer.
+            now(&(r#"{"event":{"type":"secrets.lock_changed","data":{"state":"locked","database":"d","key_file":null,"pending_requests":0,"preserved_files":[]}}}"#.to_owned()
+                + "\n"
+                + GOOD)),
+            now(r#"{"id":3,"result":[{"name":"API_KEY","value":12,"x":"hunter2-canary"}]}"#),
+            now(r#"{"id":4,"error":{"code":"secret_missing","message":"secret API_KEY is not set for project app","details":{},"recovery":null}}"#),
+        ])
+        .await;
+
+        let got: Vec<MaterializedSecret> = client.call_sensitive(materialize()).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "API_KEY");
+        assert!(got[0].value.expose() == "hunter2-canary");
+        assert!(!format!("{got:?}").contains("hunter2"));
+        assert!(matches!(
+            client.next_event().await,
+            Some(Event::SecretsLockChanged(_))
+        ));
+
+        let bad = client
+            .call_sensitive::<Vec<MaterializedSecret>>(materialize())
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, ErrorCode::Internal);
+        assert_eq!(bad.message, "unreadable answer from the service");
+        assert!(!format!("{bad:?}").contains("hunter2"));
+
+        let missing = client
+            .call_sensitive::<Vec<MaterializedSecret>>(materialize())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::SecretMissing);
+
+        drop(client);
+        service.await.unwrap();
+    }
+
+    /// T1-2: a line the reader cannot route after a sensitive call fails closed with the fixed
+    /// text; it never reaches the frame parser, whose messages quote the input.
+    #[tokio::test]
+    async fn unroutable_sensitive_answers_fail_closed() {
+        use crate::contract::secrets::MaterializedSecret;
+
+        let unroutable = [
+            // Truncated: the outer object is not closed.
+            r#"{"id":2,"result":[{"name":"API_KEY","value":"hunter2-canary"}]"#,
+            // An id that is not an unsigned integer.
+            r#"{"id":"2","result":[{"name":"API_KEY","value":"hunter2-canary"}]}"#,
+            r#"{"id":-2,"result":[{"name":"API_KEY","value":"hunter2-canary"}]}"#,
+            // A duplicated id field.
+            r#"{"id":2,"id":2,"result":[{"name":"API_KEY","value":"hunter2-canary"}]}"#,
+            // Answers without a usable id: missing, or null after the payload.
+            r#"{"result":[{"name":"API_KEY","value":"hunter2-canary"}]}"#,
+            r#"{"result":[{"name":"API_KEY","value":"hunter2-canary"}],"id":null}"#,
+            r#"{"error":{"code":"internal","message":"hunter2-canary","details":{},"recovery":null}}"#,
+            // No envelope at all.
+            r#"{"value":"hunter2-canary"}"#,
+        ];
+        // Every case is checked; failures name case numbers only (the lines hold a canary).
+        let mut failed = Vec::new();
+        for (case, line) in unroutable.into_iter().enumerate() {
+            let (mut client, service, _dir) = connected(vec![now(line)]).await;
+            let first = client
+                .call_sensitive::<Vec<MaterializedSecret>>(materialize())
+                .await;
+            // The connection stays broken with the same fixed error.
+            let again = client.call(Request::QueueSnapshot).await;
+            let fixed = |e: Option<&HostlerError>| {
+                e.is_some_and(|e| {
+                    e.code == ErrorCode::Internal
+                        && e.message == "unreadable answer from the service"
+                        && !format!("{e:?}").contains("hunter2")
+                })
+            };
+            if !fixed(first.as_ref().err()) || !fixed(again.as_ref().err()) {
+                failed.push(case);
+            }
+            drop(client);
+            service.await.unwrap();
+        }
+        assert!(failed.is_empty(), "cases not failing closed: {failed:?}");
+    }
+
+    /// T1-2: a second answer under a sensitive id and a late answer to a timed-out sensitive
+    /// call are routed raw and dropped, never parsed as a frame; later calls still work.
+    #[tokio::test]
+    async fn duplicate_and_late_sensitive_answers_are_dropped() {
+        use crate::contract::secrets::MaterializedSecret;
+
+        let (mut client, service, _dir) = connected(vec![
+            // id 2 times out; its answer arrives late, together with a duplicate that the
+            // frame parser would refuse (no result, error or event).
+            (
+                Duration::from_millis(300),
+                format!("{GOOD}\n{{\"id\":2,\"x\":\"hunter2-canary\"}}"),
+            ),
+            now(&GOOD.replace("\"id\":2", "\"id\":3")),
+            now(&format!("{{\"id\":4,\"result\":{SNAPSHOT}}}")),
+        ])
+        .await;
+
+        let timed_out = client
+            .round_trip(materialize(), Duration::from_millis(100), true)
+            .await;
+        assert!(timed_out.is_err());
+        let got: Vec<MaterializedSecret> = client.call_sensitive(materialize()).await.unwrap();
+        assert!(got[0].value.expose() == "hunter2-canary");
+        assert!(!format!("{got:?}").contains("hunter2"));
+        let snapshot = client.call(Request::QueueSnapshot).await.unwrap();
+        assert_eq!(snapshot["capacity"], 1);
+        drop(client);
+        service.await.unwrap();
+    }
+
+    /// T1-1: the Value-returning path refuses materialize before sending anything, and the
+    /// typed path refuses every other method.
+    #[tokio::test]
+    async fn materialize_never_goes_through_call() {
+        let (mut client, service, _dir) =
+            connected(vec![now(&format!("{{\"id\":2,\"result\":{SNAPSHOT}}}"))]).await;
+
+        let e = client.call(materialize()).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("call_sensitive"), "{}", e.message);
+        let e = client
+            .call_sensitive::<Value>(Request::QueueSnapshot)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(client.call(Request::QueueSnapshot).await.is_ok());
+        drop(client);
+        // Only the snapshot reached the service: both refusals sent nothing.
+        assert_eq!(service.await.unwrap(), ["queue.snapshot"]);
+    }
+
+    #[test]
+    fn answer_is_sensitive_matches_the_classifier() {
+        use crate::contract::secrets::{SecretSet, Unlock};
+        use crate::contract::wire::sensitive_answer;
+        use crate::secrets::value::SecretValue;
+
+        let requests = [
+            materialize(),
+            Request::SecretSet(SecretSet {
+                project: project(),
+                name: "API_KEY".into(),
+                value: SecretValue::new("value-1".into()),
+            }),
+            Request::SecretsUnlock(Unlock {
+                password: SecretValue::new("pw-12345".into()),
+                key_file: None,
+                forget_key_file: false,
+                create: false,
+            }),
+            Request::SecretRequests,
+            Request::SecretsStatus,
+            Request::QueueSnapshot,
+            Request::ServiceStatus,
+        ];
+        for request in requests {
+            let method = serde_json::to_value(&request).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                answer_is_sensitive(&request),
+                sensitive_answer(&method),
+                "{method}"
+            );
+        }
     }
 }

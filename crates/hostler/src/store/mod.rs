@@ -1,8 +1,10 @@
 //! The SQLite store behind the heavy queue (plan Task 5).
 
 mod schema;
+mod secrets;
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,8 +22,20 @@ pub struct Store {
 impl Store {
     /// Opens the database and brings its schema up to date.
     pub fn open(path: &Path) -> anyhow::Result<Store> {
+        Store::open_with_timeout(path, Duration::from_secs(5))
+    }
+
+    /// The busy bound is per SQLite locking event; only tests open with another value.
+    #[cfg(test)]
+    fn open_with_busy_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Store> {
+        Store::open_with_timeout(path, timeout)
+    }
+
+    fn open_with_timeout(path: &Path, timeout: Duration) -> anyhow::Result<Store> {
         let mut conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        conn.busy_timeout(timeout)
+            .context("cannot set the busy timeout")?;
         // Migrate before switching to WAL so a database from a newer hostler is never rewritten.
         schema::migrate(&mut conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -518,7 +532,7 @@ mod tests {
         };
         let message = format!("{err:#}");
         assert!(
-            message.contains("version 99") && message.contains("version 1"),
+            message.contains("version 99") && message.contains("version 2"),
             "unexpected error: {message}"
         );
     }

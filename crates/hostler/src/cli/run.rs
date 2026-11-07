@@ -1,11 +1,19 @@
 //! `hostler run --heavy` (plan Task 8): take a slot in the machine-wide heavy queue, run the
 //! command in its own run group, record its exit. The heavy queue fails open: when the service
 //! cannot be reached, started or answered in time, the command runs unqueued after one warning.
+//! `--secret` / `--secret-file` (P2 Task 10, `secret_run`) inject values first and mask the
+//! command's output; they fail closed (exit 78) and compose with `--heavy`.
 //!
 //! Debug-only test hooks read here: `HOSTLER_TEST_KILL_BEFORE_GATE=1` (die at once after spawning
-//! the gate launcher, before registering), `HOSTLER_TEST_DELAY_REATTACH_MS=<ms>` (sleep before
-//! every reattach), `HOSTLER_TEST_PAUSE_BEFORE_SPAWN_MS=<ms>` (block after the last stop check,
-//! before a granted command is spawned), `HOSTLER_TEST_DELAY_STARTED_MS=<ms>` (sleep after the
+//! the gate launcher, before registering; a secret-file run has recorded the command),
+//! `HOSTLER_TEST_KILL_BEFORE_RECORD=1` (an unqueued or re-entrant secret-file run dies between
+//! the launch and recording the command), `HOSTLER_TEST_KILL_AFTER_SPAWN=1` (a secret-file run
+//! dies right after the gate opened), `HOSTLER_TEST_DELAY_RELEASE_MS=<ms>` (sleep before the
+//! heavy release),
+//! `HOSTLER_TEST_DELAY_REATTACH_MS=<ms>` (sleep before every reattach),
+//! `HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL=<path>` (after the last stop check, before a granted
+//! command is spawned: create `<path>.reached`, then block until `<path>` exists, ≤ 30 s),
+//! `HOSTLER_TEST_DELAY_STARTED_MS=<ms>` (sleep after the
 //! spawn, before `heavy.started`), in the Windows gate launcher
 //! `HOSTLER_TEST_GATE_INTERRUPT_AFTER_MS=<ms>` (record a Ctrl+C that long after the command
 //! started, as the console handler would) and, in `spawn`, `HOSTLER_TEST_NO_PROCESS_TABLE=1`
@@ -22,7 +30,8 @@ use clap::Args;
 use serde_json::{Value, json};
 use tokio::time::Instant as TokioInstant;
 
-use super::spawn::{self, TOKEN_ENV};
+use super::secret_run::{self, ChildIo, EXIT_REFUSED};
+use super::spawn::{self, Group, TOKEN_ENV};
 use super::wait::{self, Holder, WaitStatus};
 use crate::client::Client;
 use crate::contract::heavy::{
@@ -36,7 +45,8 @@ use crate::heavy::engine::{
 };
 use crate::heavy::queue;
 use crate::paths::Paths;
-use crate::procs::current_identity;
+use crate::procs::{current_identity, identity_of};
+use crate::secrets::rundir::RunDir;
 use crate::service::manager::OsManager;
 
 /// Timed out, refused by `--no-wait`, or withdrawn before it ran (rn-looky's convention).
@@ -53,6 +63,12 @@ const RETRY_PAUSE: Duration = Duration::from_millis(200);
 const WITHDRAW_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("resource")
+        .required(true)
+        .multiple(true)
+        .args(["heavy", "secret", "secret_file"])
+))]
 pub struct RunArgs {
     /// Wait for a slot in the machine-wide heavy queue first; KIND defaults to `other`.
     #[arg(
@@ -63,14 +79,23 @@ pub struct RunArgs {
         default_missing_value = "other",
         value_parser = parse_kind
     )]
-    heavy: String,
+    heavy: Option<String>,
     /// Minutes to wait for a slot (fractions allowed; 0 = no limit). Default:
     /// $HOSTLER_HEAVY_MAX_WAIT, else 60.
-    #[arg(long, value_name = "MIN", value_parser = parse_minutes)]
+    #[arg(long, value_name = "MIN", value_parser = parse_minutes, requires = "heavy")]
     max_wait: Option<f64>,
     /// Exit 75 at once instead of waiting when no slot is free.
-    #[arg(long)]
+    #[arg(long, requires = "heavy")]
     no_wait: bool,
+    /// Put the project's secret NAME into the environment variable ENV (default: its `env` in
+    /// hostler.toml, else NAME). The command's stdout and stderr are masked. Repeatable.
+    // Hyphen values too: whatever follows reaches the non-echoing check (T10-1).
+    #[arg(long, value_name = "NAME[=ENV]", allow_hyphen_values = true)]
+    secret: Vec<String>,
+    /// Write the project's secret NAME to a private file, removed after the command, and put
+    /// the file's path into ENV (default as for --secret). Repeatable.
+    #[arg(long, value_name = "NAME[=ENV]", allow_hyphen_values = true)]
+    secret_file: Vec<String>,
     /// One argument is a shell line (`sh -c` / `cmd /C`); several are a program and its arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     command: Vec<OsString>,
@@ -150,6 +175,9 @@ fn keep_tail(s: &str, max: usize) -> String {
 }
 
 pub fn main(args: RunArgs) -> i32 {
+    if !args.secret.is_empty() || !args.secret_file.is_empty() {
+        crate::service::harden::harden_value_holder();
+    }
     let max_wait = match max_wait(args.max_wait) {
         Ok(m) => m,
         Err(e) => {
@@ -167,40 +195,67 @@ pub fn main(args: RunArgs) -> i32 {
             return 1;
         }
     };
-    let code = runtime.block_on(run(args.heavy, max_wait, args.no_wait, args.command));
+    let code = runtime.block_on(run(args, max_wait));
     runtime.shutdown_background();
     code
 }
 
-async fn run(
-    kind: String,
-    max_wait: Option<Duration>,
-    no_wait: bool,
-    command: Vec<OsString>,
-) -> i32 {
-    let display = command
+/// The signals registered first by a secret run, else a fresh registration.
+fn signals_now(
+    early: &mut Option<std::io::Result<spawn::Signals>>,
+) -> std::io::Result<spawn::Signals> {
+    early.take().unwrap_or_else(spawn::Signals::register)
+}
+
+async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
+    let display = args
+        .command
         .iter()
         .map(|a| a.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    let argv = command_argv(command);
-    // Before any request names this process as the holder.
+    let argv = command_argv(args.command);
+    // Inside a secret run the command line may hold inherited values this run cannot mask:
+    // only a placeholder leaves the process (heavy queue, history, materialization; CR-1).
+    let display = if secret_run::inside_secret_run() {
+        secret_run::INSIDE_SECRET_RUN.to_owned()
+    } else {
+        display
+    };
+    // Before any request names this process as the holder (and so a non-elevated service can
+    // judge a secret run's liveness when it sweeps `runs/`, W-3).
     spawn::let_service_observe_self();
     // Generated once and reused for every retry: a known request is never re-acquired under a
-    // new id.
+    // new id. A secret run uses it as its run id too.
     let id = uuid::Uuid::new_v4().to_string();
-    let mut heavy = match Heavy::prepare(id, kind, &display, no_wait) {
+    let secrets = !args.secret.is_empty() || !args.secret_file.is_empty();
+    // Before any value is held: from here a signal is seen (and the files removed), not fatal.
+    let mut early = secrets.then(spawn::Signals::register);
+    let (io, files, display) = if secrets {
+        match secret_run::setup(&args.secret, &args.secret_file, &id, &display).await {
+            Ok(prepared) => (prepared.io, prepared.files, prepared.display),
+            Err(code) => return code,
+        }
+    } else {
+        (ChildIo::default(), None, display)
+    };
+    // Owned by the spawn path that runs the command (removed once its output is drained), else
+    // dropped when `run` returns: the secret files are removed on every path.
+    let Some(kind) = args.heavy else {
+        return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
+    };
+    let mut heavy = match Heavy::prepare(id, kind, &display, args.no_wait) {
         Ok(heavy) => heavy,
         Err(e) => {
             warn_unavailable(&format!("{e:#}"));
-            return run_unqueued(argv, spawn::Signals::register()).await;
+            return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
         }
     };
     match Client::connect_or_start(&heavy.paths, &OsManager).await {
         Ok(client) => heavy.client = Some(client),
         Err(e) => {
             warn_fail_open(&e);
-            return run_unqueued(argv, spawn::Signals::register()).await;
+            return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
         }
     }
     let mut outcome = heavy
@@ -211,7 +266,7 @@ async fn run(
     let outcome = loop {
         match outcome {
             Ok(AcquireOutcome::Queued { position, of, .. }) => {
-                let stop = stop.get_or_insert_with(|| Stop::new(max_wait));
+                let stop = stop.get_or_insert_with(|| Stop::new(max_wait, early.take()));
                 outcome = match wait_for_slot(&mut heavy, stop, position, of).await {
                     ControlFlow::Continue(next) => next,
                     ControlFlow::Break(stopped) => {
@@ -224,15 +279,19 @@ async fn run(
     };
     // Registered before the last stop check and owned until the command ends: an interrupt at
     // any instant stops the request here, keeps the gate shut, or reaches the command.
+    // A secret run's early signals were registered before all of this and are kept throughout.
     let reentrant = matches!(outcome, Ok(AcquireOutcome::Reentrant));
-    let interrupts = reentrant.then(spawn::ignore_interrupts);
-    let signals = (!reentrant).then(spawn::Signals::register);
+    let interrupts = (reentrant && !secrets).then(spawn::ignore_interrupts);
+    let signals = (!reentrant && !secrets).then(spawn::Signals::register);
     if let Some(stop) = stop.as_mut()
         && let Some(stopped) = stop.now().await
     {
         return give_up(&mut heavy, stopped, max_wait).await;
     }
-    let signals = || signals.unwrap_or_else(spawn::Signals::register);
+    if let Some(held) = stop.as_mut().and_then(Stop::take_signals) {
+        early = Some(held);
+    }
+    let signals = || signals.or(early).unwrap_or_else(spawn::Signals::register);
     match outcome {
         Err(e) if e.code == ErrorCode::QueueBusy => {
             eprintln!("[hostler] {}", e.message);
@@ -240,7 +299,7 @@ async fn run(
         }
         Err(e) => {
             warn_fail_open(&e);
-            run_unqueued(argv, signals()).await
+            run_unqueued(argv, signals(), &io, files, Group::Own).await
         }
         Ok(AcquireOutcome::Granted { .. }) => {
             if let Some(stop) = &stop {
@@ -250,7 +309,12 @@ async fn run(
                     wait::duration_text(waited)
                 );
             }
-            run_granted(&mut heavy, argv, signals()).await
+            run_granted(&mut heavy, argv, signals(), &io, files).await
+        }
+        // A secret run: behind a gate in the enclosing group, recorded before it can run, its
+        // early signals kept (T10-2/3/4).
+        Ok(AcquireOutcome::Reentrant) if secrets => {
+            run_unqueued(argv, signals(), &io, files, Group::Enclosing).await
         }
         Ok(AcquireOutcome::Reentrant) => {
             run_direct(argv, interrupts.unwrap_or_else(spawn::ignore_interrupts)).await
@@ -300,25 +364,39 @@ enum Stopped {
 }
 
 /// Ctrl+C and the `--max-wait` deadline, armed from the first wait until the request is decided.
-/// One listener for the whole wait: a SIGINT between two waits is never lost.
+/// One listener for the whole wait: a SIGINT between two waits is never lost. A secret run's
+/// listener is its early `Signals` (all four signals, registered before materialization), so
+/// an interrupt that came before the wait is seen too; `take_signals` hands them on.
 struct Stop {
     since: Instant,
     max_wait: Option<Duration>,
     interrupt: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
     can_interrupt: bool,
+    signals: Option<std::io::Result<spawn::Signals>>,
 }
 
 impl Stop {
-    fn new(max_wait: Option<Duration>) -> Stop {
+    fn new(max_wait: Option<Duration>, signals: Option<std::io::Result<spawn::Signals>>) -> Stop {
+        let interrupt: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> =
+            if matches!(signals, Some(Ok(_))) {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(tokio::signal::ctrl_c())
+            };
         Stop {
             since: Instant::now(),
             max_wait,
-            interrupt: Box::pin(tokio::signal::ctrl_c()),
+            interrupt,
             can_interrupt: true,
+            signals,
         }
     }
 
-    /// Resolves at Ctrl+C or at the deadline. Cancel-safe.
+    fn take_signals(&mut self) -> Option<std::io::Result<spawn::Signals>> {
+        self.signals.take()
+    }
+
+    /// Resolves at Ctrl+C (any of a secret run's signals) or at the deadline. Cancel-safe.
     async fn wait(&mut self) -> Stopped {
         // An unrepresentable deadline is no deadline.
         let deadline = self
@@ -339,6 +417,7 @@ impl Stop {
                     }
                     self.can_interrupt = false;
                 }
+                () = early_signal(&mut self.signals) => return Stopped::Interrupted,
                 () = &mut expired => return Stopped::TimedOut,
             }
         }
@@ -346,21 +425,30 @@ impl Stop {
 
     /// A stop that has already happened; never waits.
     async fn now(&mut self) -> Option<Stopped> {
-        if self.can_interrupt {
-            tokio::select! {
-                biased;
-                result = &mut self.interrupt => {
-                    if result.is_ok() {
-                        return Some(Stopped::Interrupted);
-                    }
-                    self.can_interrupt = false;
+        tokio::select! {
+            biased;
+            result = &mut self.interrupt, if self.can_interrupt => {
+                if result.is_ok() {
+                    return Some(Stopped::Interrupted);
                 }
-                () = std::future::ready(()) => {}
+                self.can_interrupt = false;
             }
+            () = early_signal(&mut self.signals) => return Some(Stopped::Interrupted),
+            () = std::future::ready(()) => {}
         }
         wait::deadline_reached(self.since, Instant::now(), self.max_wait)
             .then_some(Stopped::TimedOut)
     }
+}
+
+/// Resolves at the next signal of a secret run's early `Signals`; never without them.
+async fn early_signal(signals: &mut Option<std::io::Result<spawn::Signals>>) {
+    if let Some(Ok(signals)) = signals
+        && signals.recv().await.is_some()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 /// Withdraws the request (briefly: if the service is gone the entry is reaped after we exit).
@@ -539,6 +627,13 @@ impl Heavy {
             exit_code: Some(exit_code),
             outcome,
         };
+        #[cfg(debug_assertions)]
+        if let Some(ms) = std::env::var("HOSTLER_TEST_DELAY_RELEASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         let _ = self.call(Request::HeavyRelease(release)).await;
     }
 }
@@ -652,6 +747,7 @@ async fn wait_for_slot(
                         None => true,
                     }
                 }
+                Some(_) => false,
                 None => true,
             },
         };
@@ -682,18 +778,24 @@ async fn run_granted(
     heavy: &mut Heavy,
     argv: Vec<OsString>,
     signals: std::io::Result<spawn::Signals>,
+    io: &ChildIo,
+    files: Option<RunDir>,
 ) -> i32 {
-    let program = spawn::program(&argv);
+    let program = io.mask(&spawn::program(&argv));
     #[cfg(debug_assertions)]
-    if let Some(ms) = std::env::var("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        std::thread::sleep(Duration::from_millis(ms));
+    if let Some(path) = std::env::var_os("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL") {
+        let path = std::path::PathBuf::from(path);
+        let mut reached = path.clone().into_os_string();
+        reached.push(".reached");
+        let _ = std::fs::write(reached, "");
+        let until = Instant::now() + Duration::from_secs(30);
+        while !path.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     let spawned = signals
         .context("cannot install signal forwarding")
-        .and_then(|signals| spawn::spawn_in_group(argv, &heavy.req.id, signals));
+        .and_then(|signals| spawn::spawn_in_group(argv, &heavy.req.id, signals, io));
     let mut spawned = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
@@ -702,19 +804,16 @@ async fn run_granted(
             return EXIT_CANNOT_RUN;
         }
     };
-    #[cfg(debug_assertions)]
-    if std::env::var("HOSTLER_TEST_KILL_BEFORE_GATE").as_deref() == Ok("1") {
-        // SAFETY: plain process calls with no memory preconditions; this process ends here.
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL)
-        };
-        #[cfg(windows)]
-        unsafe {
-            use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-            TerminateProcess(GetCurrentProcess(), 1)
-        };
+    let pumps = secret_run::start_pumps(io, spawned.take_output());
+    if let Some(files) = &files
+        && let Err(e) = files.record_child(&spawned.identity())
+    {
+        eprintln!("[hostler] {e:#}");
+        let _ = wait_blocking(move || spawned.abandon()).await;
+        heavy.release(EXIT_REFUSED).await;
+        return EXIT_REFUSED;
     }
+    kill_self_if("HOSTLER_TEST_KILL_BEFORE_GATE");
     let started = HeavyStarted {
         id: heavy.req.id.clone(),
         child: spawned.identity(),
@@ -741,32 +840,66 @@ async fn run_granted(
     if let Err(e) = spawned.release_gate() {
         eprintln!("[hostler] {e:#}");
     }
+    if files.is_some() {
+        kill_self_if("HOSTLER_TEST_KILL_AFTER_SPAWN");
+    }
     let code = wait_blocking(move || spawned.wait()).await;
-    heavy.release(code).await;
+    // The drain's deadline counts from the command's exit, never from the bookkeeping (T10-6).
+    let exited = Instant::now();
+    let drained = async move {
+        secret_run::drain(pumps, exited).await;
+        drop(files);
+    };
+    tokio::join!(heavy.release(code), drained);
     code
 }
 
-/// Fail-open: the command in its own group, nothing registered and no process identity needed.
-async fn run_unqueued(argv: Vec<OsString>, signals: std::io::Result<spawn::Signals>) -> i32 {
-    let program = spawn::program(&argv);
+/// Fail-open, a secret run without `--heavy`, or (`Group::Enclosing`) a re-entrant secret run:
+/// the command behind its gate, nothing registered; a process identity is needed only to record
+/// a secret-file run's command, which happens before the gate opens.
+async fn run_unqueued(
+    argv: Vec<OsString>,
+    signals: std::io::Result<spawn::Signals>,
+    io: &ChildIo,
+    files: Option<RunDir>,
+    group: spawn::Group,
+) -> i32 {
+    let program = io.mask(&spawn::program(&argv));
     let launched = signals
         .context("cannot install signal forwarding")
-        .and_then(|signals| spawn::launch(argv, None, signals));
-    match launched {
-        Ok(mut launched) => {
-            if let Err(e) = launched.release_gate() {
-                eprintln!("[hostler] {e:#}");
-            }
-            wait_blocking(move || launched.wait()).await
-        }
+        .and_then(|signals| spawn::launch(argv, None, signals, io, group));
+    let mut launched = match launched {
+        Ok(launched) => launched,
         Err(e) => {
             eprintln!("[hostler] cannot run {program}: {e:#}");
-            EXIT_CANNOT_RUN
+            return EXIT_CANNOT_RUN;
         }
+    };
+    let pumps = secret_run::start_pumps(io, launched.take_output());
+    if let Some(files) = &files {
+        kill_self_if("HOSTLER_TEST_KILL_BEFORE_RECORD");
+        if let Err(e) = record_pid(files, launched.id()) {
+            eprintln!("[hostler] {e:#}");
+            // The gate closes unopened: the command never runs.
+            let _ = wait_blocking(move || launched.wait()).await;
+            return EXIT_REFUSED;
+        }
+        kill_self_if("HOSTLER_TEST_KILL_BEFORE_GATE");
     }
+    if let Err(e) = launched.release_gate() {
+        eprintln!("[hostler] {e:#}");
+    }
+    if files.is_some() {
+        kill_self_if("HOSTLER_TEST_KILL_AFTER_SPAWN");
+    }
+    let code = wait_blocking(move || launched.wait()).await;
+    secret_run::drain(pumps, Instant::now()).await;
+    drop(files);
+    code
 }
 
-/// Re-entrant: the enclosing heavy command already holds the slot; run in its group as is.
+/// Re-entrant without secrets: the enclosing heavy command already holds the slot; run in its
+/// group as is.
 async fn run_direct(argv: Vec<OsString>, mut interrupts: spawn::IgnoreInterrupts) -> i32 {
     let program = spawn::program(&argv);
     let Some((first, rest)) = argv.split_first() else {
@@ -786,6 +919,33 @@ async fn run_direct(argv: Vec<OsString>, mut interrupts: spawn::IgnoreInterrupts
             eprintln!("[hostler] waiting for {program} failed");
             1
         }
+    }
+}
+
+/// Records the launcher `pid` (the command after `exec` on Unix, its supervisor on Windows) as a
+/// secret run's command.
+fn record_pid(files: &RunDir, pid: u32) -> anyhow::Result<()> {
+    let table = spawn::process_table()?;
+    let identity = identity_of(&table, pid)
+        .with_context(|| format!("cannot read the start time of the launched process {pid}"))?;
+    files.record_child(&identity)
+}
+
+/// Debug builds: this process dies at once (SIGKILL / TerminateProcess) when `hook` is `1`.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn kill_self_if(hook: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var(hook).as_deref() == Ok("1") {
+        // SAFETY: plain process calls with no memory preconditions; this process ends here.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL)
+        };
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            TerminateProcess(GetCurrentProcess(), 1)
+        };
     }
 }
 

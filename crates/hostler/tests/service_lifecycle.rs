@@ -6,9 +6,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use hostler::client::Client;
-use hostler::contract::ErrorCode;
 use hostler::contract::heavy::HeavyAcquire;
 use hostler::contract::wire::Request;
+use hostler::contract::{CONTRACT_VERSION, ErrorCode};
 use hostler::paths::Paths;
 use hostler::procs::{SysProcessTable, current_identity};
 use hostler::service::{NoManager, ServiceManager};
@@ -131,7 +131,7 @@ async fn first_call_auto_starts_service() {
         .await
         .unwrap();
     let status = client.call(Request::ServiceStatus).await.unwrap();
-    assert_eq!(status["contract_version"], 1);
+    assert_eq!(status["contract_version"], CONTRACT_VERSION);
     assert_eq!(home.pid(), status["pid"].as_u64().unwrap());
 }
 
@@ -265,7 +265,7 @@ fn restart_replaces_idle_mismatched_service() {
     assert!(restart.status.success(), "{}", stderr(&restart));
     assert!(old.wait().unwrap().success());
     let status = home.status_json();
-    assert_eq!(status["data"]["contract_version"], 1);
+    assert_eq!(status["data"]["contract_version"], CONTRACT_VERSION);
     assert_ne!(status["data"]["pid"].as_u64(), Some(u64::from(old.id())));
 }
 

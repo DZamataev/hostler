@@ -20,6 +20,15 @@ fn under_uses_fixed_file_names() {
     assert_eq!(paths.log_dir, home.join("logs"));
 }
 
+#[test]
+fn paths_include_kdbx_and_runs() {
+    let home = PathBuf::from("/state/hostler");
+    let paths = Paths::under(home.clone(), false);
+
+    assert_eq!(paths.kdbx, home.join("hostler.kdbx"));
+    assert_eq!(paths.runs, home.join("runs"));
+}
+
 #[cfg(unix)]
 #[test]
 fn long_home_falls_back_to_private_socket_dir() {

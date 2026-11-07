@@ -3,10 +3,16 @@
 use serde::Serialize;
 
 /// Every topic and its one-line summary, in the order `hostler guide` lists them.
-pub const TOPICS: &[(&str, &str)] = &[(
-    "heavy",
-    "the machine-wide heavy queue: when and how to wrap build commands",
-)];
+pub const TOPICS: &[(&str, &str)] = &[
+    (
+        "heavy",
+        "the machine-wide heavy queue: when and how to wrap build commands",
+    ),
+    (
+        "secrets",
+        "project secrets: requesting, injecting and masking values, and the person-only commands",
+    ),
+];
 
 /// One entry of `hostler guide --json`.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -26,6 +32,7 @@ pub struct TopicText {
 pub fn topic(name: &str) -> Option<&'static str> {
     match name {
         "heavy" => Some(include_str!("heavy.md")),
+        "secrets" => Some(include_str!("secrets.md")),
         _ => None,
     }
 }

@@ -23,6 +23,14 @@ pub use windows::{
 #[cfg(unix)]
 pub fn let_service_observe_self() {}
 
+/// Where a launched command runs: in a process group of its own (Unix; a heavy or unqueued run),
+/// or in the wrapper's (a re-entrant secret run, inside the enclosing heavy group).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Own,
+    Enclosing,
+}
+
 /// Names the slot a heavy command holds, so a nested `hostler run --heavy` can find it.
 pub const TOKEN_ENV: &str = "HOSTLER_HEAVY_TOKEN";
 

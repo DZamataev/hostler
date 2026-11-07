@@ -1,11 +1,12 @@
 //! The versioned contract shared by the CLI, the service, MCP and the app (spec §12, plan Task 4).
 
 pub mod heavy;
+pub mod secrets;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +22,18 @@ pub enum ErrorCode {
     CapacityOutOfRange,
     ForceRequired,
     Internal,
+    NotInteractive,
+    NotInProject,
+    ConfigInvalid,
+    ProjectNotApproved,
+    SecretsLocked,
+    UnlockFailed,
+    SecretsConflict,
+    SecretMissing,
+    SecretNotInProject,
+    SecretExists,
+    SecretTooShort,
+    RequestTimeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,5 +83,10 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn contract_version_is_2() {
+        assert_eq!(CONTRACT_VERSION, 2);
     }
 }

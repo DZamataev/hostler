@@ -1,6 +1,7 @@
 //! The per-user hostler service (plan Task 6): one process per home, found through a local
-//! socket, owning the store and the heavy-queue engine.
+//! socket, owning the store, the heavy-queue engine and the secrets engine (P2 Task 6).
 
+pub mod harden;
 pub mod lifecycle;
 pub mod lock;
 pub mod manager;
@@ -19,7 +20,9 @@ use crate::contract::wire::Request;
 use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::{HeavyEngine, SystemClock};
 use crate::paths::Paths;
-use crate::procs::{self, ProcessIdentity, SysProcessTable};
+use crate::procs::{self, ProcessIdentity, ProcessTable, SysProcessTable};
+use crate::secrets::engine::SecretsEngine;
+use crate::secrets::vault::{self, KdfChoice, Vault};
 use crate::store::Store;
 
 /// Registers and starts the service with the OS (Task 10).
@@ -103,15 +106,39 @@ pub async fn run_service_with(
 }
 
 async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
-    let table = SysProcessTable::new().context("cannot read the boot id")?;
+    harden::harden_service_process();
+    let recovery = vault::recover_at_start(&paths.kdbx);
+    if recovery.restored || recovery.removed_temps > 0 || !recovery.preserved.is_empty() {
+        tracing::info!(
+            "secrets database repair: restored a moved-aside file: {}, removed {} temp file(s),              kept: {:?}",
+            recovery.restored,
+            recovery.removed_temps,
+            recovery.preserved
+        );
+    }
+    let swept = crate::secrets::rundir::sweep(&paths.runs);
+    if swept > 0 {
+        tracing::info!("removed {swept} leftover secret run director(ies)");
+    }
+    let table: Arc<dyn ProcessTable> =
+        Arc::new(SysProcessTable::new().context("cannot read the boot id")?);
     let store = Store::open(&paths.db)?;
     let (events, _) = broadcast::channel(64);
     let engine = HeavyEngine::new(
         store,
-        Arc::new(table),
+        table.clone(),
         Arc::new(SystemClock),
         Box::new(LookyHeavy::new()),
         events.clone(),
+    );
+    let secrets = SecretsEngine::new(
+        Vault::new(paths.kdbx.clone()),
+        paths.kdbx.clone(),
+        Store::open(&paths.db)?,
+        table,
+        Arc::new(SystemClock),
+        events.clone(),
+        kdf_choice(),
     );
     let listener = server::bind(&paths.socket)?;
     tracing::info!(
@@ -121,7 +148,19 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
         paths.socket
     );
     // Dropping the listener removes the socket file while the lock is still held.
-    server::serve(listener, engine, events).await
+    server::serve(listener, engine, secrets, events).await
+}
+
+/// New databases: Argon2id calibrated to about 1 s; debug builds honour
+/// `HOSTLER_TEST_FAST_KDF=1` (tests).
+fn kdf_choice() -> KdfChoice {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("HOSTLER_TEST_FAST_KDF").is_some_and(|v| v == "1") {
+        return KdfChoice::Fast;
+    }
+    KdfChoice::Calibrated {
+        target: Duration::from_secs(1),
+    }
 }
 
 /// Daily-rotated `log_dir/service.log`; the guard flushes on drop.
@@ -136,8 +175,9 @@ fn init_logging(paths: &Paths) -> Option<tracing_appender::non_blocking::WorkerG
     Some(guard)
 }
 
-/// How long a stop waits for the service to release its lock.
-pub const STOP_WAIT: Duration = Duration::from_secs(10);
+/// How long a stop waits for the service to release its lock: longer than the service's own
+/// 30 s drain of vault work (P2-5).
+pub const STOP_WAIT: Duration = Duration::from_secs(40);
 
 /// Why a running service was not stopped.
 pub enum StopRefused {

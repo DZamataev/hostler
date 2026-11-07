@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -39,9 +39,10 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::{
-    CANNOT_RUN, Ended, GATE_CANCEL, GATE_CLOSED, GATE_INTERRUPTED, GATE_OPEN, GateDecision,
+    CANNOT_RUN, Ended, GATE_CANCEL, GATE_CLOSED, GATE_INTERRUPTED, GATE_OPEN, GateDecision, Group,
     TOKEN_ENV, Wake, gate_decision, read_gate, supervise,
 };
+use crate::cli::secret_run::ChildIo;
 use crate::procs::{ProcessIdentity, ProcessTable, RunGroup, identity_of};
 
 /// Every Ctrl+C or Ctrl+Break the launcher has seen since it started.
@@ -101,20 +102,30 @@ impl Signals {
         })
     }
 
+    /// The next Ctrl+C; `None` once none can arrive. Cancel-safe.
+    pub async fn recv(&mut self) -> Option<()> {
+        self.ctrl_c.recv().await
+    }
+
     fn pending(&mut self) -> bool {
         let mut cx = std::task::Context::from_waker(Waker::noop());
         matches!(self.ctrl_c.poll_recv(&mut cx), Poll::Ready(Some(())))
     }
 }
 
-/// Starts the gate launcher for `argv`, with `TOKEN_ENV` set to `token` if given. The command
-/// does not run until `release_gate`. Needs a tokio runtime.
+/// Starts the gate launcher for `argv`, with `TOKEN_ENV` set to `token` if given and `io`'s
+/// environment; with masks its stdout and stderr are pipes (`take_output`), which the launcher
+/// passes on to the command with its environment. The command does not run until
+/// `release_gate`. The launcher always stays in this process's job (`group` matters on Unix
+/// only), and is made observable for the service (W-3). Needs a tokio runtime.
 pub fn launch(
     argv: Vec<OsString>,
     token: Option<&str>,
     signals: Signals,
+    io: &ChildIo,
+    _group: Group,
 ) -> anyhow::Result<Launched> {
-    launch_in(argv, token, None, signals)
+    launch_in(argv, token, None, signals, io)
 }
 
 /// `launch`; `job` names the job the launcher will be in, so it can end the command's tree.
@@ -123,6 +134,7 @@ fn launch_in(
     token: Option<&str>,
     job: Option<&str>,
     mut signals: Signals,
+    io: &ChildIo,
 ) -> anyhow::Result<Launched> {
     anyhow::ensure!(!argv.is_empty(), "no command to run");
     let exe = std::env::current_exe().context("cannot find the hostler executable")?;
@@ -150,6 +162,11 @@ fn launch_in(
     if let Some(token) = token {
         command.env(TOKEN_ENV, token);
     }
+    command.envs(io.env.iter().map(|(name, value)| (name, value)));
+    // std makes only the child's ends inheritable; ours stay private (W-1).
+    if io.masks.is_some() {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     let child = command.spawn().context("cannot start the gate launcher")?;
     drop(reader);
     // Our handle has full access; the launcher still waits at its gate.
@@ -173,6 +190,7 @@ pub fn spawn_in_group(
     argv: Vec<OsString>,
     entry_id: &str,
     signals: Signals,
+    io: &ChildIo,
 ) -> anyhow::Result<Spawned> {
     let table = super::process_table()?;
     let name = format!(r"Local\hostler-heavy-{entry_id}");
@@ -187,7 +205,7 @@ pub fn spawn_in_group(
     }
     let job = Job(raw);
     observable(job.0, OBSERVE_JOB, "the job object");
-    let launched = launch_in(argv, Some(entry_id), Some(&name), signals)?;
+    let launched = launch_in(argv, Some(entry_id), Some(&name), signals, io)?;
     // The launcher waits at its gate, so nothing has escaped the job yet.
     // SAFETY: both handles are open: the job above, the process owned by `launched.child`.
     let assigned =
@@ -229,6 +247,10 @@ impl Spawned {
         self.launched.release_gate()
     }
 
+    pub fn take_output(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+        self.launched.take_output()
+    }
+
     pub fn wait(self) -> anyhow::Result<ExitStatus> {
         self.launched.wait()
     }
@@ -240,6 +262,16 @@ impl Spawned {
 }
 
 impl Launched {
+    /// The launcher's pid; it supervises the command.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The command's output pipes, when `launch` was given masks.
+    pub fn take_output(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+        (self.child.stdout.take(), self.child.stderr.take())
+    }
+
     /// Lets the command start, unless Ctrl+C came at any time since before the launch: then
     /// the launcher is told to exit 130. One arriving after this check is seen by the launcher
     /// itself (`gate_main`).
@@ -318,6 +350,8 @@ fn stop_command(job: Option<&str>, child: &mut Child) {
 /// `hostler __gate --fd <handle> [--job <name>] -- <argv…>`: waits for one byte on the inherited
 /// pipe handle, then runs `argv` as its child and exits with its exit code.
 pub fn gate_main(handle: u64, job: Option<&str>, argv: &[OsString]) -> i32 {
+    // First, as on Unix: a secret run's values are in this process's environment.
+    crate::service::harden::harden_value_holder();
     // Manual-reset, unnamed; set by `record_interrupt`. Without it waits only watch the exit.
     // SAFETY: default attributes, no name; a null result is handled by every user.
     let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };

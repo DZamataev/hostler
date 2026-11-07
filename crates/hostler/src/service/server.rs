@@ -1,5 +1,6 @@
 //! The local-socket server: accepts connections from the same user, speaks newline-delimited JSON
-//! frames, and dispatches versioned requests to the heavy engine (plan Tasks 6–7).
+//! frames, and dispatches versioned requests to the heavy engine (plan Tasks 6–7) and, on the
+//! blocking pool, to the secrets engine (P2 Task 6).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,19 +8,23 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use interprocess::local_socket::tokio::{Listener, Stream, prelude::*};
 use interprocess::local_socket::{ListenerOptions, Name};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use zeroize::Zeroizing;
 
 use super::lifecycle;
 use crate::contract::heavy::ServiceStatus;
-use crate::contract::wire::{ClientFrame, Event, Request, ServerFrame};
+use crate::contract::wire::{ClientFrame, Event, Request, ServerFrame, sensitive_request};
 use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::HeavyEngine;
 use crate::paths::SocketName;
+use crate::secrets::engine::{Reply as SecretsReply, SecretsEngine};
 
 /// The largest frame either side sends or accepts; a longer incoming line closes the connection.
 /// The engine's admission limits keep every answer and snapshot below it.
@@ -28,9 +33,14 @@ const TICK_EVERY: Duration = Duration::from_secs(2);
 /// How long an accepted `service.shutdown` waits for its reply to be queued and written; the
 /// service stops either way.
 const STOP_REPLY_FLUSH: Duration = Duration::from_secs(2);
+/// How long a stop waits for running vault work (P2-5, L8).
+const VAULT_DRAIN: Duration = Duration::from_secs(30);
 
 struct Shared {
     engine: Mutex<HeavyEngine>,
+    secrets: Arc<SecretsEngine>,
+    /// Every secrets job and its reply; a stop drains them before the vault is locked.
+    jobs: TaskTracker,
     events: broadcast::Sender<Event>,
     contract_version: u32,
     shutdown: watch::Sender<bool>,
@@ -62,21 +72,26 @@ pub fn bind(socket: &SocketName) -> anyhow::Result<Listener> {
     #[cfg(windows)]
     let options = {
         use interprocess::os::windows::local_socket::ListenerOptionsExt;
-        options.security_descriptor(windows_sd::current_user_only()?)
+        options.security_descriptor(crate::winsec::user_only_sd("")?)
     };
     Ok(options.create_tokio()?)
 }
 
-/// Serves until `service.shutdown` or a termination signal. Before returning, every connection
+/// Serves until `service.shutdown` or a termination signal. Then it refuses new secrets work,
+/// keeps serving connections while running vault jobs finish (up to 30 s; past that the process
+/// exits holding the service lock), and locks the vault. Before returning, every connection
 /// task and the ticker are stopped, so nothing touches the store once the caller drops the lock.
 pub async fn serve(
     listener: Listener,
     engine: HeavyEngine,
+    secrets: SecretsEngine,
     events: broadcast::Sender<Event>,
 ) -> anyhow::Result<()> {
     let (shutdown, mut stopping) = watch::channel(false);
     let shared = Arc::new(Shared {
         engine: Mutex::new(engine),
+        secrets: Arc::new(secrets),
+        jobs: TaskTracker::new(),
         events,
         contract_version: lifecycle::service_contract_version(),
         shutdown,
@@ -90,6 +105,8 @@ pub async fn serve(
             loop {
                 every.tick().await;
                 shared.engine.lock().await.tick();
+                let secrets = shared.secrets.clone();
+                let _ = shared.jobs.spawn_blocking(move || secrets.tick()).await;
             }
         })
     };
@@ -120,9 +137,35 @@ pub async fn serve(
             }
         }
     }
+    shared.secrets.begin_shutdown();
     ticker.abort();
     let _ = ticker.await;
+    shared.jobs.close();
+    let drained = shared.jobs.wait();
+    let deadline = tokio::time::sleep(VAULT_DRAIN);
+    tokio::pin!(drained, deadline);
+    // Connections keep being served meanwhile: new secrets work is answered `stopping`.
+    loop {
+        tokio::select! {
+            _ = &mut drained => break,
+            _ = &mut deadline => {
+                tracing::error!(
+                    "vault work still runs after {VAULT_DRAIN:?}; exiting while still holding                      the service lock"
+                );
+                std::process::exit(1);
+            }
+            accepted = listener.accept() => {
+                if let Ok(stream) = accepted
+                    && peer_is_current_user(&stream)
+                {
+                    connections.spawn(connection(stream, shared.clone()));
+                }
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
     connections.shutdown().await;
+    shared.secrets.lock_for_shutdown();
     Ok(())
 }
 
@@ -172,6 +215,8 @@ enum Out {
     Line(String),
     /// A line whose writer reports back once it is flushed.
     Flushed(String, oneshot::Sender<()>),
+    /// A line carrying secret values: erased once written (or not).
+    Sensitive(Zeroizing<String>, oneshot::Sender<()>),
 }
 
 /// One connection: a reader and a writer that run independently, so a large pushed snapshot
@@ -189,11 +234,12 @@ async fn write_loop(
     mut rx: mpsc::Receiver<Out>,
 ) {
     while let Some(out) = rx.recv().await {
-        let (line, flushed) = match out {
-            Out::Line(line) => (line, None),
-            Out::Flushed(line, done) => (line, Some(done)),
+        let (sent, flushed) = match out {
+            Out::Line(line) => (writer.send(line).await, None),
+            Out::Flushed(line, done) => (writer.send(line).await, Some(done)),
+            Out::Sensitive(line, done) => (writer.send(line.as_str()).await, Some(done)),
         };
-        if writer.send(line).await.is_err() {
+        if sent.is_err() {
             return;
         }
         if let Some(done) = flushed {
@@ -234,6 +280,8 @@ async fn read_loop(
                     // Closed, an I/O error, or a frame over the limit: drop the connection.
                     return;
                 };
+                // A request may carry values (unlock, set, import, a materialize command).
+                let line = Zeroizing::new(line);
                 let Some(reply) = handle_line(&line, &mut conn, shared).await else {
                     continue;
                 };
@@ -242,6 +290,31 @@ async fn read_loop(
                         if tx.send(Out::Line(encode_reply(&frame))).await.is_err() {
                             return;
                         }
+                    }
+                    Reply::Secrets(out, token) => {
+                        // A stop's drain waits for this reply at most STOP_REPLY_FLUSH, queueing
+                        // and writing together (T6-5); past it the token goes, the reply still
+                        // queues (a slow reader loses nothing; a stop drops it, erased).
+                        let mut token = Some(token);
+                        let deadline = tokio::time::Instant::now() + STOP_REPLY_FLUSH;
+                        let (done, flushed) = oneshot::channel();
+                        let out = match out {
+                            SecretsOut::Frame(frame) => Out::Flushed(encode_reply(&frame), done),
+                            SecretsOut::Sensitive(line) => Out::Sensitive(line, done),
+                        };
+                        let mut send = std::pin::pin!(tx.send(out));
+                        let sent = match tokio::time::timeout_at(deadline, &mut send).await {
+                            Ok(sent) => sent,
+                            Err(_) => {
+                                token.take();
+                                send.await
+                            }
+                        };
+                        if sent.is_err() {
+                            return;
+                        }
+                        let _ = tokio::time::timeout_at(deadline, flushed).await;
+                        drop(token);
                     }
                     Reply::Stop(frame) => {
                         // One deadline for queueing and writing the reply: a client that stopped
@@ -277,6 +350,14 @@ enum Reply {
     Frame(ServerFrame),
     /// The reply to an accepted `service.shutdown`: written, then the service stops.
     Stop(ServerFrame),
+    /// A secrets reply; the token keeps a stop waiting until it is written.
+    Secrets(SecretsOut, TaskTrackerToken),
+}
+
+enum SecretsOut {
+    Frame(ServerFrame),
+    /// `{"id":…,"result":…}` with values, under the request's own id.
+    Sensitive(Zeroizing<String>),
 }
 
 /// A reply line; one that would exceed the frame limit becomes an `Internal` error for its id.
@@ -346,25 +427,86 @@ fn response<T: Serialize>(id: u64, result: Result<T, HostlerError>) -> ServerFra
     }
 }
 
+/// The error for a frame that does not parse, under its id when it has one. A frame whose
+/// method may carry a value — or whose method cannot be read — gets a fixed text: serde's
+/// messages quote the input. The payload is skipped unread, never built into a `Value`.
+fn unreadable(line: &str, e: &serde_json::Error) -> ServerFrame {
+    // Read apart, so a bad method does not lose the id.
+    #[derive(Deserialize)]
+    struct Id {
+        id: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct Method {
+        method: Option<String>,
+    }
+    let id = serde_json::from_str::<Id>(line)
+        .ok()
+        .and_then(|h| h.id)
+        .unwrap_or(0);
+    let sensitive = serde_json::from_str::<Method>(line)
+        .ok()
+        .and_then(|h| h.method)
+        .is_none_or(|m| sensitive_request(&m));
+    let message = if sensitive {
+        "unreadable request".to_owned()
+    } else {
+        format!("unreadable request: {e}")
+    };
+    ServerFrame::Error {
+        id,
+        error: HostlerError {
+            code: ErrorCode::BadRequest,
+            message,
+            details: json!({}),
+            recovery: None,
+        },
+    }
+}
+
+/// `{"id":<id>,"result":<json>}`, built inside a zeroizing string.
+fn sensitive_line(id: u64, json: &str) -> Zeroizing<String> {
+    let id = id.to_string();
+    let mut line = Zeroizing::new(String::with_capacity(json.len() + id.len() + 16));
+    line.push_str("{\"id\":");
+    line.push_str(&id);
+    line.push_str(",\"result\":");
+    line.push_str(json);
+    line.push('}');
+    line
+}
+
+/// Runs a secrets request on the blocking pool (the KDF never runs on the runtime, and never
+/// under the heavy engine's lock).
+async fn secrets_reply(id: u64, request: Request, shared: &Shared) -> Reply {
+    let token = shared.jobs.token();
+    let secrets = shared.secrets.clone();
+    let job = shared
+        .jobs
+        .spawn_blocking(move || secrets.dispatch(request));
+    let out = match job.await {
+        Ok(Ok(SecretsReply::Value(result))) => {
+            SecretsOut::Frame(ServerFrame::Response { id, result })
+        }
+        Ok(Ok(SecretsReply::Sensitive(json))) => SecretsOut::Sensitive(sensitive_line(id, &json)),
+        Ok(Err(error)) => SecretsOut::Frame(ServerFrame::Error { id, error }),
+        Err(_) => SecretsOut::Frame(ServerFrame::Error {
+            id,
+            error: HostlerError {
+                code: ErrorCode::Internal,
+                message: "the secrets job failed".into(),
+                details: json!({}),
+                recovery: None,
+            },
+        }),
+    };
+    Reply::Secrets(out, token)
+}
+
 async fn handle_line(line: &str, conn: &mut ConnState, shared: &Shared) -> Option<Reply> {
     let frame: ClientFrame = match serde_json::from_str(line) {
         Ok(frame) => frame,
-        Err(e) => {
-            // Answer under the frame's id when it has one, so the client is not left waiting.
-            let id = serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|v| v.get("id")?.as_u64())
-                .unwrap_or(0);
-            return Some(Reply::Frame(ServerFrame::Error {
-                id,
-                error: HostlerError {
-                    code: ErrorCode::BadRequest,
-                    message: format!("unreadable request: {e}"),
-                    details: json!({}),
-                    recovery: None,
-                },
-            }));
-        }
+        Err(e) => return Some(Reply::Frame(unreadable(line, &e))),
     };
     let id = frame.id;
     let reply = match frame.request {
@@ -384,12 +526,19 @@ async fn handle_line(line: &str, conn: &mut ConnState, shared: &Shared) -> Optio
                 Ok(running) if !running.is_empty() => {
                     Reply::Frame(response::<Value>(id, Err(lifecycle::busy(&running))))
                 }
-                Ok(_) => Reply::Stop(response(id, Ok(json!({ "stopping": true })))),
+                Ok(_) => {
+                    // Accepted: no new secrets work from here on, before any reply I/O (T6-6).
+                    shared.secrets.begin_shutdown();
+                    Reply::Stop(response(id, Ok(json!({ "stopping": true }))))
+                }
                 Err(e) => Reply::Frame(response::<Value>(id, Err(e))),
             });
         }
         _ if !conn.hello_ok => {
             response::<Value>(id, Err(lifecycle::hello_required(shared.contract_version)))
+        }
+        versioned if SecretsEngine::handles(&versioned) => {
+            return Some(secrets_reply(id, versioned, shared).await);
         }
         versioned => dispatch(id, versioned, &mut *shared.engine.lock().await),
     };
@@ -424,107 +573,7 @@ fn dispatch(id: u64, request: Request, engine: &mut HeavyEngine) -> ServerFrame 
         Request::Hello { .. } | Request::ServiceStatus | Request::ServiceShutdown { .. } => {
             unreachable!("lifecycle requests are answered before dispatch")
         }
-    }
-}
-
-#[cfg(windows)]
-mod windows_sd {
-    //! A named-pipe security descriptor whose DACL grants access to the current user only.
-
-    use std::ffi::c_void;
-
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt, BorrowedSecurityDescriptor, SecurityDescriptor,
-    };
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    pub fn current_user_only() -> anyhow::Result<SecurityDescriptor> {
-        let sid = current_user_sid()?;
-        // P = protected (no inherited ACEs); GA = generic all, for this SID only.
-        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: a NUL-terminated SDDL string and a writable out-pointer; the result is checked.
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut sd,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            anyhow::bail!(
-                "cannot build the pipe security descriptor: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: `sd` is a valid self-relative descriptor until the LocalFree below.
-        let owned = unsafe { BorrowedSecurityDescriptor::from_ptr(sd.cast_const()) }.to_owned_sd();
-        // SAFETY: `sd` was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
-        unsafe { LocalFree(sd) };
-        Ok(owned?)
-    }
-
-    fn current_user_sid() -> anyhow::Result<String> {
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: the pseudo-handle of the current process and a writable out-handle.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            anyhow::bail!(
-                "cannot open the process token: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let mut needed = 0u32;
-        // SAFETY: a size query with a null buffer; it fails with ERROR_INSUFFICIENT_BUFFER.
-        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-        // u64 storage keeps TOKEN_USER (which holds pointers) aligned.
-        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-        // SAFETY: `buf` is writable for `needed` bytes.
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                buf.as_mut_ptr().cast::<c_void>(),
-                needed,
-                &mut needed,
-            )
-        };
-        // SAFETY: `token` was opened above and is closed once.
-        unsafe { CloseHandle(token) };
-        if ok == 0 {
-            anyhow::bail!(
-                "cannot read the token user: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: GetTokenInformation(TokenUser) filled `buf` with a TOKEN_USER.
-        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut text: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `sid` points into `buf`, which is alive; `text` receives a LocalAlloc'd string.
-        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
-            anyhow::bail!(
-                "cannot format the user SID: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: `text` is a NUL-terminated UTF-16 string allocated by the call above.
-        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
-        // SAFETY: `len` u16s before the terminator are initialized.
-        let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
-        // SAFETY: allocated by ConvertSidToStringSidW.
-        unsafe { LocalFree(text.cast()) };
-        Ok(sid)
+        _ => unreachable!("secrets requests are answered before dispatch"),
     }
 }
 
@@ -538,5 +587,133 @@ mod tests {
         assert!(!peer_allowed(Some(0), 501));
         assert!(!peer_allowed(Some(502), 501));
         assert!(!peer_allowed(None, 501));
+    }
+
+    #[test]
+    fn unreadable_sensitive_frames_get_a_fixed_text() {
+        let cases = [
+            r#"{"id":7,"method":"secret.set","params":{"value":12,"name":"hunter2-canary"}}"#,
+            r#"{"id":7,"method":"secret.set","params":{"value":"hunter2-canary"}}"#,
+            r#"{"id":8,"method":"secret.materialize","params":"curl hunter2-canary"}"#,
+            r#"{"id":8,"method":"secret.materialize","params":{"names":"hunter2-canary"}}"#,
+            r#"{"id":9,"method":"secrets.unlock","params":{"password":["hunter2-canary"]}}"#,
+            // The method cannot be read: treated as sensitive.
+            r#"{"id":10,"method":7,"params":"hunter2-canary"}"#,
+        ];
+        for (case, line) in cases.into_iter().enumerate() {
+            let e = serde_json::from_str::<ClientFrame>(line).unwrap_err();
+            let ServerFrame::Error { id, error } = unreadable(line, &e) else {
+                panic!("case {case}: not an error frame");
+            };
+            assert!(id >= 7, "case {case}");
+            assert_eq!(error.message, "unreadable request", "case {case}");
+        }
+        // Other methods keep serde's diagnosis.
+        let line = r#"{"id":3,"method":"queue.set_capacity","params":{"capacity":"x"}}"#;
+        let e = serde_json::from_str::<ClientFrame>(line).unwrap_err();
+        let ServerFrame::Error { id, error } = unreadable(line, &e) else {
+            panic!("not an error frame");
+        };
+        assert_eq!(id, 3);
+        assert!(error.message.starts_with("unreadable request: "));
+    }
+
+    #[test]
+    fn sensitive_line_is_an_answer_frame() {
+        let line = sensitive_line(42, r#"[{"name":"A","value":"v"}]"#);
+        let frame: ServerFrame = serde_json::from_str(&line).unwrap();
+        assert!(matches!(frame, ServerFrame::Response { id: 42, .. }));
+    }
+
+    /// A service core with in-memory stores; `running` seeds a running heavy entry.
+    fn shared(dir: &std::path::Path, running: bool) -> Shared {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        use crate::contract::heavy::HeavyAcquire;
+        use crate::heavy::engine::{Clock, NoForeign};
+        use crate::procs::ProcessIdentity;
+        use crate::procs::fake::FakeTable;
+        use crate::secrets::vault::{KdfChoice, Vault};
+        use crate::store::Store;
+
+        struct FixedClock(AtomicI64);
+        impl Clock for FixedClock {
+            fn now_ms(&self) -> i64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let table = Arc::new(FakeTable::new("b1"));
+        table.insert(42, None, Some(420));
+        let heavy_store = Store::open_in_memory().unwrap();
+        if running {
+            let req = HeavyAcquire {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind: "gradle".into(),
+                command: "./gradlew build".into(),
+                cwd: "/work/app".into(),
+                workspace_root: None,
+                holder: ProcessIdentity {
+                    pid: 42,
+                    boot_id: "b1".into(),
+                    start_time: 420,
+                },
+                reentrant_token: None,
+                no_wait: false,
+            };
+            heavy_store.insert_waiting(&req, 0).unwrap();
+            heavy_store.mark_running(&req.id, 0).unwrap();
+        }
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (events, _) = broadcast::channel(16);
+        let kdbx = dir.join("hostler.kdbx");
+        Shared {
+            engine: Mutex::new(HeavyEngine::new(
+                heavy_store,
+                table.clone(),
+                clock.clone(),
+                Box::new(NoForeign),
+                events.clone(),
+            )),
+            secrets: Arc::new(SecretsEngine::new(
+                Vault::new(kdbx.clone()),
+                kdbx,
+                Store::open_in_memory().unwrap(),
+                table,
+                clock,
+                events.clone(),
+                KdfChoice::Fast,
+            )),
+            jobs: TaskTracker::new(),
+            events,
+            contract_version: lifecycle::service_contract_version(),
+            shutdown: watch::channel(false).0,
+        }
+    }
+
+    /// T6-6: an accepted shutdown closes secrets admission before its reply is written; a
+    /// refused one does not.
+    #[tokio::test]
+    async fn accepted_shutdown_closes_secrets_admission_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = r#"{"id":5,"method":"service.shutdown","params":{"if_idle":true}}"#;
+        for running in [true, false] {
+            let shared = shared(dir.path(), running);
+            let mut conn = ConnState {
+                hello_ok: false,
+                events: None,
+            };
+            let reply = handle_line(shutdown, &mut conn, &shared).await.unwrap();
+            let status = shared.secrets.dispatch(Request::SecretsStatus);
+            if running {
+                assert!(matches!(reply, Reply::Frame(ServerFrame::Error { .. })));
+                assert!(status.is_ok(), "a refused stop must not close admission");
+            } else {
+                // The reply has not been queued, let alone written.
+                assert!(matches!(reply, Reply::Stop(_)));
+                let e = status.err().expect("admission is closed");
+                assert_eq!(e.code, ErrorCode::ServiceUnavailable);
+                assert_eq!(e.details["reason"], "stopping");
+            }
+        }
     }
 }

@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{PipeWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::task::{Poll, Waker};
 
 use anyhow::Context;
@@ -16,20 +16,24 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::task::JoinHandle;
 
 use super::{
-    CANNOT_RUN, GATE_CLOSED, GATE_INTERRUPTED, GATE_OPEN, GateDecision, TOKEN_ENV, gate_decision,
-    read_gate,
+    CANNOT_RUN, GATE_CLOSED, GATE_INTERRUPTED, GATE_OPEN, GateDecision, Group, TOKEN_ENV,
+    gate_decision, read_gate,
 };
+use crate::cli::secret_run::ChildIo;
 use crate::procs::{ProcessIdentity, ProcessTable, RunGroup, identity_of};
 
 /// The descriptor the launcher reads its gate from.
 const GATE_FD: RawFd = 3;
 
-/// The command behind its gate, in its own process group, with signals forwarded to the group.
-/// Needs no process identity, so an unqueued run works where identities cannot be read.
+/// The command behind its gate, in its own process group, with signals forwarded to the group
+/// (or, in the enclosing group, SIGTERM/SIGHUP to the command alone). Needs no process
+/// identity, so an unqueued run works where identities cannot be read.
 pub struct Launched {
     child: Child,
     gate: Option<PipeWriter>,
-    pgid: libc::pid_t,
+    /// The launcher's pid: the command's after `exec`, and its group's id in its own group.
+    pid: libc::pid_t,
+    own_group: bool,
     /// Our own process group, when the terminal's foreground was handed to the child.
     terminal_back_to: Option<libc::pid_t>,
     forwarder: JoinHandle<()>,
@@ -44,14 +48,19 @@ pub struct Spawned {
     group: RunGroup,
 }
 
-/// Starts the gate launcher for `argv` in a new process group, with `TOKEN_ENV` set to `token`
-/// if given. The command does not run until `release_gate`. A signal `signals` already holds
-/// is delivered to the gated group by `release_gate` instead of opening it (the command never
-/// starts); later ones are forwarded at once. Needs a tokio runtime.
+/// Starts the gate launcher for `argv` in a new process group (`Group::Own`) or in ours, with
+/// `TOKEN_ENV` set to `token` if given and `io`'s environment; with masks its stdout and stderr
+/// are pipes (`take_output`). The command does not run until `release_gate`. A signal `signals`
+/// already holds is delivered to the gated launcher by `release_gate` instead of opening it (the
+/// command never starts); later ones are forwarded at once: all four to its own group, or only
+/// SIGTERM/SIGHUP to the command in ours (the terminal's SIGINT/SIGQUIT reach it directly).
+/// Needs a tokio runtime.
 pub fn launch(
     argv: Vec<OsString>,
     token: Option<&str>,
     mut signals: Signals,
+    io: &ChildIo,
+    group: Group,
 ) -> anyhow::Result<Launched> {
     anyhow::ensure!(!argv.is_empty(), "no command to run");
     let exe = std::env::current_exe().context("cannot find the hostler executable")?;
@@ -63,10 +72,17 @@ pub fn launch(
         .arg("--fd")
         .arg(GATE_FD.to_string())
         .arg("--")
-        .args(&argv)
-        .process_group(0);
+        .args(&argv);
+    let own_group = matches!(group, Group::Own);
+    if own_group {
+        command.process_group(0);
+    }
     if let Some(token) = token {
         command.env(TOKEN_ENV, token);
+    }
+    command.envs(io.env.iter().map(|(name, value)| (name, value)));
+    if io.masks.is_some() {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
     // SAFETY: only dup2 and fcntl, both async-signal-safe, run between fork and exec.
     unsafe {
@@ -85,14 +101,15 @@ pub fn launch(
     }
     let child = command.spawn().context("cannot start the gate launcher")?;
     drop(reader);
-    let pgid = child.id() as libc::pid_t;
+    let pid = child.id() as libc::pid_t;
     let pending = signals.pending();
     Ok(Launched {
         child,
         gate: Some(writer),
-        pgid,
+        pid,
+        own_group,
         terminal_back_to: None,
-        forwarder: tokio::spawn(signals.forward_to(pgid)),
+        forwarder: tokio::spawn(signals.forward_to(pid, own_group)),
         pending,
     })
 }
@@ -102,9 +119,10 @@ pub fn spawn_in_group(
     argv: Vec<OsString>,
     entry_id: &str,
     signals: Signals,
+    io: &ChildIo,
 ) -> anyhow::Result<Spawned> {
     let table = super::process_table()?;
-    let launched = launch(argv, Some(entry_id), signals)?;
+    let launched = launch(argv, Some(entry_id), signals, io, Group::Own)?;
     let pid = launched.child.id();
     let Some(identity) = identity_of(&table, pid) else {
         // The gate closes unopened: the launcher exits without running anything.
@@ -135,6 +153,10 @@ impl Spawned {
         self.launched.release_gate()
     }
 
+    pub fn take_output(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+        self.launched.take_output()
+    }
+
     pub fn wait(self) -> anyhow::Result<ExitStatus> {
         self.launched.wait()
     }
@@ -146,17 +168,28 @@ impl Spawned {
 }
 
 impl Launched {
+    /// The launcher's pid, which the command keeps after `exec`.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The command's output pipes, when `launch` was given masks.
+    pub fn take_output(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+        (self.child.stdout.take(), self.child.stderr.take())
+    }
+
     /// Lets the command run; first hands it the terminal when we are the foreground job.
     pub fn release_gate(&mut self) -> anyhow::Result<()> {
         let Some(mut gate) = self.gate.take() else {
             return Ok(());
         };
         if let Some(sig) = self.pending {
-            // SAFETY: killpg has no memory preconditions; the group is our gated launcher.
-            unsafe { libc::killpg(self.pgid, sig) };
+            deliver(self.pid, self.own_group, sig);
             anyhow::bail!("interrupted before the command started");
         }
-        self.terminal_back_to = give_terminal(self.pgid);
+        if self.own_group {
+            self.terminal_back_to = give_terminal(self.pid);
+        }
         gate.write_all(&[GATE_OPEN])
             .context("the gate launcher exited before the command could start")
     }
@@ -207,17 +240,39 @@ impl Signals {
         .find_map(|(s, sig)| matches!(s.poll_recv(&mut cx), Poll::Ready(Some(()))).then_some(sig))
     }
 
-    async fn forward_to(mut self, pgid: libc::pid_t) {
-        loop {
-            let sig = tokio::select! {
-                Some(()) = self.int.recv() => libc::SIGINT,
-                Some(()) = self.term.recv() => libc::SIGTERM,
-                Some(()) = self.hup.recv() => libc::SIGHUP,
-                Some(()) = self.quit.recv() => libc::SIGQUIT,
-                else => return,
-            };
-            // SAFETY: killpg has no memory preconditions; a gone group is not an error here.
-            unsafe { libc::killpg(pgid, sig) };
+    /// The next signal received; `None` once none can arrive. Cancel-safe.
+    pub async fn recv(&mut self) -> Option<()> {
+        self.next().await.map(|_| ())
+    }
+
+    async fn next(&mut self) -> Option<libc::c_int> {
+        tokio::select! {
+            Some(()) = self.int.recv() => Some(libc::SIGINT),
+            Some(()) = self.term.recv() => Some(libc::SIGTERM),
+            Some(()) = self.hup.recv() => Some(libc::SIGHUP),
+            Some(()) = self.quit.recv() => Some(libc::SIGQUIT),
+            else => None,
+        }
+    }
+
+    async fn forward_to(mut self, pid: libc::pid_t, own_group: bool) {
+        while let Some(sig) = self.next().await {
+            // In the enclosing group the terminal's SIGINT/SIGQUIT already reach the command.
+            if own_group || matches!(sig, libc::SIGTERM | libc::SIGHUP) {
+                deliver(pid, own_group, sig);
+            }
+        }
+    }
+}
+
+/// `sig` to the launcher's own group, or to the launcher (the command after `exec`) alone.
+fn deliver(pid: libc::pid_t, own_group: bool, sig: libc::c_int) {
+    // SAFETY: kill/killpg have no memory preconditions; a gone target is not an error here.
+    unsafe {
+        if own_group {
+            libc::killpg(pid, sig);
+        } else {
+            libc::kill(pid, sig);
         }
     }
 }
@@ -253,6 +308,15 @@ fn set_foreground(pgid: libc::pid_t) -> bool {
 /// `hostler __gate --fd <fd> -- <argv…>`: waits for one byte on `fd`, then becomes `argv`.
 /// `job` is Windows-only and ignored here.
 pub fn gate_main(fd: u64, _job: Option<&str>, argv: &[OsString]) -> i32 {
+    // First: a secret run's values are in this process's environment, and Linux reset the
+    // wrapper's PR_SET_DUMPABLE at our exec (CR-2). The command's exec resets it again.
+    crate::service::harden::harden_value_holder();
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if let Some(path) = std::env::var_os("HOSTLER_TEST_GATE_DUMPABLE_TO") {
+        // SAFETY: PR_GET_DUMPABLE takes no further arguments and only reads this process.
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        let _ = std::fs::write(path, dumpable.to_string());
+    }
     let fd = RawFd::try_from(fd).unwrap_or(-1);
     // SAFETY: F_GETFD only checks that the descriptor is open.
     if fd <= 2 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {

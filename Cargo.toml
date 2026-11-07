@@ -1,3 +1,17 @@
 [workspace]
 members = ["crates/hostler"]
 resolver = "3"
+
+# The KDF and KDBX crypto are unusably slow unoptimized (2.1 s per Argon2 open, 4.6 s for an
+# AES-KDF file in a debug build); tests open databases often.
+[profile.dev.package.keepass]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.rust-argon2]
+opt-level = 3
+
+[profile.dev.package.blake2b_simd]
+opt-level = 3

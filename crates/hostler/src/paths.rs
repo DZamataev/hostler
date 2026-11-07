@@ -13,6 +13,10 @@ pub struct Paths {
     pub service_lock: PathBuf,
     pub log_dir: PathBuf,
     pub socket: SocketName,
+    /// The secrets database (P2).
+    pub kdbx: PathBuf,
+    /// Per-run directories of `hostler run --secret-file` (P2).
+    pub runs: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +56,8 @@ impl Paths {
             service_lock: home.join("service.lock"),
             log_dir: home.join("logs"),
             socket: socket_name(&home),
+            kdbx: home.join("hostler.kdbx"),
+            runs: home.join("runs"),
             custom_home,
             home,
         }

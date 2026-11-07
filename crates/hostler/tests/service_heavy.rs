@@ -406,7 +406,7 @@ async fn accepted_stop_completes_while_a_subscriber_never_reads() {
     let mut silent = Stream::connect(name).await.unwrap();
     silent
         .write_all(
-            b"{\"id\":1,\"method\":\"hello\",\"params\":{\"contract_version\":1,\"client\":\"silent\"}}\n",
+            b"{\"id\":1,\"method\":\"hello\",\"params\":{\"contract_version\":2,\"client\":\"silent\"}}\n",
         )
         .await
         .unwrap();

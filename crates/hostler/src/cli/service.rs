@@ -1,5 +1,6 @@
-//! `hostler service run | start | stop | restart | status` (plan Task 6). Only lifecycle methods
-//! are used, so these commands also work against an older or newer service.
+//! `hostler service run | start | stop | restart | status` (plan Task 6). Lifecycle methods are
+//! used against any contract version; after a restart `secrets.status` is read best-effort to
+//! report that the database locked again (its failure is ignored, so an older service still works).
 
 use std::process::ExitCode;
 
@@ -7,6 +8,7 @@ use clap::Subcommand;
 
 use crate::client::{Client, socket_display};
 use crate::contract::heavy::{HeavyEntry, ServiceStatus};
+use crate::contract::secrets::{LockState, SecretsStatus};
 use crate::contract::wire::Request;
 use crate::contract::{CONTRACT_VERSION, Envelope, ErrorCode, HostlerError};
 use crate::paths::Paths;
@@ -112,7 +114,13 @@ pub fn main(command: ServiceCommand) -> ExitCode {
                 Err(code) => code,
             },
             ServiceCommand::Restart { force } => match stop(&paths, force, "restart").await {
-                Ok(()) => start(&paths).await,
+                Ok(()) => {
+                    let code = start(&paths).await;
+                    if code == ExitCode::SUCCESS {
+                        warn_if_secrets_locked(&paths).await;
+                    }
+                    code
+                }
                 Err(code) => code,
             },
             ServiceCommand::Status { json } => status(&paths, json).await,
@@ -227,6 +235,25 @@ async fn start(paths: &Paths) -> ExitCode {
             print_error(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// L1: a restart locks the database. Say so when it did (a status failure changes nothing).
+async fn warn_if_secrets_locked(paths: &Paths) {
+    let Ok(mut client) = Client::connect(paths).await else {
+        return;
+    };
+    let Ok(value) = client.call(Request::SecretsStatus).await else {
+        return;
+    };
+    let Ok(status) = serde_json::from_value::<SecretsStatus>(value) else {
+        return;
+    };
+    if status.state == LockState::Locked {
+        eprintln!(
+            "[hostler] The secrets database is locked again after the restart; a person runs \
+             `hostler unlock`."
+        );
     }
 }
 

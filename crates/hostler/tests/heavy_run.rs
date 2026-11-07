@@ -642,24 +642,23 @@ fn ctrl_c_between_grant_and_spawn_never_starts_the_command() {
     let home = Home::new();
     let a = home.heavy(&[], home.hold("a", 1000, &[])).spawn().unwrap();
     home.wait_started("a");
+    let gate = home.file("b-may-spawn");
     let b = home
         .heavy(&[], home.hold("b", 10, &[]))
-        .env("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_MS", "4000")
+        .env("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL", &gate)
         .spawn()
         .unwrap();
     home.wait_waiting(1);
     assert_code(&finish(a), 0);
-    // b now holds the slot and sleeps between its last stop check and the spawn.
-    let b_file = home.file("b").display().to_string();
-    wait_until("b to be granted", || {
-        home.snapshot()
-            .running
-            .iter()
-            .any(|e| e.command.contains(&b_file))
-    });
-    std::thread::sleep(Duration::from_millis(500));
+    // b holds the slot and blocks between its last stop check and the spawn until `gate`.
+    let reached = home.file("b-may-spawn.reached");
+    wait_until("b to reach the spawn", || reached.exists());
     // SAFETY: a plain kill of the test's own child process.
     assert_eq!(unsafe { libc::kill(b.id() as i32, libc::SIGINT) }, 0);
+    // The kernel delivers it at once; tokio's signal driver (another runtime thread, not the
+    // blocked one) records it for the wrapper's pending check.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(&gate, "").unwrap();
     let b = finish(b);
     assert_code(&b, 130);
     assert!(

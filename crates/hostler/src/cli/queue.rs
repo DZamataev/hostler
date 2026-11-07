@@ -5,20 +5,16 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use super::output::{call, print_error, report};
 use super::wait::duration_text;
-use crate::client::Client;
 use crate::contract::heavy::{
     DEFAULT_HISTORY_LIMIT, EntrySource, HeavyEntry, HeavyHistoryItem, HistoryQuery, QueueSnapshot,
 };
 use crate::contract::wire::Request;
-use crate::contract::{Envelope, ErrorCode, HostlerError};
+use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::{Clock, SystemClock};
-use crate::paths::Paths;
-use crate::service::manager::OsManager;
 
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -145,30 +141,6 @@ fn force_required(id: &str) -> HostlerError {
     }
 }
 
-async fn call<T: DeserializeOwned>(request: Request) -> Result<T, HostlerError> {
-    let paths = Paths::resolve().map_err(|e| HostlerError {
-        code: ErrorCode::Internal,
-        message: format!("{e:#}"),
-        details: json!({}),
-        recovery: None,
-    })?;
-    let mut client = Client::connect_or_start(&paths, &OsManager).await?;
-    let value = client.call(request).await?;
-    serde_json::from_value(value).map_err(|e| HostlerError {
-        code: ErrorCode::Internal,
-        message: format!("unreadable answer from the service: {e}"),
-        details: json!({}),
-        recovery: None,
-    })
-}
-
-fn print_error(e: &HostlerError) {
-    eprintln!("[hostler] {}", e.message);
-    if let Some(recovery) = &e.recovery {
-        eprintln!("[hostler] To fix: {recovery}");
-    }
-}
-
 fn done(result: Result<(), HostlerError>, message: &str) -> ExitCode {
     match result {
         Ok(()) => {
@@ -180,38 +152,6 @@ fn done(result: Result<(), HostlerError>, message: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn report<T: Serialize>(result: Result<T, HostlerError>, json: bool, human: fn(&T)) -> ExitCode {
-    let code = if result.is_ok() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    };
-    if json {
-        let envelope = match result {
-            Ok(data) => Envelope {
-                ok: true,
-                data: Some(data),
-                error: None,
-            },
-            Err(e) => Envelope {
-                ok: false,
-                data: None,
-                error: Some(e),
-            },
-        };
-        println!(
-            "{}",
-            serde_json::to_string(&envelope).expect("an envelope always encodes")
-        );
-    } else {
-        match &result {
-            Ok(data) => human(data),
-            Err(e) => print_error(e),
-        }
-    }
-    code
 }
 
 fn since(now_ms: i64, then_ms: i64) -> String {
