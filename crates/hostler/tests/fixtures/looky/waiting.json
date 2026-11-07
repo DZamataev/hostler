@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "heavy": {
+    "capacity": 1,
+    "nextTicket": 2,
+    "entries": [
+      {
+        "id": "h1-abc123",
+        "ticket": 1,
+        "kind": "deps",
+        "command": "yarn deps",
+        "path": "/work/app",
+        "owner": {
+          "pid": 999999,
+          "bootId": "boot-1",
+          "startTime": "Thu Jan  1 00:00:00 2026"
+        },
+        "state": "waiting",
+        "enqueuedAt": "2026-01-01T00:00:00.000Z"
+      }
+    ]
+  }
+}

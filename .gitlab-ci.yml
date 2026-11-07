@@ -1,0 +1,36 @@
+stages:
+  - check
+  - test
+
+lint:
+  stage: check
+  image: rust:1.99.1
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+test-linux:
+  stage: test
+  image: rust:1.99.1
+  script:
+    - cargo test --workspace --locked
+
+test-windows:
+  stage: test
+  tags:
+    - saas-windows-medium-amd64
+  script:
+    - if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) { Invoke-WebRequest -UseBasicParsing -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe; .\rustup-init.exe -y --profile minimal --default-toolchain none }
+    - $cargoBin = if ($env:CARGO_HOME) { Join-Path $env:CARGO_HOME "bin" } else { Join-Path $env:USERPROFILE ".cargo\bin" }; $env:PATH = "$cargoBin;$env:PATH"
+    - rustup toolchain install 1.99.1 --profile minimal
+    - rustup default 1.99.1
+    - cargo test --workspace --locked
+
+test-macos:
+  stage: test
+  tags:
+    - macos
+  when: manual
+  script:
+    - cargo test --workspace --locked

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "worktrees": {
+    "demo": {
+      "path": "/work/app"
+    }
+  }
+}
