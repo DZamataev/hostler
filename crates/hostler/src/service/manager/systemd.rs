@@ -14,6 +14,7 @@ pub fn render_definition(exe: &Path, _paths: &Paths) -> String {
          [Service]\n\
          ExecStart={} service run --managed\n\
          Restart=on-failure\n\
+         KillMode=process\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -34,7 +35,31 @@ fn quote_exec(exe: &Path) -> String {
     }
 }
 
-/// A unit from before `--managed` starts a service that steps aside.
+/// P2-13: the notes about an installed unit that change nothing about its state. A unit without
+/// `KillMode=process` (from before P3b, L51) stops the adb server and hostler-booted emulators
+/// with every service stop; it still serves, so it stays `Current`.
+pub fn definition_notes(unit: &str) -> Vec<&'static str> {
+    let killmode = unit.lines().any(|line| line.trim() == "KillMode=process");
+    if killmode {
+        Vec::new()
+    } else {
+        vec![UNIT_LACKS_KILLMODE]
+    }
+}
+
+pub const UNIT_LACKS_KILLMODE: &str = "unit_lacks_killmode";
+
+/// The installed unit's notes; none when there is no unit or it cannot be read.
+#[cfg(target_os = "linux")]
+pub fn notes() -> Vec<&'static str> {
+    unit_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|unit| definition_notes(&unit))
+        .unwrap_or_default()
+}
+
+/// A unit from before `--managed` starts a service that steps aside. Unchanged by P3b: a unit
+/// without `KillMode=process` is current (P2-13).
 pub fn definition_is_current(unit: &str) -> bool {
     unit.lines().any(|line| {
         line.trim_start().starts_with("ExecStart=") && line.trim_end().ends_with(" --managed")
@@ -239,6 +264,30 @@ mod tests {
         assert_eq!(
             *calls.borrow(),
             ["disable --now hostler.service", "daemon-reload"]
+        );
+    }
+
+    #[test]
+    fn systemd_unit_has_killmode_process() {
+        let unit = render_definition(Path::new("/usr/bin/hostler"), &sample_paths());
+        assert!(unit.lines().any(|l| l == "KillMode=process"), "{unit}");
+        assert!(definition_is_current(&unit));
+        assert!(definition_notes(&unit).is_empty());
+    }
+
+    /// P2-13: an installed unit from before P3b still serves; it only gets a note.
+    #[test]
+    fn old_unit_without_killmode_is_current_with_a_note() {
+        let old = "[Unit]\nDescription=hostler per-user service\n\n[Service]\n\
+                   ExecStart=/usr/bin/hostler service run --managed\nRestart=on-failure\n\n\
+                   [Install]\nWantedBy=default.target\n";
+        assert!(definition_is_current(old));
+        assert_eq!(definition_notes(old), [UNIT_LACKS_KILLMODE]);
+        assert_eq!(
+            definition_notes(
+                &old.replace("Restart=on-failure", "Restart=on-failure\nKillMode=mixed")
+            ),
+            [UNIT_LACKS_KILLMODE]
         );
     }
 

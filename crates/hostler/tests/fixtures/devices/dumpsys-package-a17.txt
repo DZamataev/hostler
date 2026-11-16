@@ -1,0 +1,26 @@
+  Package [com.example.app3] (2667cac):
+    versionCode=211 minSdk=25 targetSdk=35
+    versionName=2.8.1
+    lastUpdateTime=2026-10-18 01:08:59
+    User 0: ceDataInode=1001 installed=true hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=2026-10-18 01:08:59
+    User 10: ceDataInode=2001 installed=false hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=1970-01-01 03:00:00
+  Package [com.example.app2] (cc7ccb6):
+    versionCode=22425 minSdk=32 targetSdk=37
+    versionName=1.463.993399841
+    lastUpdateTime=2026-10-15 14:10:34
+    User 0: ceDataInode=1002 installed=true hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=2026-06-30 13:06:39
+    User 10: ceDataInode=2002 installed=false hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=1970-01-01 03:00:00
+    User 150: ceDataInode=3002 installed=false hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=2026-01-02 03:04:05
+  Package [com.example.app1] (f2d1ebc):
+    versionCode=3615 minSdk=28 targetSdk=36
+    versionName=236.6
+    lastUpdateTime=2026-11-07 01:05:23
+    User 0: ceDataInode=1003 installed=true hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=2026-10-09 21:19:02
+    User 10: ceDataInode=2003 installed=false hidden=false suspended=false stopped=false notLaunched=false enabled=0
+      firstInstallTime=1970-01-01 03:00:00

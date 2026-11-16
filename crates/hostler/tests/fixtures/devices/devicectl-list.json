@@ -1,0 +1,310 @@
+{
+ "info": {
+  "commandType": "devicectl.list.devices",
+  "jsonVersion": 3,
+  "outcome": "success",
+  "version": "518.33"
+ },
+ "result": {
+  "devices": [
+   {
+    "capabilities": [
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.acquireusageassertion",
+      "name": "Acquire Usage Assertion"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.connectdevice",
+      "name": "Connect to Device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.tags",
+      "name": "Modify Tags"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.default.user.credentials",
+      "name": "Modify credentials for default users for a device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.unpairdevice",
+      "name": "Unpair Device"
+     }
+    ],
+    "connectionProperties": {
+     "authenticationType": "manualPairing",
+     "isMobileDeviceOnly": false,
+     "lastConnectionDate": "2026-11-07T19:07:00.000Z",
+     "pairingState": "paired",
+     "transportType": "localNetwork",
+     "tunnelState": "disconnected",
+     "tunnelTransportProtocol": "tcp",
+     "localHostnames": []
+    },
+    "deviceProperties": {
+     "bootedFromSnapshot": true,
+     "bootedSnapshotName": "com.apple.os.update-957F7D86D70816B4A3574E3ADE10DA5015F261077EAF69B5E102ED6118DEB4D4",
+     "ddiServicesAvailable": false,
+     "developerModeStatus": "enabled",
+     "hasInternalOSBuild": false,
+     "name": "Test iPhone 0",
+     "osBuildUpdate": "22H352",
+     "osVersionNumber": "18.7.8",
+     "rootFileSystemIsWritable": false,
+     "screenViewingURL": "devices://device/open?id=00000000-0000-4000-8000-0000000000C0",
+     "supportsCheckedAllocations": false
+    },
+    "hardwareProperties": {
+     "cpuType": {
+      "name": "arm64e",
+      "subType": 2,
+      "type": 16777228
+     },
+     "deviceType": "iPhone",
+     "hardwareModel": "D17AP",
+     "internalStorageCapacity": 128000000000,
+     "isProductionFused": true,
+     "marketingName": "iPhone 13",
+     "platform": "iOS",
+     "productType": "iPhone14,5",
+     "reality": "physical",
+     "supportedCPUTypes": [
+      {
+       "name": "arm64e",
+       "subType": 2,
+       "type": 16777228
+      },
+      {
+       "name": "arm64",
+       "subType": 0,
+       "type": 16777228
+      },
+      {
+       "name": "unknown-12-13",
+       "subType": 13,
+       "type": 12
+      }
+     ],
+     "supportedDeviceFamilies": [
+      1
+     ],
+     "thinningProductType": "iPhone14,5",
+     "udid": "00008101-000A00000000000E"
+    },
+    "identifier": "00000000-0000-4000-8000-0000000000C0",
+    "tags": [],
+    "visibilityClass": "default"
+   },
+   {
+    "capabilities": [
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.acquireusageassertion",
+      "name": "Acquire Usage Assertion"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.applicationcontrol",
+      "name": "Application Control"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.capturesysdiagnose",
+      "name": "Capture Sysdiagnose"
+     },
+     {
+      "featureIdentifier": "com.apple.dt.serviceconnection.create",
+      "name": "Create Service Connection"
+     },
+     {
+      "featureIdentifier": "com.apple.dt.servicesocket.create",
+      "name": "Create Service Socket"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.disableddiservices",
+      "name": "Disable Developer Disk Image Services"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.disconnectdevice",
+      "name": "Disconnect from Device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.fetchappicons",
+      "name": "Fetch Application Icons"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.getauthlistingidentifiers",
+      "name": "Fetch AuthListing Identifiers"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.fetchddimetadata",
+      "name": "Fetch Developer Disk Image Services Metadata"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.getdeviceinfo",
+      "name": "Fetch Extended Device Info"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.getdisplayinfo",
+      "name": "Get Display Information"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.getlockstate",
+      "name": "Get Lock State"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.installapp",
+      "name": "Install Application"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.installroot",
+      "name": "Install Root"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.launchapplication",
+      "name": "Launch Application"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.listFiles",
+      "name": "List Files"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.listroots",
+      "name": "List Roots"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.tags",
+      "name": "Modify Tags"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.default.user.credentials",
+      "name": "Modify credentials for default users for a device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.monitorprocesstermination",
+      "name": "Monitor Process for Termination"
+     },
+     {
+      "featureIdentifier": "com.apple.dt.customer.postdarwinnotification",
+      "name": "Post Darwin Notification"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.processcontrol",
+      "name": "Process Control"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.querymobilegestalt",
+      "name": "Query MobileGestalt"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.rebootdevice",
+      "name": "Reboot Device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.sendmemorywarningtoprocess",
+      "name": "Send Memory Warning to Process"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.sendsignaltoprocess",
+      "name": "Send Signal to Process"
+     },
+     {
+      "featureIdentifier": "com.apple.dt.profile",
+      "name": "Service Hub Profile"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.spawnexecutable",
+      "name": "Spawn Executable"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.streamapplist",
+      "name": "Stream Application List"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.streamprocesslist",
+      "name": "Stream Process List"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.transferFiles",
+      "name": "Transfer Files"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.uninstallapp",
+      "name": "Uninstall Application"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.uninstallroot",
+      "name": "Uninstall Root"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.unpairdevice",
+      "name": "Unpair Device"
+     },
+     {
+      "featureIdentifier": "com.apple.coredevice.feature.viewdevicescreen",
+      "name": "View Device Screen"
+     }
+    ],
+    "connectionProperties": {
+     "authenticationType": "manualPairing",
+     "isMobileDeviceOnly": false,
+     "lastConnectionDate": "2026-11-08T00:04:00.000Z",
+     "localHostnames": [],
+     "pairingState": "paired",
+     "transportType": "wired",
+     "tunnelIPAddress": "2001:db8::1",
+     "tunnelState": "connected",
+     "tunnelTransportProtocol": "tcp"
+    },
+    "deviceProperties": {
+     "bootState": "booted",
+     "bootedFromSnapshot": true,
+     "bootedSnapshotName": "com.apple.os.update-2EE7542680A07E40A4D3F4A62C80440C22D448F1E62DD4FA4C33086C4F2814A5",
+     "ddiServicesAvailable": true,
+     "developerModeStatus": "enabled",
+     "hasInternalOSBuild": false,
+     "name": "Test iPhone 1",
+     "osBuildUpdate": "23G71",
+     "osVersionNumber": "26.6",
+     "providerSpecificValues": {
+      "hasAMRestorableDeviceRef": "true"
+     },
+     "rootFileSystemIsWritable": false,
+     "screenViewingURL": "devices://device/open?id=00000000-0000-4000-8000-0000000000C1",
+     "supportsCheckedAllocations": false
+    },
+    "hardwareProperties": {
+     "cpuType": {
+      "name": "arm64e",
+      "subType": 2,
+      "type": 16777228
+     },
+     "deviceType": "iPhone",
+     "hardwareModel": "D53pAP",
+     "internalStorageCapacity": 256000000000,
+     "isProductionFused": true,
+     "marketingName": "iPhone 12 Pro",
+     "platform": "iOS",
+     "productType": "iPhone13,3",
+     "reality": "physical",
+     "supportedCPUTypes": [
+      {
+       "name": "arm64e",
+       "subType": 2,
+       "type": 16777228
+      },
+      {
+       "name": "arm64",
+       "subType": 0,
+       "type": 16777228
+      }
+     ],
+     "supportedDeviceFamilies": [
+      1
+     ],
+     "thinningProductType": "iPhone13,3",
+     "udid": "00008101-000A00000000001E"
+    },
+    "identifier": "00000000-0000-4000-8000-0000000000C1",
+    "tags": [],
+    "visibilityClass": "default"
+   }
+  ]
+ }
+}

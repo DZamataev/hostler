@@ -43,6 +43,24 @@ impl OsManager {
     pub fn registration(&self) -> RegistrationState {
         imp::registration()
     }
+
+    /// Notes on the installed definition that change nothing about its state (P2-13): Linux
+    /// `unit_lacks_killmode`; none elsewhere.
+    pub fn registration_notes(&self) -> Vec<&'static str> {
+        #[cfg(target_os = "linux")]
+        return systemd::notes();
+        #[cfg(not(target_os = "linux"))]
+        Vec::new()
+    }
+}
+
+/// The text `service status` prints for a registration note.
+pub fn note_text(note: &str) -> Option<&'static str> {
+    (note == systemd::UNIT_LACKS_KILLMODE).then_some(
+        "note: the unit lacks KillMode=process: a service stop also stops the adb server and \
+         hostler-booted emulators; run hostler service install (the install stops the service \
+         once more under the old unit, which stops them too)",
+    )
 }
 
 impl ServiceManager for OsManager {

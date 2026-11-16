@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 
 use crate::cli::output::report;
-use crate::cli::secrets::{PERSON_ONLY, call, current_project, report_error};
+use crate::cli::secrets::{PERSON_ONLY, call, current_project, project_at, report_error};
 use crate::cli::tty::Tty;
 use crate::contract::HostlerError;
 use crate::contract::secrets::ProjectInfo;
@@ -72,7 +72,7 @@ fn approve(path: Option<PathBuf>) -> ExitCode {
 fn run_approve(path: PathBuf) -> Result<ExitCode, HostlerError> {
     // Person-only: refuse before touching the project or the service.
     let mut tty = Tty::open("project approve")?;
-    let project_ref = crate::project::current(&path)?.project;
+    let project_ref = project_at(&path)?;
     let project = call::<ProjectInfo>(Request::ProjectResolve(project_ref.clone()))?;
     let name = sanitize_for_terminal(&project.name);
     println!("{name}");
@@ -103,6 +103,15 @@ fn print_projects(projects: &[ProjectInfo]) {
         return;
     }
     for project in projects {
+        // A project whose path now holds another repository (L21).
+        if let Some(old_path) = moved_away_path(&project.common_dir, &project.id) {
+            println!(
+                "{} — waiting at {} (moved away)",
+                sanitize_for_terminal(&project.name),
+                sanitize_for_terminal(old_path)
+            );
+            continue;
+        }
         println!(
             "{} — {} ({})",
             sanitize_for_terminal(&project.name),
@@ -114,4 +123,9 @@ fn print_projects(projects: &[ProjectInfo]) {
             }
         );
     }
+}
+
+/// `moved-away:<id>:<old path>` → the old path.
+fn moved_away_path<'a>(common_dir: &'a str, id: &str) -> Option<&'a str> {
+    common_dir.strip_prefix(&format!("moved-away:{id}:"))
 }

@@ -33,7 +33,8 @@ When your command exits, the slot is released even if it left background process
 (build daemons such as the Kotlin or Gradle daemons outlive builds for hours and must not hold the
 queue). Do not background heavy work inside a wrapped command. If the wrapper itself is killed,
 the slot stays taken while the command's process group still has a live process;
-`hostler queue release --id <id> --force` (operator's permission) frees it.
+`hostler queue release --id <id> --force` (operator's permission) frees it. An agent uses --force
+only with the operator's explicit permission.
 
 ## Waiting
 
@@ -95,11 +96,11 @@ capacity but hostler does not own or stop them.
 ### `--force` is the operator's decision
 
 `hostler queue release --id <id> --force` frees a slot while the task may still be running (the
-processes are **not** stopped). Without the flag, hostler refuses with a recovery command.
+processes are **not** stopped). Without the flag, hostler refuses with a recovery command. An
+agent uses --force only with the operator's explicit permission.
 
-Agents use `--force` — on `queue release`, `service stop`, `service restart`, `service install` or
-`service uninstall` — **only with the operator's explicit permission**. Never infer it. Ask, name
-the task, and wait for a yes.
+Never infer it. Ask, name the task, and wait for a yes — on `queue release`, `service stop`,
+`service restart`, `service install` or `service uninstall` alike.
 
 ## The service
 
@@ -110,15 +111,25 @@ starts it on demand. When you do:
 hostler service status            # running/not, pid, versions, socket
 hostler service status --json
 hostler service start
-hostler service stop              # refused while heavy tasks run unless --force
+hostler service stop              # refused while work runs, unless --force
 hostler service restart
 hostler service install           # register with the OS so it starts at logon
 hostler service uninstall
 ```
 
-`install` replaces an existing registration and `uninstall` removes it; both stop the service
-first and refuse while heavy tasks run unless `--force`. They are for the real home only, not a
-`HOSTLER_HOME` test directory.
+`stop` and `restart` are refused while heavy tasks or claim runs (a `run --screen` /
+`--account`, or a hold with a live linked run) run, and while a takeover is in progress; so are
+`install` and `uninstall`, which stop the service first. `--force` goes ahead anyway. An agent
+uses --force only with the operator's explicit permission.
+
+`install` replaces an existing registration and `uninstall` removes it. They are for the real home
+only, not a `HOSTLER_HOME` test directory. `HOSTLER_HOME` must be an absolute path; a relative one
+is refused (exit 1) before hostler derives anything from it.
+
+A service that hostler starts itself (every client start, and `service start`) gets a clean
+environment: it inherits none of the variables of the command that triggered the start, so a run's
+`--secret`/`--account` values never reach the long-lived service. It keeps only what it needs
+(home, user, locale, temp, `HOSTLER_HOME`).
 
 After upgrading the hostler binary, run `hostler service restart` so the service runs the new
 binary and contract. A service with a different contract version is reported by clients as

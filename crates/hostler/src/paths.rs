@@ -25,6 +25,27 @@ pub enum SocketName {
     Namespaced(String),
 }
 
+/// The home directory and whether it is a custom one. L45 (W-13): `HOSTLER_HOME` must be
+/// absolute — the socket name is derived from its spelling, so a relative or drive-relative one
+/// would start a service that the same home written absolutely can never reach.
+fn chosen_home(
+    var: Option<std::ffi::OsString>,
+    default_home: PathBuf,
+) -> anyhow::Result<(PathBuf, bool)> {
+    let Some(home) = var else {
+        return Ok((default_home, false));
+    };
+    let home = PathBuf::from(home);
+    anyhow::ensure!(
+        home.is_absolute(),
+        "HOSTLER_HOME must be an absolute path, not {:?}; set it to the full path of the \
+         directory",
+        home.display().to_string()
+    );
+    let custom_home = home != default_home;
+    Ok((home, custom_home))
+}
+
 impl Paths {
     /// The per-user data directory, ignoring `HOSTLER_HOME`.
     pub fn default_home() -> anyhow::Result<PathBuf> {
@@ -35,15 +56,8 @@ impl Paths {
 
     /// `HOSTLER_HOME` or the OS default, then `ensure_dirs`.
     pub fn resolve() -> anyhow::Result<Paths> {
-        let default_home = Paths::default_home()?;
-        let (home, custom_home) = match std::env::var_os("HOSTLER_HOME") {
-            Some(home) => {
-                let home = PathBuf::from(home);
-                let custom_home = home != default_home;
-                (home, custom_home)
-            }
-            None => (default_home, false),
-        };
+        let (home, custom_home) =
+            chosen_home(std::env::var_os("HOSTLER_HOME"), Paths::default_home()?)?;
         let paths = Paths::under(home, custom_home);
         paths.ensure_dirs()?;
         Ok(paths)
@@ -179,4 +193,34 @@ fn check_private_dir(dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    /// L45 (W-13): only an absolute `HOSTLER_HOME`.
+    #[test]
+    fn hostler_home_must_be_absolute() {
+        let default = std::env::temp_dir().join("default-home");
+        assert_eq!(
+            chosen_home(None, default.clone()).unwrap(),
+            (default.clone(), false)
+        );
+        let custom = std::env::temp_dir().join("custom-home");
+        assert_eq!(
+            chosen_home(Some(custom.clone().into()), default.clone()).unwrap(),
+            (custom, true)
+        );
+        for relative in ["relative/home", "", "."] {
+            let e = chosen_home(Some(relative.into()), default.clone()).unwrap_err();
+            assert!(
+                e.to_string()
+                    .starts_with("HOSTLER_HOME must be an absolute path"),
+                "{e}"
+            );
+        }
+        #[cfg(windows)]
+        assert!(chosen_home(Some(r"C:Users\\me".into()), default).is_err());
+    }
 }

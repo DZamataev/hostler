@@ -98,7 +98,7 @@ fn check_group(group: &RunGroup) -> Result<(), HostlerError> {
         RunGroup::UnixGroup { boot_id, .. } => {
             check_json_len("group.boot_id", boot_id, MAX_IDENTITY_BYTES)
         }
-        RunGroup::WindowsJob { name, boot_id } => {
+        RunGroup::WindowsJob { name, boot_id, .. } => {
             check_json_len("group.name", name, MAX_IDENTITY_BYTES)?;
             check_json_len("group.boot_id", boot_id, MAX_IDENTITY_BYTES)
         }
@@ -127,7 +127,7 @@ fn clamp_display(mut e: HeavyEntry) -> HeavyEntry {
     }
     match e.group.as_mut() {
         Some(RunGroup::UnixGroup { boot_id, .. }) => cut(boot_id, MAX_IDENTITY_BYTES),
-        Some(RunGroup::WindowsJob { name, boot_id }) => {
+        Some(RunGroup::WindowsJob { name, boot_id, .. }) => {
             cut(name, MAX_IDENTITY_BYTES);
             cut(boot_id, MAX_IDENTITY_BYTES);
         }
@@ -320,6 +320,8 @@ impl HeavyEngine {
                 self.store
                     .set_started(&s.id, &s.child, &s.group)
                     .map_err(internal)?;
+                // L31: the service keeps the run's job findable while the entry lives.
+                self.table.hold_group("heavy", &s.group);
                 self.tick();
                 Ok(())
             }
@@ -450,6 +452,9 @@ impl HeavyEngine {
         }
         let foreign = self.foreign.running();
         let entries = self.store.entries()?;
+        // L31: handles only for live entries' jobs (reopened after a restart).
+        let groups: Vec<RunGroup> = entries.iter().filter_map(|e| e.group.clone()).collect();
+        self.table.hold_only("heavy", &groups);
         let capacity = self.store.capacity()?;
         if !self.stopping {
             for id in queue::grantable(capacity, &entries, foreign.len()) {
@@ -1093,6 +1098,7 @@ mod tests {
             group: RunGroup::WindowsJob {
                 name: "\u{1}".repeat(43),
                 boot_id: BOOT.into(),
+                session: None,
             },
         };
         assert_eq!(
@@ -1158,6 +1164,23 @@ mod tests {
         );
         let entry = w.engine.store.entry(&a.id).unwrap().unwrap();
         assert_eq!(entry.child, Some(identity(11)));
+    }
+
+    /// L31: the engine holds a handle on an entry's group from `heavy.started` until the entry
+    /// ends; the tick keeps only live entries' (and reopens them after a restart).
+    #[test]
+    fn run_groups_are_held_while_their_entries_live() {
+        let mut w = world();
+        let a = w.request(10, None);
+        w.acquire(&a);
+        w.table.insert(11, Some(10), Some(110));
+        let s = started_for(&a.id, 11);
+        w.engine.started(s.clone()).unwrap();
+        assert_eq!(w.table.held("heavy"), vec![s.group.clone()]);
+        w.engine.tick();
+        assert_eq!(w.table.held("heavy"), vec![s.group.clone()]);
+        w.engine.release(release(&a.id)).unwrap();
+        assert!(w.table.held("heavy").is_empty());
     }
 
     #[test]

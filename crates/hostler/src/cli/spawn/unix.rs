@@ -80,6 +80,9 @@ pub fn launch(
     if let Some(token) = token {
         command.env(TOKEN_ENV, token);
     }
+    for name in &io.remove {
+        command.env_remove(name);
+    }
     command.envs(io.env.iter().map(|(name, value)| (name, value)));
     if io.masks.is_some() {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -114,15 +117,18 @@ pub fn launch(
     })
 }
 
-/// `launch` plus the identity and group the service needs; reads the process table first.
+/// `launch` in a new process group, plus the identity and group the service needs; reads the
+/// process table first. `run_id` names the run (a heavy entry's or a claim run's id); `token`
+/// is the heavy slot the command holds, if this run holds one (else the inherited one stays).
 pub fn spawn_in_group(
     argv: Vec<OsString>,
-    entry_id: &str,
+    _run_id: &str,
+    token: Option<&str>,
     signals: Signals,
     io: &ChildIo,
 ) -> anyhow::Result<Spawned> {
     let table = super::process_table()?;
-    let launched = launch(argv, Some(entry_id), signals, io, Group::Own)?;
+    let launched = launch(argv, token, signals, io, Group::Own)?;
     let pid = launched.child.id();
     let Some(identity) = identity_of(&table, pid) else {
         // The gate closes unopened: the launcher exits without running anything.
@@ -238,6 +244,20 @@ impl Signals {
         ]
         .into_iter()
         .find_map(|(s, sig)| matches!(s.poll_recv(&mut cx), Poll::Ready(Some(()))).then_some(sig))
+    }
+
+    /// The exit code of a signal already received (143 for SIGTERM, else 130); never waits.
+    pub fn interrupted(&mut self) -> Option<i32> {
+        self.pending()
+            .map(|sig| if sig == libc::SIGTERM { 143 } else { 130 })
+    }
+
+    /// The next signal's exit code (143 for SIGTERM, else 130); `None` once none can arrive.
+    /// Cancel-safe.
+    pub async fn recv_code(&mut self) -> Option<i32> {
+        self.next()
+            .await
+            .map(|sig| if sig == libc::SIGTERM { 143 } else { 130 })
     }
 
     /// The next signal received; `None` once none can arrive. Cancel-safe.

@@ -1,12 +1,15 @@
 //! The versioned contract shared by the CLI, the service, MCP and the app (spec §12, plan Task 4).
 
+pub mod accounts;
+pub mod claims;
+pub mod devices;
 pub mod heavy;
 pub mod secrets;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +37,29 @@ pub enum ErrorCode {
     SecretExists,
     SecretTooShort,
     RequestTimeout,
+    UnknownResource,
+    ResourceInUse,
+    ClaimNotHeld,
+    SeizureFailed,
+    AccountMissing,
+    ClaimDeadlock,
+    /// L33: refused because the run it comes from (or the claim itself) is being taken over;
+    /// every wrapper treats it as "not running", never as a service fault.
+    TakenOver,
+    /// P3b: recovery `hostler devices list --all`.
+    DeviceNotFound,
+    /// P3b: recovery `choose another alias, or: hostler devices rename {holder} <other>`.
+    AliasTaken,
+    /// P3b, L49: a physical device is registered by a person, a virtual one by anyone.
+    DeviceNotRegistered,
+    /// P3b: recovery `rerun with --boot`.
+    DeviceNotReady,
+    /// P3b: recovery `hostler devices show {alias}; emulator output: {log path}`.
+    BootFailed,
+    /// P3b: adb or agent-device cannot be found; the recovery names the fix.
+    ToolMissing,
+    /// P3b, L49, L54: a person-only device call without the person prompt.
+    PermissionDenied,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_2() {
-        assert_eq!(CONTRACT_VERSION, 2);
+    fn contract_version_is_4() {
+        assert_eq!(CONTRACT_VERSION, 4);
     }
 }

@@ -1,13 +1,20 @@
 //! The SQLite store behind the heavy queue (plan Task 5).
 
+mod claims;
+mod devices;
 mod schema;
 mod secrets;
+mod workspaces;
+
+pub use claims::{ClaimRow, PendingRow};
+pub use devices::{DeviceRow, DeviceSeen, SerialSeen};
+pub use workspaces::{ProjectResolution, WorkspaceRow};
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::contract::heavy::{
     EntrySource, HeavyAcquire, HeavyEntry, HeavyHistoryItem, HeavyOutcome, HeavyState,
@@ -61,9 +68,18 @@ impl Store {
         set_setting(&self.conn, "heavy.capacity", &n.to_string())
     }
 
+    /// Every read-then-write transaction takes the writer lock before its first read. A
+    /// DEFERRED one that reads, sees another connection commit, and then writes fails at once
+    /// with `SQLITE_BUSY_SNAPSHOT` ("database is locked"), which `busy_timeout` never retries
+    /// (P3a T3-1; three connections share this WAL database).
+    fn immediate_tx(&self) -> anyhow::Result<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("cannot begin an immediate transaction")
+    }
+
     pub fn insert_waiting(&self, req: &HeavyAcquire, now_ms: i64) -> anyhow::Result<HeavyEntry> {
         let holder = serde_json::to_string(&req.holder).context("cannot encode the holder")?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.immediate_tx()?;
         let next_ticket = match setting(&tx, "heavy.next_ticket")?.as_deref() {
             Some(raw) => raw
                 .parse::<i64>()
@@ -174,7 +190,7 @@ impl Store {
         outcome: HeavyOutcome,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.immediate_tx()?;
         let moved = tx.execute(
             "INSERT INTO heavy_history (id, ticket, kind, command, cwd, workspace_root, \
              enqueued_at_ms, granted_at_ms, finished_at_ms, exit_code, outcome) \
@@ -532,8 +548,91 @@ mod tests {
         };
         let message = format!("{err:#}");
         assert!(
-            message.contains("version 99") && message.contains("version 2"),
+            message.contains("version 99") && message.contains("version 4"),
             "unexpected error: {message}"
         );
+    }
+
+    fn claim_request(id: &str) -> crate::contract::claims::ClaimRequest {
+        use crate::contract::claims::{Purpose, ResourceId, Selector};
+
+        crate::contract::claims::ClaimRequest {
+            id: id.into(),
+            selector: Selector::Exact {
+                resource: ResourceId::screen(),
+            },
+            workspace_id: "ws-1".into(),
+            requester: identity(100),
+            purpose: Purpose::Lease {
+                command: "make test".into(),
+            },
+            reentrant_tokens: Vec::new(),
+            no_wait: false,
+        }
+    }
+
+    /// T3-1: a read-then-write transaction must take the writer lock before its first read.
+    /// A DEFERRED one that another connection commits under fails at once with "database is
+    /// locked" (SQLITE_BUSY_SNAPSHOT), which the busy timeout never retries.
+    #[test]
+    fn read_then_write_transactions_are_immediate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hostler.db");
+        let store = Store::open(&path).unwrap();
+        let other = Store::open(&path).unwrap();
+        let project = store.upsert_project("/work/app/.git", "app", 1).unwrap();
+        store
+            .upsert_workspace("ws-1", &project.id, "/work/app", "/work/app/.git", 1)
+            .unwrap();
+
+        // The mechanism, deterministically: DEFERRED reads, the other connection commits, then
+        // the write is refused instead of waiting.
+        let deferred =
+            Transaction::new_unchecked(&store.conn, TransactionBehavior::Deferred).unwrap();
+        let _: i64 = deferred
+            .query_row("SELECT count(*) FROM claim_requests", [], |row| row.get(0))
+            .unwrap();
+        other
+            .conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('race', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        let err = deferred
+            .execute("UPDATE settings SET value = '2' WHERE key = 'race'", [])
+            .unwrap_err();
+        assert!(format!("{err}").contains("locked"), "{err}");
+        drop(deferred);
+
+        // The store's own transaction survives the same interleaving: the other connection holds
+        // the writer lock while the insert starts and commits in the middle of it.
+        let locker =
+            Transaction::new_unchecked(&other.conn, TransactionBehavior::Immediate).unwrap();
+        locker
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('lock', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = store
+                .insert_claim_request(&claim_request("r1"), 10)
+                .map_err(|err| format!("{err:#}"));
+            tx.send(result).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "the insert must wait for the writer lock, not read past it"
+        );
+        locker.commit().unwrap();
+        let ticket = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the insert did not finish");
+        worker.join().unwrap();
+        assert_eq!(ticket.unwrap(), 1);
     }
 }

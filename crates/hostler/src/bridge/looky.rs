@@ -2,6 +2,8 @@
 //! ever read; hostler never writes it and never fails because of it.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::contract::heavy::HeavyEntry;
 use crate::heavy::engine::ForeignHeavySource;
@@ -53,6 +55,64 @@ fn ledger_path() -> PathBuf {
     }
 }
 
+/// How often the service reads the ledger, and how long its start waits for the first read.
+const REFRESH_EVERY: Duration = Duration::from_secs(1);
+const FIRST_READ_WAIT: Duration = Duration::from_secs(1);
+/// O-1b: a ledger read this slow (its `ps` and `sysctl`) is logged.
+const SLOW_READ: Duration = Duration::from_secs(5);
+
+/// The service's source: `LookyHeavy` read on its own thread every second, `running()` the last
+/// read. Its `ps` and `sysctl` calls never run under the heavy lock, which `claims.acquire` and
+/// every tick take (O-1, Global Constraint 3).
+pub struct RefreshedLooky {
+    last: Arc<Mutex<Vec<HeavyEntry>>>,
+}
+
+impl RefreshedLooky {
+    /// Starts the reads; waits up to a second for the first, so a start counts rn-looky's tasks.
+    pub fn start(source: LookyHeavy) -> RefreshedLooky {
+        let last = Arc::new(Mutex::new(Vec::new()));
+        let weak = Arc::downgrade(&last);
+        let (first, first_read) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("hostler-looky".into())
+            .spawn(move || {
+                loop {
+                    let started = std::time::Instant::now();
+                    let running = source.running();
+                    let took = started.elapsed();
+                    if took >= SLOW_READ {
+                        tracing::warn!("slow rn-looky ledger read: {} ms", took.as_millis());
+                    }
+                    let Some(last) = weak.upgrade() else { return };
+                    *last.lock().unwrap_or_else(PoisonError::into_inner) = running;
+                    drop(last);
+                    let _ = first.send(());
+                    std::thread::sleep(REFRESH_EVERY);
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                let _ = first_read.recv_timeout(FIRST_READ_WAIT);
+            }
+            // R3-2: without the thread rn-looky's tasks never count; say so.
+            Err(e) => tracing::warn!(
+                "cannot start the rn-looky ledger reader ({e}); its heavy tasks are not counted"
+            ),
+        }
+        RefreshedLooky { last }
+    }
+}
+
+impl ForeignHeavySource for RefreshedLooky {
+    fn running(&self) -> Vec<HeavyEntry> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 impl ForeignHeavySource for LookyHeavy {
     fn running(&self) -> Vec<HeavyEntry> {
         #[cfg(unix)]
@@ -69,10 +129,14 @@ impl ForeignHeavySource for LookyHeavy {
 #[cfg(unix)]
 impl LookyHeavy {
     fn running_unix(&self) -> Vec<HeavyEntry> {
-        let Some(current_boot) = current_boot_seconds() else {
+        // The ledger first: without a running task no process is started.
+        let Some(heavy) = read_ledger(&self.path) else {
             return Vec::new();
         };
-        let Some(heavy) = read_ledger(&self.path) else {
+        if !heavy.entries.iter().any(|e| e.state == "running") {
+            return Vec::new();
+        }
+        let Some(current_boot) = current_boot_seconds() else {
             return Vec::new();
         };
 
@@ -348,6 +412,33 @@ mod tests {
         assert_eq!(entry.state, HeavyState::Running);
         assert_eq!(entry.source, EntrySource::RnLookyLedger);
         assert_eq!(entry.group, None);
+    }
+
+    /// O-1: the service's source answers from its last read; a start waits for the first, and
+    /// a changed ledger is seen within a refresh.
+    #[test]
+    fn refreshed_source_answers_the_last_read() {
+        let (_dir, path) = write_ledger(json!({
+            "heavy": {"entries": [entry(
+                "h1", std::process::id(), &current_boot(), &own_start_time(), "running", None,
+            )]}
+        }));
+        let source = RefreshedLooky::start(looky(path.clone()));
+        // R3-3: real `ps` and `sysctl` may take longer than the start's wait on a loaded machine.
+        let deadline = std::time::Instant::now() + REFRESH_EVERY * 5;
+        while source.running().len() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first read never landed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_file(&path).unwrap();
+        let deadline = std::time::Instant::now() + REFRESH_EVERY * 5;
+        while !source.running().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never refreshed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

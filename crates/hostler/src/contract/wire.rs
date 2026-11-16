@@ -1,4 +1,5 @@
-//! Newline-delimited JSON frames (plan Task 4; secrets methods P2 Task 1).
+//! Newline-delimited JSON frames (plan Task 4; secrets methods P2 Task 1; workspaces, claims,
+//! status and accounts P3a Task 1; devices P3b Task 1).
 
 use std::fmt;
 
@@ -7,11 +8,18 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::HostlerError;
+use super::accounts::{AccountMaterialize, AccountRemove, AccountSet};
+use super::claims::{
+    ClaimRelease, ClaimRequest, ClaimStarted, ClaimsSnapshot, ResourceId, SeizeBegin, SeizeCommit,
+    SeizeProgress, SeizureRecord, WorkspaceResolve,
+};
+use super::devices::{DevicesSnapshot, InstallEvent, ToolPathsSet};
 use super::heavy::{HeavyAcquire, HeavyRelease, HeavyStarted, HistoryQuery, QueueSnapshot};
 use super::secrets::{
     DeclaredSecret, Decline, Materialize, ProjectRef, SecretImport, SecretRequest,
     SecretRequestInfo, SecretSet, SecretsStatus, Share, Unlock,
 };
+use crate::procs::ProcessIdentity;
 
 /// Lifecycle methods are frozen forever; the rest require a matching `hello` first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +89,138 @@ pub enum Request {
     SecretUnshare(Share),
     #[serde(rename = "secret.materialize")]
     SecretMaterialize(Materialize),
+    #[serde(rename = "workspace.resolve")]
+    WorkspaceResolve(WorkspaceResolve),
+    #[serde(rename = "workspace.list")]
+    WorkspaceList,
+    #[serde(rename = "claims.acquire")]
+    ClaimsAcquire(ClaimRequest),
+    #[serde(rename = "claims.attach")]
+    ClaimsAttach { request_id: String },
+    #[serde(rename = "claims.started")]
+    ClaimsStarted(ClaimStarted),
+    /// Answers `ReleaseOutcome`.
+    #[serde(rename = "claims.release")]
+    ClaimsRelease(ClaimRelease),
+    /// Ends another workspace's claim without stopping anything (L23).
+    #[serde(rename = "claims.force_release")]
+    ClaimsForceRelease {
+        claim_id: String,
+        confirmation: String,
+        workspace_id: String,
+        requester: ProcessIdentity,
+    },
+    #[serde(rename = "claims.withdraw")]
+    ClaimsWithdraw { request_id: String, timed_out: bool },
+    #[serde(rename = "claims.renew")]
+    ClaimsRenew {
+        claim_id: String,
+        workspace_id: String,
+    },
+    #[serde(rename = "claims.set_command")]
+    ClaimsSetCommand {
+        claim_id: String,
+        workspace_id: String,
+        command: String,
+    },
+    #[serde(rename = "claims.reserve")]
+    ClaimsReserve {
+        resource: ResourceId,
+        workspace_id: String,
+    },
+    #[serde(rename = "claims.unreserve")]
+    ClaimsUnreserve {
+        resource: ResourceId,
+        workspace_id: String,
+    },
+    #[serde(rename = "claims.snapshot")]
+    ClaimsSnapshot,
+    #[serde(rename = "claims.history")]
+    ClaimsHistory(HistoryQuery),
+    #[serde(rename = "claims.seize_begin")]
+    ClaimsSeizeBegin(SeizeBegin),
+    #[serde(rename = "claims.seize_commit")]
+    ClaimsSeizeCommit(SeizeCommit),
+    #[serde(rename = "claims.seize_abort")]
+    ClaimsSeizeAbort { plan_id: String },
+    /// L29: answers `{ "expires_at_ms": … }`.
+    #[serde(rename = "claims.seize_progress")]
+    ClaimsSeizeProgress(SeizeProgress),
+    #[serde(rename = "status.overview")]
+    StatusOverview,
+    #[serde(rename = "account.list")]
+    AccountList { project: ProjectRef },
+    #[serde(rename = "account.set")]
+    AccountSet(AccountSet),
+    #[serde(rename = "account.remove")]
+    AccountRemove(AccountRemove),
+    #[serde(rename = "account.check")]
+    AccountCheck { project: ProjectRef, name: String },
+    #[serde(rename = "account.materialize")]
+    AccountMaterialize(AccountMaterialize),
+    /// Answers `DevicesSnapshot`; unregistered virtual devices and unidentified transports only
+    /// with `all`.
+    #[serde(rename = "devices.list")]
+    DevicesList { all: bool },
+    /// Answers `DeviceDetail`. `fresh_sessions`: wait up to 6 s for a sessions read that started
+    /// after the call (L49, P2-15).
+    #[serde(rename = "devices.show")]
+    DevicesShow {
+        device: String,
+        fresh_sessions: bool,
+    },
+    /// Answers `DeviceInfo` of a registered device, with its transport fresh.
+    #[serde(rename = "devices.resolve")]
+    DevicesResolve { device: String },
+    /// `person`: set only by a CLI that passed P2's person prompt (L49); the service refuses a
+    /// physical device's `add` / `rename` / `remove` without it.
+    #[serde(rename = "devices.add")]
+    DevicesAdd {
+        device: String,
+        alias: Option<String>,
+        person: bool,
+    },
+    #[serde(rename = "devices.rename")]
+    DevicesRename {
+        device: String,
+        alias: String,
+        person: bool,
+    },
+    #[serde(rename = "devices.note")]
+    DevicesNote {
+        device: String,
+        note: Option<String>,
+    },
+    #[serde(rename = "devices.remove")]
+    DevicesRemove { device: String, person: bool },
+    /// Answers `Vec<InstallEvent>`, newest first.
+    #[serde(rename = "devices.installs")]
+    DevicesInstalls {
+        device: Option<String>,
+        query: HistoryQuery,
+    },
+    /// Boots a virtual device for a live lease or hold of `workspace_id` (D10).
+    #[serde(rename = "devices.boot")]
+    DevicesBoot {
+        resource: ResourceId,
+        claim_id: String,
+        workspace_id: String,
+    },
+    /// Answers `ToolStatus`.
+    #[serde(rename = "devices.tools")]
+    DevicesTools(ToolPathsSet),
+    /// L54: person-only; releases one device from the agent-device sessions wait, stopping
+    /// nothing. Refused without `person`. `by_workspace_path` and `by_pid` are the person's
+    /// checkout and process, recorded with the forget (L54's "who").
+    #[serde(rename = "devices.forget_sessions")]
+    DevicesForgetSessions {
+        device: String,
+        person: bool,
+        #[serde(default)]
+        by_workspace_path: Option<String>,
+        #[serde(default)]
+        by_pid: Option<u32>,
+    },
 }
 
 /// Methods whose params may carry a value (or a command that may hold one, L12): a frame that
@@ -88,13 +228,18 @@ pub enum Request {
 pub fn sensitive_request(method: &str) -> bool {
     matches!(
         method,
-        "secrets.unlock" | "secret.set" | "secret.import" | "secret.materialize"
+        "secrets.unlock"
+            | "secret.set"
+            | "secret.import"
+            | "secret.materialize"
+            | "account.set"
+            | "account.materialize"
     )
 }
 
 /// Methods whose answer carries values: never parsed into a `serde_json::Value`.
 pub fn sensitive_answer(method: &str) -> bool {
-    method == "secret.materialize"
+    matches!(method, "secret.materialize" | "account.materialize")
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +266,15 @@ pub enum Event {
     SecretRequestChanged(SecretRequestInfo),
     #[serde(rename = "secrets.lock_changed")]
     SecretsLockChanged(SecretsStatus),
+    #[serde(rename = "claims.changed")]
+    ClaimsChanged(ClaimsSnapshot),
+    #[serde(rename = "claims.seized")]
+    ClaimsSeized(SeizureRecord),
+    // Boxed: the frame enums stay small; the wire shape is the payload's own.
+    #[serde(rename = "devices.changed")]
+    DevicesChanged(Box<DevicesSnapshot>),
+    #[serde(rename = "devices.installed")]
+    DevicesInstalled(Box<InstallEvent>),
 }
 
 /// The tag of an adjacently tagged value (`{"<tag>":"…","<content>":…}`) and the byte length
@@ -611,10 +765,11 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_requests_are_exactly_four() {
+    fn sensitive_requests_are_exactly_six() {
         let sensitive: Vec<String> = secret_requests()
             .iter()
             .chain(&all_requests())
+            .chain(&claims_requests())
             .map(|r| {
                 serde_json::to_value(r).unwrap()["method"]
                     .as_str()
@@ -629,7 +784,9 @@ mod tests {
                 "secrets.unlock",
                 "secret.set",
                 "secret.import",
-                "secret.materialize"
+                "secret.materialize",
+                "account.set",
+                "account.materialize"
             ]
         );
         assert!(!sensitive_request("secret.setx"));
@@ -638,13 +795,375 @@ mod tests {
 
     #[test]
     fn sensitive_answer_only_materialize() {
-        for request in secret_requests().iter().chain(&all_requests()) {
+        for request in secret_requests()
+            .iter()
+            .chain(&all_requests())
+            .chain(&claims_requests())
+        {
             let method = serde_json::to_value(request).unwrap()["method"]
                 .as_str()
                 .unwrap()
                 .to_owned();
-            assert_eq!(sensitive_answer(&method), method == "secret.materialize");
+            assert_eq!(
+                sensitive_answer(&method),
+                method == "secret.materialize" || method == "account.materialize",
+                "{method}"
+            );
         }
+    }
+
+    #[test]
+    fn sensitive_lists_include_accounts() {
+        assert!(sensitive_request("account.set"));
+        assert!(sensitive_request("account.materialize"));
+        assert!(sensitive_answer("account.materialize"));
+        for plain in [
+            "account.list",
+            "account.check",
+            "account.remove",
+            "claims.acquire",
+        ] {
+            assert!(!sensitive_request(plain), "{plain}");
+            assert!(!sensitive_answer(plain), "{plain}");
+        }
+    }
+
+    fn claims_requests() -> Vec<Request> {
+        use crate::contract::accounts::{AccountMaterialize, AccountRemove, AccountSet};
+        use crate::contract::claims::fixtures;
+        use crate::contract::claims::*;
+
+        let screen = ResourceId::screen();
+        vec![
+            Request::WorkspaceResolve(WorkspaceResolve {
+                project: project(),
+                root: "/work/app".into(),
+            }),
+            Request::WorkspaceList,
+            Request::ClaimsAcquire(fixtures::request()),
+            Request::ClaimsAttach {
+                request_id: "r1".into(),
+            },
+            Request::ClaimsStarted(ClaimStarted {
+                claim_id: "c1".into(),
+                child: identity(43),
+                group: group(),
+            }),
+            Request::ClaimsRelease(ClaimRelease {
+                claim_id: "c1".into(),
+                workspace_id: "ws-1".into(),
+                requester: identity(42),
+                exit_code: Some(3),
+            }),
+            Request::ClaimsForceRelease {
+                claim_id: "c1".into(),
+                confirmation: "screen".into(),
+                workspace_id: "ws-2".into(),
+                requester: identity(77),
+            },
+            Request::ClaimsWithdraw {
+                request_id: "r1".into(),
+                timed_out: true,
+            },
+            Request::ClaimsRenew {
+                claim_id: "h1".into(),
+                workspace_id: "ws-1".into(),
+            },
+            Request::ClaimsSetCommand {
+                claim_id: "c1".into(),
+                workspace_id: "ws-1".into(),
+                command: "login ***".into(),
+            },
+            Request::ClaimsReserve {
+                resource: screen.clone(),
+                workspace_id: "ws-1".into(),
+            },
+            Request::ClaimsUnreserve {
+                resource: screen.clone(),
+                workspace_id: "ws-1".into(),
+            },
+            Request::ClaimsSnapshot,
+            Request::ClaimsHistory(HistoryQuery {
+                since_ms: Some(1_000),
+                limit: 50,
+            }),
+            Request::ClaimsSeizeBegin(SeizeBegin {
+                resource: screen,
+                confirmation: "screen".into(),
+                request: fixtures::request(),
+            }),
+            Request::ClaimsSeizeCommit(SeizeCommit {
+                plan_id: "p1".into(),
+                requester: identity(77),
+                evidence: vec![
+                    StopEvidence::Gone { target: 0 },
+                    StopEvidence::JobGone {
+                        target: 1,
+                        session: 2,
+                    },
+                ],
+            }),
+            Request::ClaimsSeizeAbort {
+                plan_id: "p1".into(),
+            },
+            Request::StatusOverview,
+            Request::AccountList { project: project() },
+            Request::AccountSet(AccountSet {
+                project: project(),
+                name: "qa-user".into(),
+                field: "session".into(),
+                value: SecretValue::new("session-value-1".into()),
+            }),
+            Request::AccountRemove(AccountRemove {
+                project: project(),
+                name: "qa-user".into(),
+                field: Some("env".into()),
+            }),
+            Request::AccountCheck {
+                project: project(),
+                name: "qa-user".into(),
+            },
+            Request::AccountMaterialize(AccountMaterialize {
+                run_id: "run-1".into(),
+                claim_id: "c1".into(),
+                requester: identity(42),
+                project: project(),
+                name: "qa-user".into(),
+                command: RawCommand::new("login ***".into()),
+                workspace: "/work/app".into(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn claims_requests_round_trip() {
+        let methods = [
+            "workspace.resolve",
+            "workspace.list",
+            "claims.acquire",
+            "claims.attach",
+            "claims.started",
+            "claims.release",
+            "claims.force_release",
+            "claims.withdraw",
+            "claims.renew",
+            "claims.set_command",
+            "claims.reserve",
+            "claims.unreserve",
+            "claims.snapshot",
+            "claims.history",
+            "claims.seize_begin",
+            "claims.seize_commit",
+            "claims.seize_abort",
+            "status.overview",
+            "account.list",
+            "account.set",
+            "account.remove",
+            "account.check",
+            "account.materialize",
+        ];
+        let requests = claims_requests();
+        assert_eq!(requests.len(), methods.len());
+        for (request, method) in requests.into_iter().zip(methods) {
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["method"], method);
+            let back: Request = serde_json::from_value(value).unwrap();
+            assert_eq!(back, request, "{method}");
+        }
+    }
+
+    #[test]
+    fn claims_events_round_trip() {
+        use crate::contract::claims::fixtures;
+
+        let events = [
+            Event::ClaimsChanged(fixtures::snapshot()),
+            Event::ClaimsSeized(fixtures::seizure()),
+        ];
+        for (event, kind) in events.into_iter().zip(["claims.changed", "claims.seized"]) {
+            let frame = ServerFrame::Event { event };
+            let value = serde_json::to_value(&frame).unwrap();
+            assert_eq!(value["event"]["type"], kind);
+            assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
+        }
+    }
+
+    fn device_requests() -> Vec<Request> {
+        use crate::contract::devices::fixtures;
+
+        vec![
+            Request::DevicesList { all: true },
+            Request::DevicesShow {
+                device: "pixel-9".into(),
+                fresh_sessions: true,
+            },
+            Request::DevicesResolve {
+                device: "emulator-5554".into(),
+            },
+            Request::DevicesAdd {
+                device: "SERIAL0001".into(),
+                alias: Some("pixel-9".into()),
+                person: true,
+            },
+            Request::DevicesRename {
+                device: "pixel-9".into(),
+                alias: "pixel-9-left".into(),
+                person: false,
+            },
+            Request::DevicesNote {
+                device: "pixel-9".into(),
+                note: None,
+            },
+            Request::DevicesRemove {
+                device: "pixel-9".into(),
+                person: true,
+            },
+            Request::DevicesInstalls {
+                device: None,
+                query: HistoryQuery {
+                    since_ms: Some(1_000),
+                    limit: 20,
+                },
+            },
+            Request::DevicesBoot {
+                resource: ResourceId("device:android:avd:pixel_9".into()),
+                claim_id: "c1".into(),
+                workspace_id: "ws-1".into(),
+            },
+            Request::DevicesTools(fixtures::tool_paths()),
+            Request::DevicesForgetSessions {
+                device: "pixel-9".into(),
+                person: true,
+                by_workspace_path: Some("/work/app".into()),
+                by_pid: Some(42),
+            },
+        ]
+    }
+
+    #[test]
+    fn device_requests_round_trip() {
+        let methods = [
+            "devices.list",
+            "devices.show",
+            "devices.resolve",
+            "devices.add",
+            "devices.rename",
+            "devices.note",
+            "devices.remove",
+            "devices.installs",
+            "devices.boot",
+            "devices.tools",
+            "devices.forget_sessions",
+        ];
+        let requests = device_requests();
+        assert_eq!(requests.len(), methods.len());
+        for (request, method) in requests.into_iter().zip(methods) {
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["method"], method);
+            assert!(!sensitive_request(method), "{method}");
+            assert!(!sensitive_answer(method), "{method}");
+            let frame = ClientFrame { id: 3, request };
+            let line = serde_json::to_string(&frame).unwrap();
+            let back: ClientFrame = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, frame, "{method}");
+        }
+    }
+
+    #[test]
+    fn device_events_round_trip() {
+        use crate::contract::devices::fixtures;
+
+        let events = [
+            Event::DevicesChanged(Box::new(fixtures::snapshot())),
+            Event::DevicesInstalled(Box::new(fixtures::install_event())),
+        ];
+        for (event, kind) in events
+            .into_iter()
+            .zip(["devices.changed", "devices.installed"])
+        {
+            let frame = ServerFrame::Event { event };
+            let value = serde_json::to_value(&frame).unwrap();
+            assert_eq!(value["event"]["type"], kind);
+            assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
+        }
+        // The box is not on the wire: the data is the snapshot itself.
+        let value =
+            serde_json::to_value(Event::DevicesChanged(Box::new(fixtures::snapshot()))).unwrap();
+        assert_eq!(
+            value["data"],
+            serde_json::to_value(fixtures::snapshot()).unwrap()
+        );
+    }
+
+    #[test]
+    fn devices_list_frame_matches_wire_shape() {
+        let frame = ClientFrame {
+            id: 7,
+            request: Request::DevicesList { all: false },
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({ "id": 7, "method": "devices.list", "params": { "all": false } })
+        );
+        let boot = ClientFrame {
+            id: 8,
+            request: Request::DevicesBoot {
+                resource: ResourceId("device:android:avd:pixel_9".into()),
+                claim_id: "c1".into(),
+                workspace_id: "ws-1".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&boot).unwrap(),
+            json!({
+                "id": 8,
+                "method": "devices.boot",
+                "params": {
+                    "resource": "device:android:avd:pixel_9",
+                    "claim_id": "c1",
+                    "workspace_id": "ws-1"
+                }
+            })
+        );
+        let tools = serde_json::to_value(Request::DevicesTools(ToolPathsSet::default())).unwrap();
+        assert_eq!(
+            tools,
+            json!({
+                "method": "devices.tools",
+                "params": {
+                    "adb": null,
+                    "agent_device": null,
+                    "node": null,
+                    "detected_script": null,
+                    "explicit_agent_device": false,
+                    "android_env": {}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn claims_acquire_frame_matches_wire_shape() {
+        let frame = ClientFrame {
+            id: 1,
+            request: Request::ClaimsAcquire(crate::contract::claims::fixtures::request()),
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({
+                "id": 1,
+                "method": "claims.acquire",
+                "params": {
+                    "id": "6f1e6a9a-2d0f-4b7c-9a41-6f0f2f7c1a11",
+                    "selector": {"by": "exact", "resource": "screen"},
+                    "workspace_id": "ws-1",
+                    "requester": {"pid": 42, "boot_id": "boot-1", "start_time": 500},
+                    "purpose": {"kind": "lease", "command": "make test"},
+                    "reentrant_tokens": ["c0"],
+                    "no_wait": false
+                }
+            })
+        );
     }
 
     #[test]

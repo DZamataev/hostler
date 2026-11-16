@@ -1,0 +1,52 @@
+{
+ "devices": {
+  "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+   {
+    "lastBootedAt": "2026-11-05T13:18:37Z",
+    "dataPath": "/Users/dev/sim",
+    "dataPathSize": 7467192320,
+    "logPath": "/Users/dev/simlog",
+    "udid": "00000000-0000-4000-8000-0000000000D0",
+    "isAvailable": true,
+    "logPathSize": 462848,
+    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+    "state": "Booted",
+    "name": "iPhone 17 Pro"
+   },
+   {
+    "lastBootedAt": "2026-10-28T12:08:21Z",
+    "dataPath": "/Users/dev/sim",
+    "dataPathSize": 1888944128,
+    "logPath": "/Users/dev/simlog",
+    "udid": "00000000-0000-4000-8000-0000000000D1",
+    "isAvailable": true,
+    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max",
+    "state": "Shutdown",
+    "name": "iPhone 17 Pro Max"
+   },
+   {
+    "lastBootedAt": "2026-10-28T12:08:12Z",
+    "dataPath": "/Users/dev/sim",
+    "dataPathSize": 1380560896,
+    "logPath": "/Users/dev/simlog",
+    "udid": "00000000-0000-4000-8000-0000000000D2",
+    "isAvailable": true,
+    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-Air",
+    "state": "Shutdown",
+    "name": "iPhone Air"
+   },
+   {
+    "lastBootedAt": "2026-11-03T16:05:38Z",
+    "dataPath": "/Users/dev/sim",
+    "dataPathSize": 3765141504,
+    "logPath": "/Users/dev/simlog",
+    "udid": "00000000-0000-4000-8000-0000000000D3",
+    "isAvailable": true,
+    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+    "state": "Shutdown",
+    "name": "iPhone 17"
+   }
+  ],
+  "com.apple.CoreSimulator.SimRuntime.iOS-18-3": []
+ }
+}

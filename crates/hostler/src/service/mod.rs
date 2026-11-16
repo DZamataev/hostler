@@ -12,12 +12,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
-use crate::bridge::looky::LookyHeavy;
+use crate::bridge::looky::{LookyHeavy, RefreshedLooky};
+use crate::claims::engine::ClaimsEngine;
+use crate::claims::{ForeignClaimSource, ResourceCatalog, ScreenCatalog};
 use crate::client::Client;
 use crate::contract::wire::Request;
 use crate::contract::{ErrorCode, HostlerError};
+use crate::devices::agent_device::AgentDeviceSource;
+use crate::devices::catalog::DeviceCatalog;
+use crate::devices::service::DeviceCache;
 use crate::heavy::engine::{HeavyEngine, SystemClock};
 use crate::paths::Paths;
 use crate::procs::{self, ProcessIdentity, ProcessTable, SysProcessTable};
@@ -122,13 +127,35 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
     }
     let table: Arc<dyn ProcessTable> =
         Arc::new(SysProcessTable::new().context("cannot read the boot id")?);
+    // L58 (debug builds): a service a test started stops once its test process is gone, even
+    // when a killed run never reached the test's own stop guard. The initial receiver stays
+    // alive: a stop sent before `serve` subscribes must still be a stored value.
+    let (shutdown, _open) = watch::channel(false);
+    #[cfg(debug_assertions)]
+    spawn_owner_watchdog(table.clone(), shutdown.clone());
     let store = Store::open(&paths.db)?;
     let (events, _) = broadcast::channel(64);
+    // P3b: the device service, on its own (4th) connection. Its catalog and sessions source
+    // answer the claims engine from its cache, without I/O (T5-4).
+    let devices_store = Store::open(&paths.db)?;
+    let device_tools = crate::devices::service::find_service_tools(
+        &crate::devices::service::read_settings(&devices_store),
+    );
+    let (devices, device_cache) =
+        crate::devices::service::DevicesService::new(devices_store, device_tools, events.clone());
     let engine = HeavyEngine::new(
         store,
         table.clone(),
         Arc::new(SystemClock),
-        Box::new(LookyHeavy::new()),
+        Box::new(RefreshedLooky::start(LookyHeavy::new())),
+        events.clone(),
+    );
+    let claims = ClaimsEngine::new(
+        Store::open(&paths.db)?,
+        table.clone(),
+        Arc::new(SystemClock),
+        catalogs(&device_cache),
+        foreign_sources(&device_cache),
         events.clone(),
     );
     let secrets = SecretsEngine::new(
@@ -140,6 +167,9 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
         events.clone(),
         kdf_choice(),
     );
+    // Workspace paths for the stranding check, probed off the claims lock (T5-1); the task
+    // ends with the runtime.
+    tokio::spawn(claims.path_probe().run());
     let listener = server::bind(&paths.socket)?;
     tracing::info!(
         "hostler service {} (pid {}) listening on {:?}",
@@ -148,7 +178,121 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
         paths.socket
     );
     // Dropping the listener removes the socket file while the lock is still held.
-    server::serve(listener, engine, secrets, events).await
+    server::serve(listener, engine, claims, secrets, devices, events, shutdown).await
+}
+
+/// L58, debug builds only: `HOSTLER_TEST_OWNER_PID` names the test process a service started by
+/// a test belongs to. Once that identity is gone (dead, or the pid reused), the service takes
+/// its normal shutdown path, so no test daemon outlives a killed run. Its own task: it never
+/// holds the heavy, claims or secrets locks.
+#[cfg(debug_assertions)]
+fn spawn_owner_watchdog(table: Arc<dyn ProcessTable>, shutdown: watch::Sender<bool>) {
+    let Some(pid) = owner_pid(std::env::var_os("HOSTLER_TEST_OWNER_PID").as_deref()) else {
+        return;
+    };
+    tokio::spawn(async move {
+        // Read once: a pid that is gone, or whose start time cannot be read, never comes back
+        // as the same process.
+        let owner = procs::identity_of(&*table, pid);
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate: an unreadable owner stops the service at once.
+        loop {
+            every.tick().await;
+            let alive = owner
+                .as_ref()
+                .is_some_and(|owner| procs::liveness(owner, &*table) == procs::Liveness::Alive);
+            if !alive {
+                tracing::info!(
+                    "stopping: the test process {pid} that started this service is gone"
+                );
+                let _ = shutdown.send(true);
+                return;
+            }
+        }
+    });
+}
+
+/// `HOSTLER_TEST_OWNER_PID` as a decimal pid; anything else is logged and the hook ignored.
+#[cfg(debug_assertions)]
+fn owner_pid(raw: Option<&std::ffi::OsStr>) -> Option<u32> {
+    let raw = raw?;
+    let pid = raw.to_str().and_then(|v| v.trim().parse::<u32>().ok());
+    if pid.is_none() {
+        tracing::warn!("ignoring HOSTLER_TEST_OWNER_PID={raw:?}: not a process id");
+    }
+    pid
+}
+
+/// The screen and the registered devices (P3b). Debug builds add `HOSTLER_TEST_FAKE_CATALOG=<n>`
+/// fake devices.
+fn catalogs(devices: &Arc<DeviceCache>) -> Vec<Box<dyn ResourceCatalog>> {
+    #[allow(unused_mut)]
+    let mut catalogs: Vec<Box<dyn ResourceCatalog>> = vec![
+        Box::new(ScreenCatalog),
+        Box::new(DeviceCatalog(devices.clone())),
+    ];
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("HOSTLER_TEST_FAKE_CATALOG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        catalogs.push(Box::new(test_hooks::FakeCatalog(n)));
+    }
+    catalogs
+}
+
+/// The agent-device sessions from the device cache (P3b, L50–L54); debug builds also read
+/// `HOSTLER_TEST_FAKE_FOREIGN=<path>` on each tick.
+fn foreign_sources(devices: &Arc<DeviceCache>) -> Vec<Box<dyn ForeignClaimSource>> {
+    #[allow(unused_mut)]
+    let mut sources: Vec<Box<dyn ForeignClaimSource>> =
+        vec![Box::new(AgentDeviceSource(devices.clone()))];
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("HOSTLER_TEST_FAKE_FOREIGN") {
+        sources.push(Box::new(test_hooks::FakeForeign(path.into())));
+    }
+    sources
+}
+
+/// The only way to exercise `Any` selectors, device sharing and foreign claims end to end
+/// before P3b.
+#[cfg(debug_assertions)]
+mod test_hooks {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use crate::claims::{ForeignClaimSource, ResourceCatalog};
+    use crate::contract::claims::{ForeignClaim, ResourceId, ResourceInfo, ResourceKind};
+
+    /// `device:test:<i>`, kind `Device`, `attributes {test: "1"}`, display `fake-<i>`.
+    pub struct FakeCatalog(pub u32);
+
+    impl ResourceCatalog for FakeCatalog {
+        fn resources(&self) -> Vec<ResourceInfo> {
+            (0..self.0)
+                .map(|i| ResourceInfo {
+                    id: ResourceId(format!("device:test:{i}")),
+                    kind: ResourceKind::Device,
+                    display: format!("fake-{i}"),
+                    attributes: BTreeMap::from([("test".to_owned(), "1".to_owned())]),
+                    available: true,
+                })
+                .collect()
+        }
+    }
+
+    /// Claims read from a JSON file (`[ForeignClaim]`); missing or unreadable means none.
+    pub struct FakeForeign(pub PathBuf);
+
+    impl ForeignClaimSource for FakeForeign {
+        fn foreign(&self) -> Vec<ForeignClaim> {
+            std::fs::read(&self.0)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// New databases: Argon2id calibrated to about 1 s; debug builds honour
@@ -260,4 +404,22 @@ pub async fn request_stop(paths: &Paths, force: bool) -> Result<Stopping, StopRe
         Err(e) => return Err(StopRefused::Failed(e)),
     }
     Ok(Stopping::Accepted { process })
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::owner_pid;
+
+    /// L58: the hook takes a decimal pid and ignores anything else.
+    #[test]
+    fn the_owner_pid_hook_reads_a_decimal_pid_only() {
+        assert_eq!(owner_pid(Some(OsStr::new("4242"))), Some(4242));
+        assert_eq!(owner_pid(Some(OsStr::new(" 4242\n"))), Some(4242));
+        assert_eq!(owner_pid(Some(OsStr::new("sleep"))), None);
+        assert_eq!(owner_pid(Some(OsStr::new("-1"))), None);
+        assert_eq!(owner_pid(Some(OsStr::new(""))), None);
+        assert_eq!(owner_pid(None), None);
+    }
 }

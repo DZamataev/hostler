@@ -102,6 +102,16 @@ impl Signals {
         })
     }
 
+    /// 130 when a Ctrl+C was already received; never waits.
+    pub fn interrupted(&mut self) -> Option<i32> {
+        self.pending().then_some(130)
+    }
+
+    /// 130 at the next Ctrl+C; `None` once none can arrive. Cancel-safe.
+    pub async fn recv_code(&mut self) -> Option<i32> {
+        self.ctrl_c.recv().await.map(|()| 130)
+    }
+
     /// The next Ctrl+C; `None` once none can arrive. Cancel-safe.
     pub async fn recv(&mut self) -> Option<()> {
         self.ctrl_c.recv().await
@@ -162,6 +172,9 @@ fn launch_in(
     if let Some(token) = token {
         command.env(TOKEN_ENV, token);
     }
+    for name in &io.remove {
+        command.env_remove(name);
+    }
     command.envs(io.env.iter().map(|(name, value)| (name, value)));
     // std makes only the child's ends inheritable; ours stay private (W-1).
     if io.masks.is_some() {
@@ -184,16 +197,18 @@ fn launch_in(
     })
 }
 
-/// `launch`, inside the entry's job, plus the identity and group the service needs; reads the
-/// process table first.
+/// `launch`, inside the run's job, plus the identity and group the service needs; reads the
+/// process table first. The job keeps P1's name with the run's id (a heavy entry's or a claim
+/// run's); `token` is the heavy slot the command holds, if this run holds one.
 pub fn spawn_in_group(
     argv: Vec<OsString>,
-    entry_id: &str,
+    run_id: &str,
+    token: Option<&str>,
     signals: Signals,
     io: &ChildIo,
 ) -> anyhow::Result<Spawned> {
     let table = super::process_table()?;
-    let name = format!(r"Local\hostler-heavy-{entry_id}");
+    let name = format!(r"Local\hostler-heavy-{run_id}");
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: default security attributes and a NUL-terminated name; null is checked.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), wide.as_ptr()) };
@@ -205,7 +220,7 @@ pub fn spawn_in_group(
     }
     let job = Job(raw);
     observable(job.0, OBSERVE_JOB, "the job object");
-    let launched = launch_in(argv, Some(entry_id), Some(&name), signals, io)?;
+    let launched = launch_in(argv, token, Some(&name), signals, io)?;
     // The launcher waits at its gate, so nothing has escaped the job yet.
     // SAFETY: both handles are open: the job above, the process owned by `launched.child`.
     let assigned =
@@ -229,6 +244,7 @@ pub fn spawn_in_group(
         group: RunGroup::WindowsJob {
             name,
             boot_id: table.boot_id(),
+            session: crate::procs::current_session(),
         },
     })
 }

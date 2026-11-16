@@ -12,6 +12,22 @@ pub const TOPICS: &[(&str, &str)] = &[
         "secrets",
         "project secrets: requesting, injecting and masking values, and the person-only commands",
     ),
+    (
+        "holds",
+        "holds, leases, waiting, takeover and workspaces: who may use the screen, a device or one account",
+    ),
+    (
+        "devices",
+        "phones, emulators and simulators: onboarding, leases, holds, agent-device sessions and telemetry",
+    ),
+    (
+        "screen",
+        "this machine's desktop session: hold it before driving the real GUI",
+    ),
+    (
+        "accounts",
+        "a project's test accounts: protected fields, environment variables and masking",
+    ),
 ];
 
 /// One entry of `hostler guide --json`.
@@ -33,6 +49,10 @@ pub fn topic(name: &str) -> Option<&'static str> {
     match name {
         "heavy" => Some(include_str!("heavy.md")),
         "secrets" => Some(include_str!("secrets.md")),
+        "holds" => Some(include_str!("holds.md")),
+        "devices" => Some(include_str!("devices.md")),
+        "screen" => Some(include_str!("screen.md")),
+        "accounts" => Some(include_str!("accounts.md")),
         _ => None,
     }
 }

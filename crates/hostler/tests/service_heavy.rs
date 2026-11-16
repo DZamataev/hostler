@@ -42,6 +42,8 @@ impl Home {
             )
             .env_remove("HOSTLER_TEST_CONTRACT_VERSION")
             .env_remove("HOSTLER_TEST_EXIT_AFTER_COMMIT")
+            // L58: a service this command starts stops when this test process is gone.
+            .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
             .stdin(Stdio::null());
         c
     }
@@ -75,6 +77,9 @@ impl Home {
 
     /// Starts the service through the CLI (so it gets the test environment), then connects.
     async fn client(&self) -> Client {
+        // L58: if the client has to start the service itself, it must watch this test process.
+        #[cfg(debug_assertions)]
+        hostler::client::set_test_owner_pid(std::process::id());
         let start = self.run(&["service", "start"]);
         assert!(
             start.status.success(),
@@ -406,7 +411,7 @@ async fn accepted_stop_completes_while_a_subscriber_never_reads() {
     let mut silent = Stream::connect(name).await.unwrap();
     silent
         .write_all(
-            b"{\"id\":1,\"method\":\"hello\",\"params\":{\"contract_version\":2,\"client\":\"silent\"}}\n",
+            b"{\"id\":1,\"method\":\"hello\",\"params\":{\"contract_version\":4,\"client\":\"silent\"}}\n",
         )
         .await
         .unwrap();
@@ -485,6 +490,7 @@ async fn old_oversized_rows_are_clamped_in_responses() {
             group: RunGroup::WindowsJob {
                 name: "\u{1}".repeat(4096),
                 boot_id: "\u{1}".repeat(4096),
+                session: None,
             },
         };
         store
@@ -509,7 +515,7 @@ async fn old_oversized_rows_are_clamped_in_responses() {
     }
     let first = &queue.running[0];
     assert!(json_len(&first.child.as_ref().unwrap().boot_id) <= MAX_IDENTITY_BYTES);
-    let Some(RunGroup::WindowsJob { name, boot_id }) = &first.group else {
+    let Some(RunGroup::WindowsJob { name, boot_id, .. }) = &first.group else {
         panic!("{:?}", first.group)
     };
     assert!(json_len(name) <= MAX_IDENTITY_BYTES && json_len(boot_id) <= MAX_IDENTITY_BYTES);

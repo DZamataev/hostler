@@ -58,6 +58,13 @@ fn read_stat(pid: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn process_name(pid: u32) -> Option<String> {
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = name.trim_end_matches('\n');
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn info(pid: u32) -> Option<super::ProcInfo> {
     let contents = read_stat(&pid.to_string())?;
     // The process exists; a stat we cannot parse leaves its start time unreadable (= dead).

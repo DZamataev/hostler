@@ -29,7 +29,7 @@ use crate::mask::{MaskSet, Masker};
 use crate::paths::Paths;
 use crate::project::{self, Current, config::ProjectConfig};
 use crate::secrets::rundir::{self, RunDir};
-use crate::secrets::value::RawCommand;
+use crate::secrets::value::{RawCommand, SecretValue};
 use crate::secrets::{valid_env_name, valid_secret_name};
 use crate::service::manager::OsManager;
 
@@ -106,6 +106,18 @@ pub fn injections(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| spec.name.clone());
+        // L48: never a name a hostler service started from inside this run would keep.
+        if crate::client::reserved_for_the_service(&env) {
+            return Err(format!(
+                "the environment variable {env} is reserved: a hostler service started from \
+                 inside this run would keep it (PATH, HOME, USER, SHELL, LANG, TMPDIR, LC_*, \
+                 XDG_*, RUST_LOG, the Windows profile and system names, the Android SDK names \
+                 ANDROID_HOME, ANDROID_SDK_ROOT, ANDROID_SDK_HOME, ANDROID_USER_HOME, \
+                 ANDROID_AVD_HOME, ANDROID_EMULATOR_HOME, ANDROID_ADB_SERVER_PORT and \
+                 ADB_SERVER_SOCKET, ANDROID_SERIAL, and every HOSTLER_* name); give the secret \
+                 another name with NAME=ENV"
+            ));
+        }
         if out.iter().any(|i| same_env(&i.env, &env)) {
             return Err(format!(
                 "the environment variable {env} would be set twice; give one secret another \
@@ -135,6 +147,9 @@ fn same_env(a: &str, b: &str) -> bool {
 pub struct ChildIo {
     pub env: Vec<(OsString, OsString)>,
     pub masks: Option<Arc<MaskSet>>,
+    /// Inherited names the command must not see (a device run's, P3b Task 7), removed before
+    /// `env` is set.
+    pub remove: Vec<OsString>,
 }
 
 impl ChildIo {
@@ -152,16 +167,33 @@ pub struct Prepared {
     pub files: Option<RunDir>,
     /// Masked with the materialized values.
     pub display: String,
+    /// The materialized values, for a mask that adds more (an account's fields, P3a Task 8).
+    pub values: Vec<SecretValue>,
 }
 
 /// Everything before the spawn of a secret run: on failure the reason is printed and the exit
-/// code returned (2 for usage, else 78).
+/// code returned (2 for usage, else 78). The checkout's workspace is recorded first (L15).
 pub async fn setup(
     secrets: &[String],
     files: &[String],
     run_id: &str,
     display: &str,
 ) -> Result<Prepared, i32> {
+    let specs = specs(secrets, files)?;
+    let cwd = std::env::current_dir().map_err(|e| refused(internal(format!("no cwd: {e}"))))?;
+    let current = crate::cli::secrets::current_at(&cwd).map_err(refused)?;
+    let paths = Paths::resolve().map_err(|e| refused(internal(format!("{e:#}"))))?;
+    let mut client = Client::connect_or_start(&paths, &OsManager)
+        .await
+        .map_err(refused)?;
+    setup_in(&specs, &current, &paths, run_id, display, &mut client).await
+}
+
+/// The parsed `--secret` and `--secret-file` specs; exit 2 for one that is not NAME[=ENV].
+pub fn specs(
+    secrets: &[String],
+    files: &[String],
+) -> Result<(Vec<SecretSpec>, Vec<SecretSpec>), i32> {
     let parse = |raw: &[String]| {
         raw.iter()
             .map(|s| parse_spec(s))
@@ -175,23 +207,30 @@ pub async fn setup(
         );
         return Err(EXIT_USAGE);
     };
-    let refused = |e: HostlerError| {
-        print_error(&e);
-        EXIT_REFUSED
-    };
-    let cwd = std::env::current_dir().map_err(|e| refused(internal(format!("no cwd: {e}"))))?;
-    let current = project::current(&cwd).map_err(refused)?;
-    let injections = injections(&secrets, &files, current.config.as_ref()).map_err(|m| {
+    Ok((secrets, files))
+}
+
+/// `setup` for a project already resolved, over an open connection (a claim run has both).
+pub async fn setup_in(
+    (secrets, files): &(Vec<SecretSpec>, Vec<SecretSpec>),
+    current: &Current,
+    paths: &Paths,
+    run_id: &str,
+    display: &str,
+    client: &mut Client,
+) -> Result<Prepared, i32> {
+    let injections = injections(secrets, files, current.config.as_ref()).map_err(|m| {
         eprintln!("[hostler] {m}");
         EXIT_USAGE
     })?;
-    let paths = Paths::resolve().map_err(|e| refused(internal(format!("{e:#}"))))?;
-    let mut client = Client::connect_or_start(&paths, &OsManager)
-        .await
-        .map_err(refused)?;
-    prepare(&injections, &current, display, &paths, run_id, &mut client)
+    prepare(&injections, current, display, paths, run_id, client)
         .await
         .map_err(refused)
+}
+
+fn refused(e: HostlerError) -> i32 {
+    print_error(&e);
+    EXIT_REFUSED
 }
 
 fn internal(message: String) -> HostlerError {
@@ -219,16 +258,12 @@ pub async fn prepare(
             names.push(i.name.clone());
         }
     }
-    let command = if display.len() <= MAX_RAW_COMMAND {
-        display.to_owned()
-    } else {
-        format!("<command of {} bytes>", display.len())
-    };
+    let command = raw_command(display);
     let request = Request::SecretMaterialize(Materialize {
         run_id: run_id.to_owned(),
         project: current.project.clone(),
         names,
-        command: RawCommand::new(command),
+        command,
         workspace: project::display_path(&current.checkout.workspace_root),
     });
     let values: Vec<MaterializedSecret> = client.call_sensitive(request).await?;
@@ -272,13 +307,29 @@ pub async fn prepare(
     let io = ChildIo {
         env,
         masks: Some(set),
+        remove: Vec::new(),
     };
     let display = io.mask(display);
     #[cfg(debug_assertions)]
     if let Some(ms) = test_ms("HOSTLER_TEST_PAUSE_AFTER_MATERIALIZE_MS") {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
-    Ok(Prepared { io, files, display })
+    Ok(Prepared {
+        io,
+        files,
+        display,
+        values: values.into_iter().map(|v| v.value).collect(),
+    })
+}
+
+/// The display sent with a materialization for history (L13), or a content-free placeholder
+/// when longer than 16 KiB.
+pub fn raw_command(display: &str) -> RawCommand {
+    RawCommand::new(if display.len() <= MAX_RAW_COMMAND {
+        display.to_owned()
+    } else {
+        format!("<command of {} bytes>", display.len())
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -630,8 +681,35 @@ mod tests {
         assert!(injections(&[spec("A", None)], &[spec("A", None)], None).is_err());
         // The same secret twice under two names is fine.
         assert!(injections(&[spec("A", None)], &[spec("A", Some("A_FILE"))], None).is_ok());
-        let case = injections(&[spec("PATH", None), spec("X", Some("Path"))], &[], None);
+        let case = injections(
+            &[spec("MY_VAR", None), spec("X", Some("My_Var"))],
+            &[],
+            None,
+        );
         assert_eq!(case.is_err(), cfg!(windows));
+    }
+
+    /// L48 (FR-4): a secret is never injected under a name the self-started service keeps —
+    /// by its spec, by the project config, case-insensitively.
+    #[test]
+    fn service_kept_names_are_refused() {
+        for env in [
+            "PATH",
+            "LC_ALL",
+            "LC_TOKEN",
+            "HOSTLER_X",
+            "Path",
+            "xdg_api_key",
+        ] {
+            let e = injections(&[spec("T", Some(env))], &[], None).unwrap_err();
+            assert!(e.contains(&format!("{env} is reserved")), "{e}");
+        }
+        let config = crate::project::config::parse(
+            "[secrets.API_KEY]\npurpose = \"x\"\nenv = \"XDG_API_KEY\"\n",
+        )
+        .unwrap();
+        assert!(injections(&[spec("API_KEY", None)], &[], Some(&config)).is_err());
+        assert!(injections(&[spec("T", Some("TOKEN"))], &[], None).is_ok());
     }
 
     #[test]
@@ -639,6 +717,7 @@ mod tests {
         let io = ChildIo {
             env: Vec::new(),
             masks: Some(Arc::new(MaskSet::new([b"s3cr3t-value".to_vec()]))),
+            remove: Vec::new(),
         };
         assert_eq!(
             io.mask("cannot run ./s3cr3t-value.sh"),

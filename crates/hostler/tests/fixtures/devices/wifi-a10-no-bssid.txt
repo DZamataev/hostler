@@ -1,0 +1,1 @@
+mWifiInfo SSID: TestNet, Supplicant state: COMPLETED, RSSI: -47, Link speed: 72Mbps, Frequency: 2412MHz, Net ID: 0, Metered hint: false, score: 60

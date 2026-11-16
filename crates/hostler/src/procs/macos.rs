@@ -93,6 +93,22 @@ pub(super) fn info(pid: u32) -> Option<ProcInfo> {
     })
 }
 
+/// `proc_name`: the executable's name, truncated by the kernel to `2 * MAXCOMLEN`.
+pub(super) fn process_name(pid: u32) -> Option<String> {
+    let pid = c_int::try_from(pid).ok()?;
+    let mut buf = [0u8; 1024];
+    // SAFETY: `buf` is writable for its whole length, which is passed as the size.
+    let written =
+        unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
+    if written <= 0 {
+        return None;
+    }
+    let end = (written as usize).min(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    let name = name.trim_end_matches('\0');
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// The pids in process group `pgid`. Empty on error: a false "alive" would hold a slot forever.
 fn group_pids(pgid: u32) -> Vec<u32> {
     let mut cap = 256;
@@ -148,5 +164,13 @@ mod tests {
         let pgid = unsafe { libc::getpgrp() } as u32;
         assert!(super::group_pids(pgid).contains(&std::process::id()));
         assert!(super::group_has_live_member(pgid));
+    }
+
+    #[test]
+    fn own_process_has_a_name() {
+        let name = super::process_name(std::process::id()).unwrap();
+        assert!(!name.is_empty(), "{name:?}");
+        assert!(!name.contains('/'), "{name:?}");
+        assert_eq!(super::process_name(u32::MAX), None);
     }
 }

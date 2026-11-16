@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -31,6 +33,14 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(120);
 /// Methods that may open, re-read or save the KDBX (one KDF each).
 pub const VAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// `devices.boot`: the emulator's start plus `bootstatus` (180 s), with room (P3b).
+pub const DEVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(200);
+/// `claims.seize_commit`: the service first reads agent-device's status once more, up to its
+/// 5 s bound plus a lane wait (P-2, P2-9).
+pub const SEIZE_COMMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// `devices.show` with `fresh_sessions`: up to 6 s for a sessions read that started after the
+/// call (L49, P2-15).
+pub const FRESH_SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
 /// The whole start-and-retry window of `connect_or_start`, every attempt included.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const START_RETRY_EVERY: Duration = Duration::from_millis(100);
@@ -53,7 +63,10 @@ type SensitiveIds = Arc<Mutex<HashSet<u64>>>;
 
 /// `sensitive_answer` for a typed request: these answers carry values.
 fn answer_is_sensitive(req: &Request) -> bool {
-    matches!(req, Request::SecretMaterialize(_))
+    matches!(
+        req,
+        Request::SecretMaterialize(_) | Request::AccountMaterialize(_)
+    )
 }
 
 /// How long a call may wait for its answer.
@@ -66,7 +79,23 @@ pub fn call_bound(req: &Request) -> Duration {
         | Request::SecretImport(_)
         | Request::SecretRequest(_)
         | Request::SecretShare(_)
-        | Request::SecretMaterialize(_) => VAULT_CALL_TIMEOUT,
+        | Request::SecretMaterialize(_)
+        | Request::AccountList { .. }
+        | Request::AccountSet(_)
+        | Request::AccountRemove(_)
+        | Request::AccountCheck { .. }
+        | Request::AccountMaterialize(_) => VAULT_CALL_TIMEOUT,
+        // The registry calls wait for the claims lock and a store write; as long as a vault call.
+        Request::DevicesAdd { .. }
+        | Request::DevicesRename { .. }
+        | Request::DevicesRemove { .. }
+        | Request::DevicesForgetSessions { .. } => VAULT_CALL_TIMEOUT,
+        Request::DevicesBoot { .. } => DEVICE_BOOT_TIMEOUT,
+        Request::ClaimsSeizeCommit(_) => SEIZE_COMMIT_TIMEOUT,
+        Request::DevicesShow {
+            fresh_sessions: true,
+            ..
+        } => FRESH_SESSIONS_TIMEOUT,
         _ => CALL_TIMEOUT,
     }
 }
@@ -98,7 +127,7 @@ pub fn unavailable(reason: &str, message: String, socket: &SocketName) -> Hostle
         code: ErrorCode::ServiceUnavailable,
         message,
         details: json!({ "reason": reason, "socket": socket_display(socket) }),
-        recovery: Some("hostler service run".into()),
+        recovery: Some("hostler service start".into()),
     }
 }
 
@@ -620,17 +649,195 @@ fn check_socket_owner(socket: &SocketName) -> Result<(), HostlerError> {
     Ok(())
 }
 
+/// L44 (CR-B-1): whether a service that hostler starts itself keeps the caller's variable
+/// `name`. The caller may be a command inside a run, whose environment holds an account's or a
+/// secret's values; the service needs none of them, so it gets a cleared environment plus this
+/// list. `HOSTLER_LOOKY_LEDGER` is read by the service's rn-looky bridge; `HOSTLER_TEST_*` only
+/// in debug builds. The Android SDK names reach the service's adb and emulator calls (P3b).
+fn service_keeps(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    const BOTH: &[&str] = &[
+        "HOSTLER_HOME",
+        "HOSTLER_LOOKY_LEDGER",
+        "RUST_LOG",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "ANDROID_SDK_HOME",
+        "ANDROID_USER_HOME",
+        "ANDROID_AVD_HOME",
+        "ANDROID_EMULATOR_HOME",
+        "ANDROID_ADB_SERVER_PORT",
+        "ADB_SERVER_SOCKET",
+    ];
+    #[cfg(unix)]
+    const KEPT: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
+    #[cfg(unix)]
+    const PREFIXES: &[&str] = &["LC_", "XDG_"];
+    #[cfg(windows)]
+    const KEPT: &[&str] = &[
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        "PATHEXT",
+        "PATH",
+        "USERPROFILE",
+        "USERNAME",
+        "USERDOMAIN",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "TEMP",
+        "TMP",
+    ];
+    #[cfg(windows)]
+    const PREFIXES: &[&str] = &[];
+    // Windows names are case-insensitive; Unix names are not.
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    // On bytes: a multibyte character may span the prefix's length (FR-3).
+    let starts = |prefix: &str| {
+        name.as_bytes().get(..prefix.len()).is_some_and(|head| {
+            if cfg!(windows) {
+                head.eq_ignore_ascii_case(prefix.as_bytes())
+            } else {
+                head == prefix.as_bytes()
+            }
+        })
+    };
+    BOTH.iter().chain(KEPT).any(|kept| same(name, kept))
+        || PREFIXES.iter().any(|p| starts(p))
+        || (cfg!(debug_assertions) && starts("HOSTLER_TEST_"))
+}
+
+/// L48 (FR-4): whether a run may not inject a value under `name`: a self-started service would
+/// keep it (L44). Case-insensitive on every system, over both systems' lists, `LC_*`, `XDG_*`
+/// and every `HOSTLER_*`; also the Android SDK names and `ANDROID_SERIAL`, which `run --device`
+/// exports (P3b).
+pub fn reserved_for_the_service(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "ANDROID_SDK_HOME",
+        "ANDROID_USER_HOME",
+        "ANDROID_AVD_HOME",
+        "ANDROID_EMULATOR_HOME",
+        "ANDROID_ADB_SERVER_PORT",
+        "ADB_SERVER_SOCKET",
+        "ANDROID_SERIAL",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TMPDIR",
+        "RUST_LOG",
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "USERNAME",
+        "USERDOMAIN",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "TEMP",
+        "TMP",
+    ];
+    const PREFIXES: &[&str] = &["LC_", "XDG_", "HOSTLER_"];
+    NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+        || PREFIXES.iter().any(|p| {
+            name.as_bytes()
+                .get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
+        })
+}
+
+/// The caller's environment as a self-started service gets it (L44).
+fn service_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| service_keeps(name))
+        .collect()
+}
+
+/// L58 (FR1-1): the test process whose services this process starts belong to, from
+/// `set_test_owner_pid`. Debug builds only; release builds have no such hook.
+#[cfg(debug_assertions)]
+static TEST_OWNER_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Test-only (L58): names `pid` as the owner of the services this process starts itself, so they
+/// stop along with it; `0` clears it. Debug builds only.
+#[cfg(debug_assertions)]
+pub fn set_test_owner_pid(pid: u32) {
+    TEST_OWNER_PID.store(pid, Ordering::SeqCst);
+}
+
+/// The `HOSTLER_TEST_OWNER_PID` a spawned service gets: the test owner, unless the caller's own
+/// environment already carries the variable (`None`: its value wins).
+#[cfg(debug_assertions)]
+fn test_owner_value(
+    owner: Option<u32>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<String> {
+    let owner = owner?;
+    let present = vars.iter().any(|(name, _)| {
+        name.to_str().is_some_and(|name| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case("HOSTLER_TEST_OWNER_PID")
+            } else {
+                name == "HOSTLER_TEST_OWNER_PID"
+            }
+        })
+    });
+    (!present).then(|| owner.to_string())
+}
+
+/// Adds the test owner to a service's environment (L58); the caller's own value wins.
+#[cfg(debug_assertions)]
+fn add_test_owner(vars: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+    let owner = match TEST_OWNER_PID.load(Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    };
+    if let Some(pid) = test_owner_value(owner, vars) {
+        vars.push(("HOSTLER_TEST_OWNER_PID".into(), pid.into()));
+    }
+}
+
 /// Starts `exe service run` detached from this process and its terminal, holding none of our
 /// handles or fds: a caller reading our output must see EOF as soon as we exit, not when the
-/// long-lived service does.
+/// long-lived service does. Its environment is cleared but for `service_keeps` (L44).
 #[cfg(unix)]
 fn spawn_service(exe: &Path, paths: &Paths) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    // L58: a service a test starts in-process watches the test process too (debug builds).
+    #[allow(unused_mut)]
+    let mut vars = service_environment(std::env::vars_os());
+    #[cfg(debug_assertions)]
+    add_test_owner(&mut vars);
     let mut command = Command::new(exe);
     command
         .args(["service", "run"])
+        .env_clear()
+        .envs(vars)
         .env("HOSTLER_HOME", &paths.home)
         .current_dir(&paths.home)
         .stdin(Stdio::null())
@@ -775,7 +982,13 @@ fn spawn_service(exe: &Path, paths: &Paths) -> std::io::Result<()> {
     let mut command_line = quote_windows_arg(&exe);
     command_line.extend(" service run".encode_utf16());
     command_line.push(0);
-    let vars = std::env::vars_os()
+    // L44: never the caller's injected values. L58: a test's service watches the test process.
+    #[allow(unused_mut)]
+    let mut vars = service_environment(std::env::vars_os());
+    #[cfg(debug_assertions)]
+    add_test_owner(&mut vars);
+    let vars = vars
+        .into_iter()
         .map(|(k, v)| (k.encode_wide().collect(), v.encode_wide().collect()))
         .collect();
     let home: Vec<u16> = paths.home.as_os_str().encode_wide().collect();
@@ -890,6 +1103,294 @@ fn environment_block(vars: Vec<(Vec<u16>, Vec<u16>)>, home: &[u16]) -> Vec<u16> 
 mod tests {
     use super::*;
 
+    /// L48 (FR-4): the names a run may not inject a value under.
+    #[test]
+    fn names_the_service_keeps_are_reserved() {
+        for name in [
+            "PATH",
+            "path",
+            "LC_ALL",
+            "lc_token",
+            "XDG_API_KEY",
+            "HOSTLER_X",
+            "hostler_home",
+            "RUST_LOG",
+            "USERNAME",
+            "Temp",
+            "SystemRoot",
+        ] {
+            assert!(reserved_for_the_service(name), "{name}");
+        }
+        for name in ["API_KEY", "TOKEN", "LCX", "XDG", "HOSTLE", "A€B", "PATHX"] {
+            assert!(!reserved_for_the_service(name), "{name}");
+        }
+    }
+
+    /// The Android names: kept by a self-started service (the SDK's, not `ANDROID_SERIAL`, which
+    /// is a run's), and reserved against injection, any case (P3b, L48).
+    #[test]
+    fn android_names_are_kept_and_reserved() {
+        use std::ffi::OsStr;
+
+        const SDK: [&str; 8] = [
+            "ANDROID_HOME",
+            "ANDROID_SDK_ROOT",
+            "ANDROID_SDK_HOME",
+            "ANDROID_USER_HOME",
+            "ANDROID_AVD_HOME",
+            "ANDROID_EMULATOR_HOME",
+            "ANDROID_ADB_SERVER_PORT",
+            "ADB_SERVER_SOCKET",
+        ];
+        for name in SDK {
+            assert!(service_keeps(OsStr::new(name)), "{name}");
+            assert!(reserved_for_the_service(name), "{name}");
+            assert!(
+                reserved_for_the_service(&name.to_ascii_lowercase()),
+                "{name}"
+            );
+        }
+        assert!(!service_keeps(OsStr::new("ANDROID_SERIAL")));
+        assert!(!service_keeps(OsStr::new("ANDROID_HOMEX")));
+        for name in ["ANDROID_SERIAL", "android_serial", "Android_Serial"] {
+            assert!(reserved_for_the_service(name), "{name}");
+        }
+        for name in ["ANDROID", "ANDROID_SERIAL_X", "MY_ANDROID_HOME"] {
+            assert!(!reserved_for_the_service(name), "{name}");
+        }
+
+        // At injection: exit 2 (the caller's) with L48's text, whatever the case.
+        use crate::cli::secret_run::{SecretSpec, injections};
+        for (spec, env) in [
+            ("ANDROID_SERIAL", "ANDROID_SERIAL"),
+            ("API_KEY=android_serial", "android_serial"),
+            ("API_KEY=ANDROID_HOME", "ANDROID_HOME"),
+        ] {
+            let spec: SecretSpec = crate::cli::secret_run::parse_spec(spec).unwrap();
+            for (secrets, files) in [
+                (std::slice::from_ref(&spec), &[][..]),
+                (&[][..], std::slice::from_ref(&spec)),
+            ] {
+                let err = injections(secrets, files, None).unwrap_err();
+                assert!(
+                    err.starts_with(&format!(
+                        "the environment variable {env} is reserved: a hostler service started \
+                         from inside this run would keep it"
+                    )),
+                    "{err}"
+                );
+                // P3bT1-5: the list the person reads names every Android name too.
+                let (_, list) = err.split_once(" (").unwrap();
+                let (list, _) = list.split_once(");").unwrap();
+                for name in SDK.iter().chain(&["ANDROID_SERIAL"]) {
+                    assert!(list.contains(name), "{name} missing from {list:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn self_started_service_keeps_android_home() {
+        use std::ffi::OsString;
+
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("ANDROID_HOME", "/sdk"),
+            ("ANDROID_SDK_ROOT", "/sdk"),
+            ("ANDROID_ADB_SERVER_PORT", "5038"),
+            ("ADB_SERVER_SOCKET", "tcp:localhost:5038"),
+            ("ANDROID_SERIAL", "SERIAL0001"),
+            ("API_KEY", "hunter2-canary"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let kept: Vec<(String, String)> = service_environment(vars)
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("PATH", "/usr/bin"),
+                ("ANDROID_HOME", "/sdk"),
+                ("ANDROID_SDK_ROOT", "/sdk"),
+                ("ANDROID_ADB_SERVER_PORT", "5038"),
+                ("ADB_SERVER_SOCKET", "tcp:localhost:5038"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        );
+    }
+
+    #[test]
+    fn devices_boot_call_bound_is_200_s() {
+        let boot = Request::DevicesBoot {
+            resource: crate::contract::claims::ResourceId("device:android:avd:pixel_9".into()),
+            claim_id: "c1".into(),
+            workspace_id: "ws-1".into(),
+        };
+        assert_eq!(call_bound(&boot), Duration::from_secs(200));
+        let show = |fresh_sessions| Request::DevicesShow {
+            device: "pixel-9".into(),
+            fresh_sessions,
+        };
+        assert_eq!(call_bound(&show(true)), Duration::from_secs(10));
+        assert_eq!(call_bound(&show(false)), CALL_TIMEOUT);
+        for registry in [
+            Request::DevicesAdd {
+                device: "SERIAL0001".into(),
+                alias: None,
+                person: true,
+            },
+            Request::DevicesRename {
+                device: "pixel-9".into(),
+                alias: "left".into(),
+                person: true,
+            },
+            Request::DevicesRemove {
+                device: "pixel-9".into(),
+                person: true,
+            },
+            Request::DevicesForgetSessions {
+                device: "pixel-9".into(),
+                person: true,
+                by_workspace_path: Some("/work/app".into()),
+                by_pid: Some(42),
+            },
+        ] {
+            assert_eq!(call_bound(&registry), VAULT_CALL_TIMEOUT, "{registry:?}");
+        }
+        for other in [
+            Request::DevicesList { all: true },
+            Request::DevicesResolve {
+                device: "pixel-9".into(),
+            },
+            Request::DevicesNote {
+                device: "pixel-9".into(),
+                note: None,
+            },
+            Request::DevicesInstalls {
+                device: None,
+                query: Default::default(),
+            },
+            Request::DevicesTools(Default::default()),
+        ] {
+            assert_eq!(call_bound(&other), CALL_TIMEOUT, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn seize_commit_call_bound_is_15_s() {
+        use crate::contract::claims::SeizeCommit;
+
+        let commit = Request::ClaimsSeizeCommit(SeizeCommit {
+            plan_id: "p1".into(),
+            requester: crate::procs::ProcessIdentity {
+                pid: 42,
+                boot_id: "b1".into(),
+                start_time: 420,
+            },
+            evidence: Vec::new(),
+        });
+        assert_eq!(call_bound(&commit), Duration::from_secs(15));
+        assert_eq!(
+            call_bound(&Request::ClaimsSeizeAbort {
+                plan_id: "p1".into()
+            }),
+            CALL_TIMEOUT
+        );
+    }
+
+    /// L44: a self-started service keeps the allowlist only — never an account's or a secret's
+    /// value, nor the run's tokens.
+    #[test]
+    fn a_started_service_keeps_only_the_allowlist() {
+        use std::ffi::OsString;
+
+        let vars = [
+            "PATH",
+            "HOSTLER_HOME",
+            "HOSTLER_LOOKY_LEDGER",
+            "RUST_LOG",
+            "HOSTLER_ACCOUNT_SESSION",
+            "HOSTLER_SECRET_RUN",
+            "HOSTLER_CLAIM_TOKENS",
+            "HOSTLER_HEAVY_TOKEN",
+            "API_KEY",
+            "HOSTLER_TEST_FAST_KDF",
+            // FR-3: a multibyte character across a prefix's length neither panics nor is kept.
+            "A€B",
+            "XD€Z",
+            "LC€X",
+            "HOSTLER_TES€T",
+            #[cfg(unix)]
+            "HOME",
+            #[cfg(unix)]
+            "LC_ALL",
+            #[cfg(unix)]
+            "XDG_RUNTIME_DIR",
+            #[cfg(windows)]
+            "SYSTEMROOT",
+            #[cfg(windows)]
+            "LocalAppData",
+        ]
+        .map(|name| (OsString::from(name), OsString::from("v")));
+        let kept: Vec<String> = service_environment(vars)
+            .into_iter()
+            .map(|(k, _)| k.into_string().unwrap())
+            .collect();
+        let mut expected = vec!["PATH", "HOSTLER_HOME", "HOSTLER_LOOKY_LEDGER", "RUST_LOG"];
+        if cfg!(debug_assertions) {
+            expected.push("HOSTLER_TEST_FAST_KDF");
+        }
+        #[cfg(unix)]
+        expected.extend(["HOME", "LC_ALL", "XDG_RUNTIME_DIR"]);
+        #[cfg(windows)]
+        expected.extend(["SYSTEMROOT", "LocalAppData"]);
+        assert_eq!(kept, expected);
+    }
+
+    /// L58 (FR1-1): a service this process starts itself gets the test owner, unless the caller's
+    /// own environment already carries the variable (that value wins).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_spawned_service_gets_the_test_owner_unless_the_caller_set_it() {
+        let env = |name: &str| {
+            vec![(
+                std::ffi::OsString::from(name),
+                std::ffi::OsString::from("9"),
+            )]
+        };
+        assert_eq!(test_owner_value(Some(4242), &[]), Some("4242".to_owned()));
+        assert_eq!(
+            test_owner_value(Some(4242), &env("HOSTLER_TEST_OWNER_PID")),
+            None
+        );
+        // A similar name is not the variable.
+        assert_eq!(
+            test_owner_value(Some(4242), &env("HOSTLER_TEST_OWNER_PID_OLD")),
+            Some("4242".to_owned())
+        );
+        assert_eq!(test_owner_value(None, &[]), None);
+
+        // Set -> added; already present -> kept as it is; cleared -> absent.
+        set_test_owner_pid(4242);
+        let mut vars = Vec::new();
+        add_test_owner(&mut vars);
+        assert_eq!(
+            vars,
+            vec![(
+                std::ffi::OsString::from("HOSTLER_TEST_OWNER_PID"),
+                std::ffi::OsString::from("4242")
+            )]
+        );
+        let mut vars = env("HOSTLER_TEST_OWNER_PID");
+        add_test_owner(&mut vars);
+        assert_eq!(vars, env("HOSTLER_TEST_OWNER_PID"));
+        set_test_owner_pid(0);
+        let mut vars = Vec::new();
+        add_test_owner(&mut vars);
+        assert!(vars.is_empty());
+    }
+
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
     }
@@ -966,6 +1467,43 @@ mod tests {
         assert_eq!(call_bound(&Request::SecretRequests), Duration::from_secs(5));
         assert_eq!(call_bound(&Request::QueueSnapshot), CALL_TIMEOUT);
         assert_eq!(call_bound(&Request::SecretsStatus), CALL_TIMEOUT);
+        // Every account method may open, re-read or save the KDBX.
+        use crate::contract::accounts::{AccountMaterialize, AccountRemove, AccountSet};
+        let accounts = [
+            Request::AccountList { project: project() },
+            Request::AccountSet(AccountSet {
+                project: project(),
+                name: "qa-user".into(),
+                field: "session".into(),
+                value: SecretValue::new("value-1".into()),
+            }),
+            Request::AccountRemove(AccountRemove {
+                project: project(),
+                name: "qa-user".into(),
+                field: None,
+            }),
+            Request::AccountCheck {
+                project: project(),
+                name: "qa-user".into(),
+            },
+            Request::AccountMaterialize(AccountMaterialize {
+                run_id: "run-1".into(),
+                claim_id: "c1".into(),
+                requester: crate::procs::ProcessIdentity {
+                    pid: 42,
+                    boot_id: "b1".into(),
+                    start_time: 420,
+                },
+                project: project(),
+                name: "qa-user".into(),
+                command: crate::secrets::value::RawCommand::new("make".into()),
+                workspace: "/work/app".into(),
+            }),
+        ];
+        for request in accounts {
+            assert_eq!(call_bound(&request), VAULT_CALL_TIMEOUT, "{request:?}");
+        }
+        assert_eq!(call_bound(&Request::ClaimsSnapshot), CALL_TIMEOUT);
     }
 
     /// A one-connection service stand-in: answers `hello`, then, for each request it reads,
@@ -1204,6 +1742,23 @@ mod tests {
             Request::SecretsStatus,
             Request::QueueSnapshot,
             Request::ServiceStatus,
+            Request::AccountMaterialize(crate::contract::accounts::AccountMaterialize {
+                run_id: "run-1".into(),
+                claim_id: "c1".into(),
+                requester: crate::procs::ProcessIdentity {
+                    pid: 42,
+                    boot_id: "b1".into(),
+                    start_time: 420,
+                },
+                project: project(),
+                name: "qa-user".into(),
+                command: crate::secrets::value::RawCommand::new("make".into()),
+                workspace: "/work/app".into(),
+            }),
+            Request::AccountCheck {
+                project: project(),
+                name: "qa-user".into(),
+            },
         ];
         for request in requests {
             let method = serde_json::to_value(&request).unwrap()["method"]

@@ -1,0 +1,47 @@
+{
+  "success": true,
+  "data": {
+    "claims": [
+      {
+        "deviceKey": "local:apple:ios:00000000-0000-4000-8000-00000000000A",
+        "classification": "live",
+        "device": {
+          "id": "00000000-0000-4000-8000-00000000000A",
+          "appleOs": "ios",
+          "kind": "simulator",
+          "target": "mobile",
+          "name": "iPhone 17 Pro",
+          "platform": "ios"
+        },
+        "owner": {
+          "session": "cwd:0000000000000000:default",
+          "workspace": "/Users/dev/work/app",
+          "stateDir": "/Users/dev/.agent-device",
+          "pid": 11111,
+          "startTime": "Mon Jan  5 10:00:00 2026"
+        }
+      },
+      {
+        "deviceKey": "local:apple:ios:00008101-000A00000000001E",
+        "classification": "live",
+        "device": {
+          "id": "00008101-000A00000000001E",
+          "appleOs": "ios",
+          "kind": "device",
+          "target": "mobile",
+          "iosPhysicalDeviceBackend": "coredevice",
+          "name": "Test iPhone 1",
+          "platform": "ios"
+        },
+        "owner": {
+          "session": "p10probe",
+          "workspace": "/Users/dev/work/probe",
+          "stateDir": "/Users/dev/work/probe/ad-state",
+          "pid": 33333,
+          "startTime": "Mon Jan  5 12:00:00 2026"
+        }
+      }
+    ],
+    "hiddenStaleClaims": 0
+  }
+}

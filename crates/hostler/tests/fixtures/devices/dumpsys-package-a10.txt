@@ -1,0 +1,15 @@
+  Package [com.example.app1] (d157d8f):
+    versionCode=498232 minSdk=29 targetSdk=36
+    versionName=1.22.5
+    firstInstallTime=2024-05-03 14:34:47
+    lastUpdateTime=2026-11-04 02:54:33
+  Package [com.example.app2] (c62b538):
+    versionCode=11920 minSdk=26 targetSdk=36
+    versionName=0.243.0
+    firstInstallTime=2023-10-05 12:01:35
+    lastUpdateTime=2026-10-07 03:11:58
+  Package [com.example.app3] (9f41513):
+    versionCode=1298043 minSdk=24 targetSdk=34
+    versionName=1.6.0
+    firstInstallTime=2023-10-05 12:31:25
+    lastUpdateTime=2024-09-19 03:17:14

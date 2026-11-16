@@ -249,7 +249,13 @@ async fn wait_for_answer(
             _ = poll.tick() => true,
             event = next_event(&mut waiter.client) => match event {
                 Some(Event::SecretRequestChanged(_) | Event::SecretsLockChanged(_)) => events_count,
-                Some(Event::QueueChanged(_)) => false,
+                Some(
+                    Event::QueueChanged(_)
+                    | Event::ClaimsChanged(_)
+                    | Event::ClaimsSeized(_)
+                    | Event::DevicesChanged(_)
+                    | Event::DevicesInstalled(_),
+                ) => false,
                 None => {
                     // The connection is gone: reconnect (inside `ask`) and re-send.
                     waiter.client = None;
@@ -445,7 +451,7 @@ impl Waiter {
                     code: ErrorCode::ServiceUnavailable,
                     message: "the hostler service did not answer in time".into(),
                     details: json!({ "reason": "timeout" }),
-                    recovery: Some("hostler service run".into()),
+                    recovery: Some("hostler service start".into()),
                 }));
             }
             tokio::time::sleep(RETRY_PAUSE).await;

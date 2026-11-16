@@ -2,16 +2,30 @@
 //!
 //! An entry's `Title` is the secret NAME (unprotected), its `Password` the value (protected).
 //! A project group is found by UUID anywhere in the tree; one under the Recycle Bin is gone.
+//!
+//! An account (plan P3a, Task 9) is an entry tagged `hostler-account`: its `Title` is the account
+//! name (unprotected), each field one protected custom string. `UserName`, `Password`, `URL` and
+//! `Notes` are never read.
 
 use keepass::Database;
 use keepass::db::{EntryId, GroupId, fields};
 
 use super::valid_secret_name;
 use super::value::SecretValue;
+use crate::contract::accounts::{valid_account_name, valid_field_name};
+
+pub const ACCOUNT_TAG: &str = "hostler-account";
 
 pub enum Lookup {
     Missing,
     Value(SecretValue),
+    Duplicate,
+}
+
+pub enum AccountLookup {
+    Missing,
+    /// `(field, value)`, sorted by field.
+    Found(Vec<(String, SecretValue)>),
     Duplicate,
 }
 
@@ -121,6 +135,147 @@ pub fn remove(db: &mut Database, group: GroupId, name: &str) -> bool {
         }
     }
     !ids.is_empty()
+}
+
+fn is_account(e: &keepass::db::Entry) -> bool {
+    e.tags.iter().any(|t| t == ACCOUNT_TAG)
+}
+
+/// Tagged entries of `group` (direct children only) whose title is `name`.
+fn accounts_named(db: &Database, group: GroupId, name: &str) -> Vec<EntryId> {
+    if !live_group(db, group) {
+        return Vec::new();
+    }
+    db.group(group)
+        .map(|g| {
+            g.entries()
+                .filter(|e| is_account(e) && e.get_title() == Some(name))
+                .map(|e| e.id())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// An entry's account fields: custom strings with a valid field name; an empty one is unset.
+fn field_entries(e: &keepass::db::Entry) -> impl Iterator<Item = (&String, &str)> {
+    e.fields
+        .iter()
+        .map(|(k, v)| (k, v.get().as_str()))
+        .filter(|(k, v)| !fields::KNOWN_FIELDS.contains(&k.as_str()) && !v.is_empty())
+        .filter(|(k, _)| valid_field_name(k))
+}
+
+/// Titles of the group's tagged entries that are valid account names, sorted, deduplicated.
+pub fn account_names(db: &Database, group: GroupId) -> Vec<String> {
+    if !live_group(db, group) {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = db
+        .group(group)
+        .map(|g| {
+            g.entries()
+                .filter(|e| is_account(e))
+                .filter_map(|e| e.get_title().map(str::to_string))
+                .filter(|t| valid_account_name(t))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The field names of account `name` (of every entry, when it is duplicated), sorted.
+pub fn account_fields(db: &Database, group: GroupId, name: &str) -> Option<Vec<String>> {
+    let ids = accounts_named(db, group, name);
+    if ids.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = ids
+        .iter()
+        .filter_map(|id| db.entry(*id))
+        .flat_map(|e| {
+            field_entries(&e)
+                .map(|(field, _)| field.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
+pub fn account(db: &Database, group: GroupId, name: &str) -> AccountLookup {
+    match accounts_named(db, group, name).as_slice() {
+        [] => AccountLookup::Missing,
+        [id] => db.entry(*id).map_or(AccountLookup::Missing, |e| {
+            let mut fields: Vec<(String, SecretValue)> = field_entries(&e)
+                .map(|(k, v)| (k.clone(), SecretValue::new(v.to_owned())))
+                .collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            AccountLookup::Found(fields)
+        }),
+        _ => AccountLookup::Duplicate,
+    }
+}
+
+/// Sets `field` of account `name` in `group` (which must exist), adding the tagged entry when it
+/// is new. The caller refuses duplicates before.
+pub fn put_account_field(
+    db: &mut Database,
+    group: GroupId,
+    name: &str,
+    field: &str,
+    value: &SecretValue,
+) {
+    if let Some(id) = accounts_named(db, group, name).first() {
+        if let Some(mut entry) = db.entry_mut(*id) {
+            entry.set_protected(field, value.expose());
+        }
+        return;
+    }
+    let mut group = db
+        .group_mut(group)
+        .expect("layout::put_account_field into a group that does not exist");
+    let mut entry = group.add_entry();
+    entry.set_unprotected(fields::TITLE, name);
+    entry.tags.push(ACCOUNT_TAG.to_string());
+    entry.set_protected(field, value.expose());
+}
+
+/// Removes hostler's data of account `name` (every tagged entry of that title): only `field`, or
+/// every account field. An entry left without account fields loses the tag too (L26); it is
+/// deleted (recorded in `deleted_objects`) only when nothing else has content — a standard
+/// field, another custom string or an attachment keeps it, as a plain entry.
+pub fn remove_account(db: &mut Database, group: GroupId, name: &str, field: Option<&str>) -> bool {
+    let mut removed = false;
+    for id in accounts_named(db, group, name) {
+        let Some(mut entry) = db.entry_mut(id) else {
+            continue;
+        };
+        let ours: Vec<String> = match field {
+            Some(field) if entry.fields.contains_key(field) => vec![field.to_string()],
+            Some(_) => continue,
+            None => field_entries(&entry).map(|(k, _)| k.clone()).collect(),
+        };
+        for field in &ours {
+            entry.fields.remove(field);
+        }
+        removed = true;
+        if field_entries(&entry).next().is_some() {
+            continue;
+        }
+        entry.tags.retain(|t| t != ACCOUNT_TAG);
+        let other_data = entry
+            .fields
+            .iter()
+            .any(|(k, v)| k != fields::TITLE && !v.get().is_empty())
+            || entry.as_ref().attachments().next().is_some();
+        if !other_data {
+            entry.track_changes().remove();
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -258,5 +413,169 @@ mod tests {
         assert!(live_group(&db, g));
         assert_eq!(ensure_group(&mut db, Some(g), "proj"), g);
         assert!(expect_value(lookup(&db, g, "API_KEY")) == "v1-value");
+    }
+
+    fn fields(l: AccountLookup) -> Vec<(String, String)> {
+        match l {
+            AccountLookup::Found(f) => f
+                .into_iter()
+                .map(|(k, v)| (k, v.expose().to_string()))
+                .collect(),
+            AccountLookup::Missing => panic!("missing"),
+            AccountLookup::Duplicate => panic!("duplicate"),
+        }
+    }
+
+    #[test]
+    fn put_field_creates_tagged_entry() {
+        let (mut db, g) = db_with_group();
+        assert!(matches!(account(&db, g, "qa-user"), AccountLookup::Missing));
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        put_account_field(&mut db, g, "qa-user", "env", &value("stage"));
+        let entries: Vec<_> = db.group(g).unwrap().entries().map(|e| e.id()).collect();
+        assert_eq!(entries.len(), 1, "the second field joins the first entry");
+        let e = db.entry(entries[0]).unwrap();
+        assert_eq!(e.tags, vec![ACCOUNT_TAG.to_string()]);
+        assert_eq!(e.get_title(), Some("qa-user"));
+        assert!(e.get(fields::PASSWORD).is_none());
+        assert_eq!(
+            fields(account(&db, g, "qa-user")),
+            vec![
+                ("env".to_string(), "stage".to_string()),
+                ("session".to_string(), "sess-1234".to_string())
+            ]
+        );
+        put_account_field(&mut db, g, "qa-user", "env", &value("prod-1"));
+        assert_eq!(fields(account(&db, g, "qa-user"))[0].1, "prod-1");
+        assert_eq!(account_names(&db, g), vec!["qa-user".to_string()]);
+        assert_eq!(
+            account_fields(&db, g, "qa-user"),
+            Some(vec!["env".to_string(), "session".to_string()])
+        );
+        assert_eq!(account_fields(&db, g, "other"), None);
+    }
+
+    #[test]
+    fn fields_are_protected_custom_strings() {
+        let (mut db, g) = db_with_group();
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        let id = db.group(g).unwrap().entries().next().unwrap().id();
+        let e = db.entry(id).unwrap();
+        assert!(e.fields["session"].is_protected());
+        assert!(!e.fields[fields::TITLE].is_protected());
+        // Standard fields, invalid names and empty values are not account fields.
+        let mut e = db.entry_mut(id).unwrap();
+        e.set_protected(fields::PASSWORD, "pw-value");
+        e.set_unprotected(fields::NOTES, "notes");
+        e.set_protected("KP2A_URL", "x-value");
+        e.set_protected("blank", "");
+        assert_eq!(
+            account_fields(&db, g, "qa-user"),
+            Some(vec!["session".to_string()])
+        );
+    }
+
+    #[test]
+    fn untagged_entry_is_not_an_account() {
+        let (mut db, g) = db_with_group();
+        {
+            let mut group = db.group_mut(g).unwrap();
+            let mut e = group.add_entry();
+            e.set_unprotected(fields::TITLE, "qa-user");
+            e.set_protected("session", "sess-1234");
+        }
+        assert!(account_names(&db, g).is_empty());
+        assert!(matches!(account(&db, g, "qa-user"), AccountLookup::Missing));
+        assert!(!remove_account(&mut db, g, "qa-user", None));
+        // A tagged entry with an invalid title is not listed either.
+        put_account_field(&mut db, g, "Bad Name", "session", &value("sess-1234"));
+        assert!(account_names(&db, g).is_empty());
+    }
+
+    #[test]
+    fn secret_names_never_list_accounts() {
+        let (mut db, g) = db_with_group();
+        put(&mut db, g, "API_KEY", &value("v1-value"));
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        assert_eq!(names(&db, g), vec!["API_KEY".to_string()]);
+        assert!(matches!(lookup(&db, g, "qa-user"), Lookup::Missing));
+        assert_eq!(account_names(&db, g), vec!["qa-user".to_string()]);
+        assert!(account_fields(&db, g, "API_KEY").is_none());
+    }
+
+    #[test]
+    fn remove_field_then_account() {
+        let (mut db, g) = db_with_group();
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        put_account_field(&mut db, g, "qa-user", "env", &value("stage"));
+        let id = db.group(g).unwrap().entries().next().unwrap().id();
+        assert!(!remove_account(&mut db, g, "qa-user", Some("nope")));
+        assert!(remove_account(&mut db, g, "qa-user", Some("env")));
+        assert_eq!(
+            account_fields(&db, g, "qa-user"),
+            Some(vec!["session".to_string()])
+        );
+        // Removing the last field removes the account.
+        assert!(remove_account(&mut db, g, "qa-user", Some("session")));
+        assert!(db.entry(id).is_none());
+        assert!(db.deleted_objects.contains_key(&id.uuid()));
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        assert!(remove_account(&mut db, g, "qa-user", None));
+        assert!(matches!(account(&db, g, "qa-user"), AccountLookup::Missing));
+        assert!(!remove_account(&mut db, g, "qa-user", None));
+    }
+
+    #[test]
+    fn duplicate_tagged_entries_are_reported() {
+        let (mut db, g) = db_with_group();
+        for v in ["first-value", "second-value"] {
+            let mut group = db.group_mut(g).unwrap();
+            let mut e = group.add_entry();
+            e.set_unprotected(fields::TITLE, "qa-user");
+            e.tags.push(ACCOUNT_TAG.into());
+            e.set_protected("session", v);
+        }
+        assert!(matches!(
+            account(&db, g, "qa-user"),
+            AccountLookup::Duplicate
+        ));
+        assert_eq!(account_names(&db, g), vec!["qa-user".to_string()]);
+        assert!(remove_account(&mut db, g, "qa-user", None));
+        assert!(db.group(g).unwrap().entries().next().is_none());
+    }
+
+    /// L26: a person's own data on the entry survives `remove --field` and `remove NAME`.
+    #[test]
+    fn remove_keeps_the_persons_own_fields() {
+        for field in [Some("session"), None] {
+            let (mut db, g) = db_with_group();
+            put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+            let id = db.group(g).unwrap().entries().next().unwrap().id();
+            {
+                let mut e = db.entry_mut(id).unwrap();
+                e.set_protected(fields::PASSWORD, "login-pw-1");
+                e.set_unprotected(fields::NOTES, "my notes");
+                e.tags.push("work".into());
+            }
+            assert!(remove_account(&mut db, g, "qa-user", field));
+            let e = db.entry(id).expect("the entry stays");
+            assert_eq!(e.get(fields::PASSWORD), Some("login-pw-1"));
+            assert_eq!(e.get(fields::NOTES), Some("my notes"));
+            assert_eq!(e.get_title(), Some("qa-user"));
+            assert!(e.get("session").is_none());
+            assert_eq!(e.tags, vec!["work".to_string()]);
+            assert!(!db.deleted_objects.contains_key(&id.uuid()));
+            assert!(matches!(account(&db, g, "qa-user"), AccountLookup::Missing));
+            assert!(account_names(&db, g).is_empty());
+            assert!(!remove_account(&mut db, g, "qa-user", None));
+        }
+        // An entry with only hostler's data is still deleted.
+        let (mut db, g) = db_with_group();
+        put_account_field(&mut db, g, "qa-user", "session", &value("sess-1234"));
+        put_account_field(&mut db, g, "qa-user", "env", &value("stage"));
+        let id = db.group(g).unwrap().entries().next().unwrap().id();
+        assert!(remove_account(&mut db, g, "qa-user", None));
+        assert!(db.entry(id).is_none());
+        assert!(db.deleted_objects.contains_key(&id.uuid()));
     }
 }

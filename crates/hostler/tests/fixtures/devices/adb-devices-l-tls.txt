@@ -1,0 +1,4 @@
+List of devices attached
+FAKE0SAMS01            device usb:0-2.3.1 product:psqxxx model:SM_S937B device:psq transport_id:11
+adb-FAKE0SAMS01-Ab3dEf._adb-tls-connect._tcp device product:psqxxx model:SM_S937B device:psq transport_id:16
+

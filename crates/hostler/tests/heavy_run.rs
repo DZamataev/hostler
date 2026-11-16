@@ -58,6 +58,8 @@ impl Home {
             .env_remove("HOSTLER_TEST_CONTRACT_VERSION")
             .env_remove("HOSTLER_TEST_EXIT_AFTER_COMMIT")
             .env_remove("HOSTLER_TEST_KILL_BEFORE_GATE")
+            // L58: a service these commands start stops when this test process is gone.
+            .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
             .current_dir(self.dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -210,6 +212,41 @@ fn two_runs_are_serialized_with_capacity_one() {
     );
     assert!(err.contains("Ctrl+C withdraws the request."), "{err}");
     assert!(err.contains("[hostler] Slot granted after"), "{err}");
+}
+
+/// CR-B-2: another agent's escape sequences never reach the terminal through `hostler queue` or
+/// the heavy waiting line.
+#[test]
+fn other_agents_escape_sequences_never_reach_the_terminal() {
+    const EVIL: &str = "\u{1b}]0;PWNED\u{7}\u{1b}[2J";
+    let home = Home::new();
+    let evil = vec![
+        hold_exe().as_os_str().to_owned(),
+        "--print".into(),
+        EVIL.into(),
+        home.file("evil").into_os_string(),
+        "3000".into(),
+    ];
+    let held = home.heavy(&[], evil).spawn().unwrap();
+    home.wait_started("evil");
+
+    let listed = home.hostler().arg("queue").output().unwrap();
+    assert!(listed.status.success());
+    let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(!text.contains('\u{7}'), "{text:?}");
+
+    let blocked = home
+        .heavy(&["--max-wait", "0.005"], home.hold("second", 10, &[]))
+        .output()
+        .unwrap();
+    assert_code(&blocked, 75);
+    let err = stderr(&blocked);
+    assert!(err.contains("Heavy queue"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+    assert!(!err.contains('\u{7}'), "{err:?}");
+
+    assert_code(&finish(held), 0);
 }
 
 #[test]

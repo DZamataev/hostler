@@ -42,7 +42,8 @@ pub fn main_list(json: bool) -> ExitCode {
 }
 
 fn list() -> Result<SecretList, HostlerError> {
-    let current = crate::project::current(&crate::cli::secrets::cwd()?)?;
+    // Through `workspace.resolve`: a moved project follows on this first P2 command (T5-6).
+    let current = crate::cli::secrets::current_at(&crate::cli::secrets::cwd()?)?;
     let declared = current
         .config
         .as_ref()
@@ -100,7 +101,7 @@ fn run_set(name: String) -> Result<ExitCode, HostlerError> {
 
 /// At most 64 KiB from stdin after one trailing `\n` or `\r\n` is stripped. The buffer is
 /// erasing and reserved for the largest possible read, so no copy is freed in clear.
-fn read_stdin_value() -> Result<SecretValue, HostlerError> {
+pub(crate) fn read_stdin_value() -> Result<SecretValue, HostlerError> {
     read_value_from(std::io::stdin())
 }
 

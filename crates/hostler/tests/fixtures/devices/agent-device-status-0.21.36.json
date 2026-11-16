@@ -1,0 +1,45 @@
+{
+ "success": true,
+ "data": {
+  "claims": [
+   {
+    "deviceKey": "local:apple:ios:00000000-0000-4000-8000-00000000000A",
+    "classification": "live",
+    "device": {
+     "id": "00000000-0000-4000-8000-00000000000A",
+     "appleOs": "ios",
+     "kind": "simulator",
+     "target": "mobile",
+     "name": "iPhone 17 Pro",
+     "platform": "ios"
+    },
+    "owner": {
+     "session": "cwd:0000000000000000:default",
+     "workspace": "/Users/dev/work/app",
+     "stateDir": "/Users/dev/work/app",
+     "pid": 11111,
+     "startTime": "Mon Jan  5 10:00:00 2026"
+    }
+   },
+   {
+    "deviceKey": "local:android:none:FAKE0TECNO01",
+    "classification": "live",
+    "device": {
+     "id": "FAKE0TECNO01",
+     "kind": "device",
+     "target": "mobile",
+     "name": "TECNO LH7n",
+     "platform": "android"
+    },
+    "owner": {
+     "session": "p3b-envtest",
+     "workspace": "/private/tmp",
+     "stateDir": "/Users/dev/work/app",
+     "pid": 22222,
+     "startTime": "Mon Jan  5 11:00:00 2026"
+    }
+   }
+  ],
+  "hiddenStaleClaims": 0
+ }
+}

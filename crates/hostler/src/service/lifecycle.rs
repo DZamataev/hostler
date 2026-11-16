@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::contract::claims::ClaimSummary;
 use crate::contract::heavy::HeavyEntry;
 use crate::contract::{CONTRACT_VERSION, ErrorCode, HostlerError};
 
@@ -65,16 +66,35 @@ pub fn hello_required(service_contract: u32) -> HostlerError {
     }
 }
 
-/// `service.shutdown { if_idle: true }` while heavy entries run.
-pub fn busy(running: &[HeavyEntry]) -> HostlerError {
+/// `service.shutdown { if_idle: true }` while heavy entries or leases (linked ones included)
+/// run, or a takeover is in progress (T6-7: its taker would lose its commit after stopping the
+/// holder); holds and reservations never block a stop.
+pub fn busy(
+    running: &[HeavyEntry],
+    leases: &[ClaimSummary],
+    plans: &[serde_json::Value],
+) -> HostlerError {
+    let mut parts = Vec::new();
+    if !running.is_empty() {
+        parts.push(format!("{} heavy task(s) are running", running.len()));
+    }
+    if !leases.is_empty() {
+        parts.push(format!(
+            "{} run(s) holding claims are running",
+            leases.len()
+        ));
+    }
+    if !plans.is_empty() {
+        parts.push(format!("{} takeover(s) are in progress", plans.len()));
+    }
+    let what = parts.join(" and ");
     HostlerError {
         code: ErrorCode::ServiceBusy,
         message: format!(
-            "{} heavy task(s) are running; stopping the service now would not stop them, but \
-             their slots would be unguarded until it restarts",
-            running.len()
+            "{what}; stopping the service now would not stop them, but their slots and claims \
+             would be unguarded until it restarts"
         ),
-        details: json!({ "running": running }),
+        details: json!({ "running": running, "leases": leases, "plans": plans }),
         recovery: Some("hostler service stop --force".into()),
     }
 }

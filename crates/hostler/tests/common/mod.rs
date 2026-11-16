@@ -1,5 +1,7 @@
 //! Shared helpers of the secrets integration tests (plan P2). Every `Home` has its own
-//! `HOSTLER_HOME` and stops its service on drop.
+//! `HOSTLER_HOME` and stops its service on drop. L58: its commands also set
+//! `HOSTLER_TEST_OWNER_PID` (debug builds only), so a service a test started stops itself once
+//! this test process is gone, even when a killed run never reaches `Drop`.
 #![allow(dead_code)]
 
 use std::io::Write;
@@ -8,6 +10,7 @@ use std::process::{Command, Output, Stdio};
 
 use hostler::client::Client;
 use hostler::contract::HostlerError;
+use hostler::contract::claims::{ClaimsSnapshot, WorkspaceInfo, WorkspaceResolve};
 use hostler::contract::secrets::{Materialize, MaterializedSecret};
 use hostler::contract::wire::Request;
 use hostler::paths::Paths;
@@ -53,6 +56,8 @@ impl Home {
                 self.home.join("no-looky-ledger.json"),
             )
             .env("HOSTLER_TEST_FAST_KDF", "1")
+            // L58: the service stops when this test process is gone, not only on `Drop`.
+            .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
             .stdin(Stdio::null());
         c
     }
@@ -152,6 +157,33 @@ impl Home {
         // Never print the value, even when the command failed.
         assert!(out.status.success(), "secret set {name} failed");
         out
+    }
+
+    /// `workspace.resolve` for the checkout at `repo`, as the CLI sends it.
+    pub fn workspace(&self, repo: &Path) -> Result<WorkspaceInfo, HostlerError> {
+        let current = hostler::project::current(repo)?;
+        let request = Request::WorkspaceResolve(WorkspaceResolve {
+            root: hostler::project::display_path(&current.checkout.workspace_root),
+            project: current.project,
+        });
+        let info = self.call(request)?;
+        Ok(serde_json::from_value(info).expect("a WorkspaceInfo"))
+    }
+
+    /// `hostler hold ARGS…` in `repo`.
+    pub fn hold(&self, repo: &Path, args: &[&str]) -> Output {
+        self.hostler()
+            .arg("hold")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap()
+    }
+
+    /// `claims.snapshot`.
+    pub fn snapshot(&self) -> ClaimsSnapshot {
+        let snapshot = self.call(Request::ClaimsSnapshot).expect("claims.snapshot");
+        serde_json::from_value(snapshot).expect("a ClaimsSnapshot")
     }
 
     /// A directory that counts as a git checkout: `.git/HEAD`.

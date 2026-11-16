@@ -211,6 +211,7 @@ impl Store {
         Ok(ids)
     }
 
+    /// A retried materialize of the same run (after a reconnect) replaces its row (T9-2).
     pub fn record_materialization(
         &self,
         run_id: &str,
@@ -222,7 +223,7 @@ impl Store {
     ) -> anyhow::Result<()> {
         let names = serde_json::to_string(names).context("cannot encode the names")?;
         self.conn.execute(
-            "INSERT INTO secret_materializations (run_id, project_id, names_json, workspace, \
+            "INSERT OR REPLACE INTO secret_materializations (run_id, project_id, names_json, workspace, \
              command, at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![run_id, project_id, names, workspace, command, now_ms],
         )?;
@@ -357,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v2_keeping_heavy_rows() {
+    fn v1_database_migrates_keeping_heavy_rows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hostler.db");
         {
@@ -379,7 +380,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         let history = store.history(&HistoryQuery::default()).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, "old");

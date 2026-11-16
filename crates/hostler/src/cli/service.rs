@@ -30,29 +30,45 @@ pub enum ServiceCommand {
     /// Start the service unless it runs.
     Start,
     /// Register the service with the OS so it starts at logon, replacing an existing
-    /// registration; refused while heavy tasks run unless --force.
+    /// registration; refused while heavy tasks or claim runs run, or a takeover is in progress,
+    /// unless --force.
     Install {
-        /// Replace even while heavy tasks run (agents: only with the operator's explicit permission).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Replace the registration even while heavy tasks or claim runs run, or a \
+                    takeover is in progress. An agent uses --force only with the operator's \
+                    explicit permission."
+        )]
         force: bool,
     },
-    /// Remove the OS registration and stop the service; refused while heavy tasks run unless
-    /// --force.
+    /// Remove the OS registration and stop the service; refused while heavy tasks or claim runs
+    /// run, or a takeover is in progress, unless --force.
     Uninstall {
-        /// Remove even while heavy tasks run (agents: only with the operator's explicit permission).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Remove the registration even while heavy tasks or claim runs run, or a \
+                    takeover is in progress. An agent uses --force only with the operator's \
+                    explicit permission."
+        )]
         force: bool,
     },
-    /// Stop the service; refused while heavy tasks run unless --force.
+    /// Stop the service; refused while heavy tasks or claim runs run, or a takeover is in
+    /// progress, unless --force.
     Stop {
-        /// Stop even while heavy tasks run (agents: only with the operator's explicit permission).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Stop even while heavy tasks or claim runs run, or a takeover is in progress. \
+                    An agent uses --force only with the operator's explicit permission."
+        )]
         force: bool,
     },
     /// Stop, then start the service.
     Restart {
-        /// Restart even while heavy tasks run (agents: only with the operator's explicit permission).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Restart even while heavy tasks or claim runs run, or a takeover is in \
+                    progress. An agent uses --force only with the operator's explicit permission."
+        )]
         force: bool,
     },
     /// Show whether the service runs, its versions and the heavy-queue counts.
@@ -315,20 +331,63 @@ async fn uninstall(paths: &Paths, force: bool) -> ExitCode {
 }
 
 fn print_busy(e: &HostlerError, verb: &str) {
-    eprintln!("[hostler] Not running `hostler service {verb}`: heavy tasks are running.");
+    for line in busy_lines(e, verb) {
+        eprintln!("{line}");
+    }
+}
+
+/// The refusal lines of `service stop|restart|install|uninstall`: what runs now, then the way
+/// through. Every field is another agent's text, so it is sanitized before it reaches a terminal.
+fn busy_lines(e: &HostlerError, verb: &str) -> Vec<String> {
     let running: Vec<HeavyEntry> =
         serde_json::from_value(e.details["running"].clone()).unwrap_or_default();
-    for entry in &running {
-        eprintln!(
-            "[hostler]   {} — {} ({}, PID {})",
-            entry.id, entry.command, entry.cwd, entry.holder.pid
-        );
+    let leases: Vec<crate::contract::claims::ClaimSummary> =
+        serde_json::from_value(e.details["leases"].clone()).unwrap_or_default();
+    let plans = e.details["plans"].as_array().cloned().unwrap_or_default();
+    let mut lines = vec![format!(
+        "[hostler] Not running `hostler service {verb}`: {}",
+        crate::secrets::sanitize_for_terminal(&e.message)
+    )];
+    if running.is_empty() && leases.is_empty() && plans.is_empty() {
+        // Busy for another reason (T5-R2: the claims engine does not answer): its own words.
+        lines.push(format!(
+            "[hostler] To do it anyway: hostler service {verb} --force. {}",
+            crate::contract::claims::FORCE_SENTENCE
+        ));
+        return lines;
     }
-    eprintln!(
-        "[hostler] To do it anyway: hostler service {verb} --force (agents: only with the \
-         operator's explicit permission). The tasks keep running; their slots are kept in the \
-         queue and checked again when the service restarts."
-    );
+    for entry in &running {
+        lines.push(format!(
+            "[hostler]   {} — {} ({}, PID {})",
+            crate::secrets::sanitize_for_terminal(&entry.id),
+            crate::secrets::sanitize_for_terminal(&entry.command),
+            crate::secrets::sanitize_for_terminal(&entry.cwd),
+            entry.holder.pid
+        ));
+    }
+    for lease in &leases {
+        lines.push(format!(
+            "[hostler]   {} — {} ({}, PID {})",
+            crate::secrets::sanitize_for_terminal(&lease.resource),
+            crate::secrets::sanitize_for_terminal(lease.command.as_deref().unwrap_or("")),
+            crate::secrets::sanitize_for_terminal(&lease.workspace_path),
+            lease.pid.map_or_else(|| "?".into(), |pid| pid.to_string())
+        ));
+    }
+    for plan in &plans {
+        lines.push(format!(
+            "[hostler]   a takeover of {} by {}",
+            crate::secrets::sanitize_for_terminal(plan["resource"].as_str().unwrap_or("?")),
+            crate::secrets::sanitize_for_terminal(plan["by_workspace"].as_str().unwrap_or("?"))
+        ));
+    }
+    lines.push(format!(
+        "[hostler] To do it anyway: hostler service {verb} --force. {} What runs now keeps \
+         running: heavy tasks keep their slots in the queue, a lease's claim stays until its \
+         command ends, and a takeover in progress finishes first.",
+        crate::contract::claims::FORCE_SENTENCE
+    ));
+    lines
 }
 
 async fn status(paths: &Paths, json: bool) -> ExitCode {
@@ -336,17 +395,14 @@ async fn status(paths: &Paths, json: bool) -> ExitCode {
         Ok(mut client) => query_status(&mut client).await,
         Err(e) => Err(e),
     };
-    let registration = if paths.custom_home {
-        RegistrationState::Absent
+    let (registration, notes) = if paths.custom_home {
+        (RegistrationState::Absent, Vec::new())
     } else {
         registration_within(REGISTRATION_CHECK).await
     };
     let (envelope, code) = compose_status(result, registration);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&envelope).expect("an envelope always encodes")
-        );
+        println!("{}", status_json(&envelope, &notes));
         return ExitCode::from(code);
     }
     let socket = socket_display(&paths.socket);
@@ -380,21 +436,39 @@ async fn status(paths: &Paths, json: bool) -> ExitCode {
     {
         print_error(e);
     }
+    for text in notes
+        .iter()
+        .filter_map(|n| crate::service::manager::note_text(n))
+    {
+        println!("  {text}");
+    }
     ExitCode::from(code)
+}
+
+/// The status envelope as P1 froze it, plus `registration_notes` beside it when there are any
+/// (P2-13): composed here, so the service's answer is unchanged.
+fn status_json(envelope: &Envelope<ServiceStatus>, notes: &[&'static str]) -> String {
+    let mut value = serde_json::to_value(envelope).expect("an envelope always encodes");
+    if !notes.is_empty()
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert("registration_notes".into(), serde_json::json!(notes));
+    }
+    value.to_string()
 }
 
 /// How long `status` waits for the OS registration to be read (`schtasks` can hang).
 const REGISTRATION_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn registration_within(limit: std::time::Duration) -> RegistrationState {
+async fn registration_within(limit: std::time::Duration) -> (RegistrationState, Vec<&'static str>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     // A plain thread: a hung `schtasks` must not keep the process from exiting.
     std::thread::spawn(move || {
-        let _ = tx.send(OsManager.registration());
+        let _ = tx.send((OsManager.registration(), OsManager.registration_notes()));
     });
     match tokio::time::timeout(limit, rx).await {
-        Ok(Ok(state)) => state,
-        _ => RegistrationState::Unknown,
+        Ok(Ok(answer)) => answer,
+        _ => (RegistrationState::Unknown, Vec::new()),
     }
 }
 
@@ -460,6 +534,32 @@ fn compose_status(
 mod tests {
     use super::*;
 
+    #[test]
+    fn busy_lines_sanitize_another_agents_text_and_name_the_force_rule() {
+        let mut lease = crate::contract::claims::fixtures::summary();
+        lease.resource = "account \u{1b}]0;PWNED\u{7}".into();
+        lease.workspace_path = "/w/\u{1b}[2J".into();
+        lease.command = Some("login \u{1b}]0;X\u{7}".into());
+        let error = HostlerError {
+            code: ErrorCode::ServiceBusy,
+            message: "busy \u{1b}[2J".into(),
+            details: serde_json::json!({
+                "leases": [lease],
+                "plans": [{ "resource": "screen\u{1b}", "by_workspace": "/w/b\u{7}" }],
+            }),
+            recovery: None,
+        };
+        let lines = busy_lines(&error, "stop");
+        let text = lines.join("\n");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{7}'), "{text:?}");
+        assert!(
+            text.contains(crate::contract::claims::FORCE_SENTENCE),
+            "{text}"
+        );
+        assert!(text.contains("a lease's claim stays"), "{text}");
+    }
+
     fn running() -> ServiceStatus {
         ServiceStatus {
             service_version: "0.0.1".into(),
@@ -475,8 +575,34 @@ mod tests {
             code: ErrorCode::ServiceUnavailable,
             message: "not running".into(),
             details: serde_json::json!({ "reason": "not_running" }),
-            recovery: Some("hostler service run".into()),
+            recovery: Some("hostler service start".into()),
         }
+    }
+
+    /// P2-13: a unit without `KillMode=process` is current and serves; `status` keeps its exit
+    /// code and state, prints the note and lists it in `--json` beside the frozen data.
+    #[test]
+    fn old_unit_without_killmode_is_current_with_a_note() {
+        let (env, code) = compose_status(Ok(running()), RegistrationState::Current);
+        assert_eq!(code, 0);
+        let notes = [crate::service::manager::systemd::UNIT_LACKS_KILLMODE];
+        let json: serde_json::Value = serde_json::from_str(&status_json(&env, &notes)).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["registration_notes"],
+            serde_json::json!(["unit_lacks_killmode"])
+        );
+        assert_eq!(json["data"]["pid"], 42);
+        let plain: serde_json::Value = serde_json::from_str(&status_json(&env, &[])).unwrap();
+        assert_eq!(
+            plain,
+            serde_json::to_value(&env).unwrap(),
+            "unchanged without notes"
+        );
+        let text = crate::service::manager::note_text("unit_lacks_killmode").unwrap();
+        assert!(text.starts_with("note: the unit lacks KillMode=process"));
+        assert!(text.contains("run hostler service install"));
+        assert_eq!(crate::service::manager::note_text("other"), None);
     }
 
     #[test]

@@ -4,6 +4,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::secrets::sanitize_for_terminal;
+
 /// How often the waiting status is repeated when nothing changes.
 pub const PRINT_EVERY: Duration = Duration::from_secs(30);
 
@@ -47,9 +49,11 @@ pub fn wait_line(p: &WaitStatus) -> String {
                 let dir = Path::new(&h.cwd)
                     .file_name()
                     .map_or_else(|| h.cwd.clone(), |n| n.to_string_lossy().into_owned());
+                // Another agent's command and directory name are text, not terminal control.
                 format!(
-                    "{} ({dir}, PID {}, {})",
-                    h.command,
+                    "{} ({}, PID {}, {})",
+                    sanitize_for_terminal(&h.command),
+                    sanitize_for_terminal(&dir),
                     h.pid,
                     duration_text(h.held)
                 )
@@ -107,6 +111,17 @@ mod tests {
              (app, PID 4242, 3 min). Waited 42 s of 60 min — this is waiting, not hanging; \
              Ctrl+C withdraws the request."
         );
+    }
+
+    #[test]
+    fn wait_line_sanitizes_another_agents_command_and_directory() {
+        let mut p = status(None);
+        p.running[0].command = "make \u{1b}]0;PWNED\u{7}\u{1b}[2J".into();
+        p.running[0].cwd = "/work/dir\u{1b}]0;X\u{7}".into();
+        let line = wait_line(&p);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{7}'), "{line:?}");
+        assert!(line.contains('\u{FFFD}'), "{line:?}");
     }
 
     #[test]

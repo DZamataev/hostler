@@ -3,6 +3,7 @@
 //! cannot be reached, started or answered in time, the command runs unqueued after one warning.
 //! `--secret` / `--secret-file` (P2 Task 10, `secret_run`) inject values first and mask the
 //! command's output; they fail closed (exit 78) and compose with `--heavy`.
+//! `--screen` / `--account` (P3a Task 8, `resource_run`) take claims first; they fail closed too.
 //!
 //! Debug-only test hooks read here: `HOSTLER_TEST_KILL_BEFORE_GATE=1` (die at once after spawning
 //! the gate launcher, before registering; a secret-file run has recorded the command),
@@ -50,9 +51,9 @@ use crate::secrets::rundir::RunDir;
 use crate::service::manager::OsManager;
 
 /// Timed out, refused by `--no-wait`, or withdrawn before it ran (rn-looky's convention).
-const EXIT_QUEUE: i32 = 75;
+pub(crate) const EXIT_QUEUE: i32 = 75;
 const EXIT_INTERRUPTED: i32 = 130;
-const EXIT_CANNOT_RUN: i32 = 127;
+pub(crate) const EXIT_CANNOT_RUN: i32 = 127;
 const EXIT_USAGE: i32 = 2;
 const DEFAULT_MAX_WAIT_MIN: f64 = 60.0;
 const MAX_WAIT_ENV: &str = "HOSTLER_HEAVY_MAX_WAIT";
@@ -67,7 +68,18 @@ const WITHDRAW_BUDGET: Duration = Duration::from_secs(2);
     clap::ArgGroup::new("resource")
         .required(true)
         .multiple(true)
-        .args(["heavy", "secret", "secret_file"])
+        .args(["heavy", "secret", "secret_file", "screen", "account", "device"])
+))]
+#[command(group(
+    clap::ArgGroup::new("claim")
+        .multiple(true)
+        .args(["screen", "account", "device"])
+))]
+// L39: something to wait for.
+#[command(group(
+    clap::ArgGroup::new("waits")
+        .multiple(true)
+        .args(["heavy", "screen", "account", "device"])
 ))]
 pub struct RunArgs {
     /// Wait for a slot in the machine-wide heavy queue first; KIND defaults to `other`.
@@ -79,26 +91,55 @@ pub struct RunArgs {
         default_missing_value = "other",
         value_parser = parse_kind
     )]
-    heavy: Option<String>,
-    /// Minutes to wait for a slot (fractions allowed; 0 = no limit). Default:
-    /// $HOSTLER_HEAVY_MAX_WAIT, else 60.
-    #[arg(long, value_name = "MIN", value_parser = parse_minutes, requires = "heavy")]
-    max_wait: Option<f64>,
-    /// Exit 75 at once instead of waiting when no slot is free.
-    #[arg(long, requires = "heavy")]
-    no_wait: bool,
+    pub(crate) heavy: Option<String>,
+    /// Hold the screen (this machine's desktop session) while the command runs.
+    #[arg(long)]
+    pub(crate) screen: bool,
+    /// Hold this project's test account NAME while the command runs; its fields are in
+    /// HOSTLER_ACCOUNT_<FIELD> and masked in the command's output.
+    #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+    pub(crate) account: Option<String>,
+    /// Lease a device while the command runs: an alias or id, or `auto`, `auto:<platform>`,
+    /// `auto:<platform>:<kind>`. The command gets ANDROID_SERIAL (Android) and HOSTLER_DEVICE_*.
+    #[arg(long, value_name = "DEVICE")]
+    pub(crate) device: Option<String>,
+    /// Boot the --device emulator or simulator if it is not running (headless); hostler shuts
+    /// it down 2 minutes after its last claim ends.
+    #[arg(long, requires = "device")]
+    pub(crate) boot: bool,
+    // An explicit help: clap would drop the D9 sentence's final period from a doc comment.
+    #[arg(
+        long,
+        requires = "confirmation",
+        requires = "claim",
+        help = "Take the resource named by --confirmation over from another workspace, stopping \
+                every process that uses it. An agent uses --force only with the operator's \
+                explicit permission."
+    )]
+    pub(crate) force: bool,
+    /// The resource to take over, typed to confirm: `screen`, the account's name, or the
+    /// device's alias.
+    #[arg(long, value_name = "TOKEN", requires = "force")]
+    pub(crate) confirmation: Option<String>,
+    /// Minutes to wait in all, for every claim and the slot (fractions allowed; 0 = no limit).
+    /// Default: 5 with --screen, --account or --device, else $HOSTLER_HEAVY_MAX_WAIT, else 60.
+    #[arg(long, value_name = "MIN", value_parser = parse_minutes, requires = "waits")]
+    pub(crate) max_wait: Option<f64>,
+    /// Exit 75 at once instead of waiting when a resource or the slot is busy.
+    #[arg(long, requires = "waits")]
+    pub(crate) no_wait: bool,
     /// Put the project's secret NAME into the environment variable ENV (default: its `env` in
     /// hostler.toml, else NAME). The command's stdout and stderr are masked. Repeatable.
     // Hyphen values too: whatever follows reaches the non-echoing check (T10-1).
     #[arg(long, value_name = "NAME[=ENV]", allow_hyphen_values = true)]
-    secret: Vec<String>,
+    pub(crate) secret: Vec<String>,
     /// Write the project's secret NAME to a private file, removed after the command, and put
     /// the file's path into ENV (default as for --secret). Repeatable.
     #[arg(long, value_name = "NAME[=ENV]", allow_hyphen_values = true)]
-    secret_file: Vec<String>,
+    pub(crate) secret_file: Vec<String>,
     /// One argument is a shell line (`sh -c` / `cmd /C`); several are a program and its arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
-    command: Vec<OsString>,
+    pub(crate) command: Vec<OsString>,
 }
 
 fn parse_kind(s: &str) -> Result<String, String> {
@@ -119,8 +160,12 @@ fn parse_minutes(s: &str) -> Result<f64, String> {
     }
 }
 
-/// `None` = no limit.
-fn max_wait(cli: Option<f64>) -> Result<Option<Duration>, String> {
+/// `None` = no limit. A run with a claim waits 5 minutes by default (D7), a heavy-only run
+/// $HOSTLER_HEAVY_MAX_WAIT, else 60.
+fn max_wait(cli: Option<f64>, claims: bool) -> Result<Option<Duration>, String> {
+    if claims {
+        return Ok(super::claim_wait::max_wait(cli));
+    }
     let minutes = match cli {
         Some(m) => m,
         None => match std::env::var(MAX_WAIT_ENV) {
@@ -135,7 +180,23 @@ fn max_wait(cli: Option<f64>) -> Result<Option<Duration>, String> {
         .flatten())
 }
 
-fn command_argv(mut command: Vec<OsString>) -> Vec<OsString> {
+/// The command as people read it.
+pub(crate) fn display_of(command: &[OsString]) -> String {
+    let display = command
+        .iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Inside a secret run the command line may hold inherited values this run cannot mask:
+    // only a placeholder leaves the process (heavy queue, history, materialization; CR-1).
+    if secret_run::inside_secret_run() {
+        secret_run::INSIDE_SECRET_RUN.to_owned()
+    } else {
+        display
+    }
+}
+
+pub(crate) fn command_argv(mut command: Vec<OsString>) -> Vec<OsString> {
     if command.len() != 1 {
         return command;
     }
@@ -150,7 +211,7 @@ fn command_argv(mut command: Vec<OsString>) -> Vec<OsString> {
 const CUT: &str = "…";
 
 /// Keeps the head within `max` JSON bytes (the service's measure); a cut is marked with `…`.
-fn keep_head(s: &str, max: usize) -> String {
+pub(crate) fn keep_head(s: &str, max: usize) -> String {
     if json_len(s) <= max {
         return s.to_owned();
     }
@@ -175,10 +236,11 @@ fn keep_tail(s: &str, max: usize) -> String {
 }
 
 pub fn main(args: RunArgs) -> i32 {
-    if !args.secret.is_empty() || !args.secret_file.is_empty() {
+    if !args.secret.is_empty() || !args.secret_file.is_empty() || args.account.is_some() {
         crate::service::harden::harden_value_holder();
     }
-    let max_wait = match max_wait(args.max_wait) {
+    let claims = args.screen || args.account.is_some() || args.device.is_some();
+    let max_wait = match max_wait(args.max_wait, claims) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("[hostler] {e}");
@@ -195,7 +257,11 @@ pub fn main(args: RunArgs) -> i32 {
             return 1;
         }
     };
-    let code = runtime.block_on(run(args, max_wait));
+    let code = if claims {
+        runtime.block_on(super::resource_run::main(args, max_wait))
+    } else {
+        runtime.block_on(run(args, max_wait))
+    };
     runtime.shutdown_background();
     code
 }
@@ -208,20 +274,8 @@ fn signals_now(
 }
 
 async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
-    let display = args
-        .command
-        .iter()
-        .map(|a| a.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let display = display_of(&args.command);
     let argv = command_argv(args.command);
-    // Inside a secret run the command line may hold inherited values this run cannot mask:
-    // only a placeholder leaves the process (heavy queue, history, materialization; CR-1).
-    let display = if secret_run::inside_secret_run() {
-        secret_run::INSIDE_SECRET_RUN.to_owned()
-    } else {
-        display
-    };
     // Before any request names this process as the holder (and so a non-elevated service can
     // judge a secret run's liveness when it sweeps `runs/`, W-3).
     spawn::let_service_observe_self();
@@ -242,20 +296,41 @@ async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
     // Owned by the spawn path that runs the command (removed once its output is drained), else
     // dropped when `run` returns: the secret files are removed on every path.
     let Some(kind) = args.heavy else {
-        return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
+        return run_unqueued(
+            argv,
+            signals_now(&mut early),
+            &io,
+            files,
+            unregistered_group(),
+        )
+        .await;
     };
     let mut heavy = match Heavy::prepare(id, kind, &display, args.no_wait) {
         Ok(heavy) => heavy,
         Err(e) => {
             warn_unavailable(&format!("{e:#}"));
-            return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
+            return run_unqueued(
+                argv,
+                signals_now(&mut early),
+                &io,
+                files,
+                unregistered_group(),
+            )
+            .await;
         }
     };
     match Client::connect_or_start(&heavy.paths, &OsManager).await {
         Ok(client) => heavy.client = Some(client),
         Err(e) => {
             warn_fail_open(&e);
-            return run_unqueued(argv, signals_now(&mut early), &io, files, Group::Own).await;
+            return run_unqueued(
+                argv,
+                signals_now(&mut early),
+                &io,
+                files,
+                unregistered_group(),
+            )
+            .await;
         }
     }
     let mut outcome = heavy
@@ -297,9 +372,14 @@ async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
             eprintln!("[hostler] {}", e.message);
             EXIT_QUEUE
         }
+        // L33: not a service fault — nothing may start under a run being taken over.
+        Err(e) if e.code == ErrorCode::TakenOver => {
+            eprintln!("{TAKEN_OVER}");
+            EXIT_REFUSED
+        }
         Err(e) => {
             warn_fail_open(&e);
-            run_unqueued(argv, signals(), &io, files, Group::Own).await
+            run_unqueued(argv, signals(), &io, files, unregistered_group()).await
         }
         Ok(AcquireOutcome::Granted { .. }) => {
             if let Some(stop) = &stop {
@@ -336,14 +416,18 @@ async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
     }
 }
 
-fn warn_unavailable(reason: &str) {
+pub(crate) fn warn_unavailable(reason: &str) {
     eprintln!(
         "[hostler] Warning: the hostler service is unavailable ({reason}); running without the \
          heavy queue."
     );
 }
 
-fn warn_fail_open(e: &HostlerError) {
+/// L33: what a run refused under a takeover prints (exit 78).
+pub(crate) const TAKEN_OVER: &str =
+    "[hostler] The run this command comes from is being taken over; not running.";
+
+pub(crate) fn warn_fail_open(e: &HostlerError) {
     if e.code == ErrorCode::ContractMismatch {
         eprintln!(
             "[hostler] Warning: {}; running without the heavy queue.",
@@ -358,7 +442,7 @@ fn warn_fail_open(e: &HostlerError) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stopped {
+pub(crate) enum Stopped {
     Interrupted,
     TimedOut,
 }
@@ -367,7 +451,7 @@ enum Stopped {
 /// One listener for the whole wait: a SIGINT between two waits is never lost. A secret run's
 /// listener is its early `Signals` (all four signals, registered before materialization), so
 /// an interrupt that came before the wait is seen too; `take_signals` hands them on.
-struct Stop {
+pub(crate) struct Stop {
     since: Instant,
     max_wait: Option<Duration>,
     interrupt: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
@@ -392,7 +476,19 @@ impl Stop {
         }
     }
 
-    fn take_signals(&mut self) -> Option<std::io::Result<spawn::Signals>> {
+    /// `new`, measured from `since` (a claim run's one deadline, D7).
+    pub(crate) fn since(
+        since: Instant,
+        max_wait: Option<Duration>,
+        signals: Option<std::io::Result<spawn::Signals>>,
+    ) -> Stop {
+        Stop {
+            since,
+            ..Stop::new(max_wait, signals)
+        }
+    }
+
+    pub(crate) fn take_signals(&mut self) -> Option<std::io::Result<spawn::Signals>> {
         self.signals.take()
     }
 
@@ -424,7 +520,7 @@ impl Stop {
     }
 
     /// A stop that has already happened; never waits.
-    async fn now(&mut self) -> Option<Stopped> {
+    pub(crate) async fn now(&mut self) -> Option<Stopped> {
         tokio::select! {
             biased;
             result = &mut self.interrupt, if self.can_interrupt => {
@@ -452,7 +548,11 @@ async fn early_signal(signals: &mut Option<std::io::Result<spawn::Signals>>) {
 }
 
 /// Withdraws the request (briefly: if the service is gone the entry is reaped after we exit).
-async fn give_up(heavy: &mut Heavy, stopped: Stopped, max_wait: Option<Duration>) -> i32 {
+pub(crate) async fn give_up(
+    heavy: &mut Heavy,
+    stopped: Stopped,
+    max_wait: Option<Duration>,
+) -> i32 {
     let (timed_out, code) = match stopped {
         Stopped::TimedOut => {
             let limit = max_wait.map_or_else(String::new, wait::duration_text);
@@ -503,10 +603,10 @@ async fn recover(
 }
 
 /// One heavy request and the connection it is made over.
-struct Heavy {
-    paths: Paths,
-    client: Option<Client>,
-    req: HeavyAcquire,
+pub(crate) struct Heavy {
+    pub(crate) paths: Paths,
+    pub(crate) client: Option<Client>,
+    pub(crate) req: HeavyAcquire,
 }
 
 impl Outcomes for Heavy {
@@ -526,7 +626,12 @@ impl Outcomes for Heavy {
 }
 
 impl Heavy {
-    fn prepare(id: String, kind: String, display: &str, no_wait: bool) -> anyhow::Result<Heavy> {
+    pub(crate) fn prepare(
+        id: String,
+        kind: String,
+        display: &str,
+        no_wait: bool,
+    ) -> anyhow::Result<Heavy> {
         let paths = Paths::resolve()?;
         let holder = current_identity(&spawn::process_table()?)?;
         let cwd = std::env::current_dir()?;
@@ -547,7 +652,7 @@ impl Heavy {
     }
 
     /// `call_until` with a fresh 10 s budget.
-    async fn call(&mut self, request: Request) -> Result<Value, HostlerError> {
+    pub(crate) async fn call(&mut self, request: Request) -> Result<Value, HostlerError> {
         self.call_until(request, TokioInstant::now() + RETRY_BUDGET)
             .await
     }
@@ -580,14 +685,17 @@ impl Heavy {
                     code: ErrorCode::ServiceUnavailable,
                     message: "the hostler service did not answer in time".into(),
                     details: json!({ "reason": "timeout" }),
-                    recovery: Some("hostler service run".into()),
+                    recovery: Some("hostler service start".into()),
                 }));
             }
             tokio::time::sleep(RETRY_PAUSE).await;
         }
     }
 
-    async fn outcome(&mut self, request: Request) -> Result<AcquireOutcome, HostlerError> {
+    pub(crate) async fn outcome(
+        &mut self,
+        request: Request,
+    ) -> Result<AcquireOutcome, HostlerError> {
         self.outcome_until(request, TokioInstant::now() + RETRY_BUDGET)
             .await
     }
@@ -616,7 +724,7 @@ impl Heavy {
     }
 
     /// Best effort: after 10 s the service reaps the entry once we are gone.
-    async fn release(&mut self, exit_code: i32) {
+    pub(crate) async fn release(&mut self, exit_code: i32) {
         let outcome = if exit_code == 0 {
             HeavyOutcome::Ok
         } else {
@@ -700,7 +808,7 @@ async fn next_event(client: &mut Option<Client>) -> Option<Event> {
 
 /// Waits until our entry leaves the waiting list or the connection drops, then answers its state
 /// (`Continue`). Every await, recovery included, races `stop` (`Break`).
-async fn wait_for_slot(
+pub(crate) async fn wait_for_slot(
     heavy: &mut Heavy,
     stop: &mut Stop,
     position: u32,
@@ -760,7 +868,9 @@ async fn wait_for_slot(
     }
 }
 
-async fn wait_blocking(wait: impl FnOnce() -> anyhow::Result<ExitStatus> + Send + 'static) -> i32 {
+pub(crate) async fn wait_blocking(
+    wait: impl FnOnce() -> anyhow::Result<ExitStatus> + Send + 'static,
+) -> i32 {
     match tokio::task::spawn_blocking(wait).await {
         Ok(Ok(status)) => spawn::exit_code(status),
         Ok(Err(e)) => {
@@ -782,20 +892,12 @@ async fn run_granted(
     files: Option<RunDir>,
 ) -> i32 {
     let program = io.mask(&spawn::program(&argv));
-    #[cfg(debug_assertions)]
-    if let Some(path) = std::env::var_os("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL") {
-        let path = std::path::PathBuf::from(path);
-        let mut reached = path.clone().into_os_string();
-        reached.push(".reached");
-        let _ = std::fs::write(reached, "");
-        let until = Instant::now() + Duration::from_secs(30);
-        while !path.exists() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
+    pause_before_spawn();
     let spawned = signals
         .context("cannot install signal forwarding")
-        .and_then(|signals| spawn::spawn_in_group(argv, &heavy.req.id, signals, io));
+        .and_then(|signals| {
+            spawn::spawn_in_group(argv, &heavy.req.id, Some(&heavy.req.id), signals, io)
+        });
     let mut spawned = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
@@ -833,6 +935,14 @@ async fn run_granted(
             eprintln!("[hostler] The request was withdrawn by an operator; not running.");
             return EXIT_QUEUE;
         }
+        // L33: the run this comes from is being taken over: the gate never opens, and the slot
+        // is given back at once.
+        Err(e) if e.code == ErrorCode::TakenOver => {
+            let _ = wait_blocking(move || spawned.abandon()).await;
+            eprintln!("{TAKEN_OVER}");
+            heavy.release(EXIT_REFUSED).await;
+            return EXIT_REFUSED;
+        }
         // Undelivered, the entry is reaped once we are gone and the group goes unseen:
         // accepted. Any other refusal is a defect of ours, not a reason to block the work.
         _ => {}
@@ -854,10 +964,37 @@ async fn run_granted(
     code
 }
 
+/// `HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL=<path>` (debug builds): after the last stop check,
+/// before a granted command is spawned, create `<path>.reached`, then block until `<path>`
+/// exists (≤ 30 s).
+pub(crate) fn pause_before_spawn() {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("HOSTLER_TEST_PAUSE_BEFORE_SPAWN_UNTIL") {
+        let path = std::path::PathBuf::from(path);
+        let mut reached = path.clone().into_os_string();
+        reached.push(".reached");
+        let _ = std::fs::write(reached, "");
+        let until = Instant::now() + Duration::from_secs(30);
+        while !path.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Where a run that registers nothing (no heavy slot, no claim) runs (L43): nested in a claim or
+/// heavy run (its tokens inherited), in that run's group, so a takeover of it stops this command
+/// too; elsewhere in a group of its own.
+fn unregistered_group() -> Group {
+    let nested = [super::resource_run::CLAIM_TOKENS_ENV, TOKEN_ENV]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()));
+    if nested { Group::Enclosing } else { Group::Own }
+}
+
 /// Fail-open, a secret run without `--heavy`, or (`Group::Enclosing`) a re-entrant secret run:
 /// the command behind its gate, nothing registered; a process identity is needed only to record
 /// a secret-file run's command, which happens before the gate opens.
-async fn run_unqueued(
+pub(crate) async fn run_unqueued(
     argv: Vec<OsString>,
     signals: std::io::Result<spawn::Signals>,
     io: &ChildIo,
@@ -933,7 +1070,7 @@ fn record_pid(files: &RunDir, pid: u32) -> anyhow::Result<()> {
 
 /// Debug builds: this process dies at once (SIGKILL / TerminateProcess) when `hook` is `1`.
 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-fn kill_self_if(hook: &str) {
+pub(crate) fn kill_self_if(hook: &str) {
     #[cfg(debug_assertions)]
     if std::env::var(hook).as_deref() == Ok("1") {
         // SAFETY: plain process calls with no memory preconditions; this process ends here.
@@ -1100,8 +1237,13 @@ mod tests {
         assert_eq!(parse_minutes("0.05"), Ok(0.05));
         assert!(parse_minutes("-1").is_err());
         assert!(parse_minutes("NaN").is_err());
-        assert_eq!(max_wait(Some(0.0)), Ok(None));
-        assert_eq!(max_wait(Some(2.0)), Ok(Some(Duration::from_secs(120))));
+        assert_eq!(max_wait(Some(0.0), false), Ok(None));
+        assert_eq!(
+            max_wait(Some(2.0), false),
+            Ok(Some(Duration::from_secs(120)))
+        );
+        // A claim run waits 5 minutes unless told otherwise, whatever the heavy default.
+        assert_eq!(max_wait(None, true), Ok(Some(Duration::from_secs(300))));
     }
 
     #[test]

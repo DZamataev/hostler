@@ -171,6 +171,8 @@ mod changes {
                 )
                 .env_remove("HOSTLER_TEST_CONTRACT_VERSION")
                 .env_remove("HOSTLER_TEST_EXIT_AFTER_COMMIT")
+                // L58: a service this command starts stops when this test process is gone.
+                .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -623,6 +625,9 @@ mod changes {
         use hostler::client::Client;
 
         let home = Home::new();
+        // L58: a service this process started itself must watch this test process.
+        #[cfg(debug_assertions)]
+        hostler::client::set_test_owner_pid(std::process::id());
         let manager = Arc::new(Slow {
             appears_late: false,
             slow_check: false,

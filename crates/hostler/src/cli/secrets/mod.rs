@@ -187,8 +187,33 @@ pub(crate) fn current_project() -> Result<ProjectRef, HostlerError> {
     project_at(&cwd()?)
 }
 
+/// The checkout's project, after `workspace.resolve`: a moved repository's project follows on
+/// the first P2 command too (L15). Secrets do not depend on workspaces, so a failure there is a
+/// warning.
 pub(crate) fn project_at(path: &Path) -> Result<ProjectRef, HostlerError> {
-    crate::project::current(path).map(|current| current.project)
+    current_at(path).map(|current| current.project)
+}
+
+/// `project::current`, after `workspace.resolve` (as `project_at`).
+pub(crate) fn current_at(path: &Path) -> Result<crate::project::Current, HostlerError> {
+    let current = crate::project::current(path)?;
+    let resolve = Request::WorkspaceResolve(crate::contract::claims::WorkspaceResolve {
+        project: current.project.clone(),
+        root: crate::project::display_path(&current.checkout.workspace_root),
+    });
+    // Its own thread: some callers (`secret request`) already run inside an async runtime.
+    let resolved = std::thread::scope(|scope| {
+        scope
+            .spawn(|| call::<crate::contract::claims::WorkspaceInfo>(resolve))
+            .join()
+    });
+    if let Ok(Err(e)) = resolved {
+        eprintln!(
+            "[hostler] warning: this checkout's workspace was not recorded: {}",
+            crate::secrets::sanitize_for_terminal(&e.message)
+        );
+    }
+    Ok(current)
 }
 
 /// A target given by name (unique in `project list`) or by a path inside its checkout.

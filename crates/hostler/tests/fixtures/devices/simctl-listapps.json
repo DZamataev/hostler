@@ -1,0 +1,32 @@
+{
+ "com.apple.Bridge": {
+  "CFBundleIdentifier": "com.apple.Bridge",
+  "Path": "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/Applications/Bridge.app",
+  "ApplicationType": "System",
+  "CFBundleVersion": "1.0"
+ },
+ "com.example.sim1": {
+  "CFBundleIdentifier": "com.example.sim1",
+  "ApplicationType": "User",
+  "CFBundleVersion": "2395694",
+  "Path": "/Users/dev/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000A/data/Containers/Bundle/Application/00000000-0000-4000-8000-00000000000A/Example1.app"
+ },
+ "com.example.sim2": {
+  "CFBundleIdentifier": "com.example.sim2",
+  "ApplicationType": "User",
+  "CFBundleVersion": "1",
+  "Path": "/Users/dev/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000A/data/Containers/Bundle/Application/00000000-0000-4000-8000-00000000000A/AgentDeviceRunnerUITests-Runner.app"
+ },
+ "com.example.sim3": {
+  "CFBundleIdentifier": "com.example.sim3",
+  "ApplicationType": "User",
+  "CFBundleVersion": "1",
+  "Path": "/Users/dev/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000A/data/Containers/Bundle/Application/00000000-0000-4000-8000-00000000000A/Example3UITests-Runner.app"
+ },
+ "com.example.sim4": {
+  "CFBundleIdentifier": "com.example.sim4",
+  "ApplicationType": "User",
+  "CFBundleVersion": "2415643",
+  "Path": "/Users/dev/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000A/data/Containers/Bundle/Application/00000000-0000-4000-8000-00000000000A/Example2.app"
+ }
+}

@@ -309,15 +309,6 @@ pub mod errors {
         )
     }
 
-    /// Answered by every secrets method until the engine exists (Task 6 removes it).
-    pub fn not_available_yet() -> HostlerError {
-        error(
-            ErrorCode::Internal,
-            "secrets are not available in this build yet".into(),
-            None,
-        )
-    }
-
     pub fn service_stopping() -> HostlerError {
         let mut e = error(
             ErrorCode::ServiceUnavailable,
@@ -464,10 +455,6 @@ mod tests {
         let e = errors::unlock_failed();
         assert_eq!(e.code, ErrorCode::UnlockFailed);
         assert_eq!(e.message, "wrong master password or key file");
-
-        let e = errors::not_available_yet();
-        assert_eq!(e.code, ErrorCode::Internal);
-        assert_eq!(e.message, "secrets are not available in this build yet");
 
         let e = errors::service_stopping();
         assert_eq!(e.code, ErrorCode::ServiceUnavailable);

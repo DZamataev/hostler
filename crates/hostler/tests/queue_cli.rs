@@ -38,6 +38,8 @@ impl Home {
             )
             .env_remove("HOSTLER_TEST_CONTRACT_VERSION")
             .env_remove("HOSTLER_TEST_EXIT_AFTER_COMMIT")
+            // L58: a service this command starts stops when this test process is gone.
+            .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
             .args(args)
             .stdin(Stdio::null())
             .output()

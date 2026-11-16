@@ -7,6 +7,8 @@
 //! Methods that need an unlocked vault check the cached flag first and answer `SecretsLocked`
 //! at once. A poisoned vault mutex counts as locked, a poisoned store mutex as `Internal`.
 
+mod accounts;
+
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -166,18 +168,25 @@ impl std::io::Write for Bounded<'_> {
     }
 }
 
-/// `values` as JSON in a zeroizing buffer of at most `MAX_ANSWER_BYTES`, never reallocated.
-fn encode_answer(values: &[MaterializedSecret]) -> Result<Zeroizing<Vec<u8>>, HostlerError> {
-    // Escaping makes at most 6 bytes of one; names need none.
-    let worst: usize = values
+/// The largest JSON encoding of `values`: escaping makes at most 6 bytes of one; names need none.
+fn answer_bound(values: &[MaterializedSecret]) -> usize {
+    values
         .iter()
         .map(|v| v.value.len() * 6 + v.name.len() + 32)
         .sum::<usize>()
-        + 16;
+        + 16
+}
+
+/// `answer` as JSON in a zeroizing buffer of at most `MAX_ANSWER_BYTES`, never reallocated;
+/// `worst` bounds its encoding.
+fn encode_answer(
+    answer: &(impl Serialize + ?Sized),
+    worst: usize,
+) -> Result<Zeroizing<Vec<u8>>, HostlerError> {
     let mut encoded = Zeroizing::new(Vec::with_capacity(worst.min(MAX_ANSWER_BYTES)));
     let mut writer = Bounded::new(&mut encoded);
     writer.limit = writer.limit.min(MAX_ANSWER_BYTES);
-    serde_json::to_writer(writer, values)
+    serde_json::to_writer(writer, answer)
         .map_err(|_| bad_request("the requested secrets are too large for one run"))?;
     Ok(encoded)
 }
@@ -246,7 +255,7 @@ impl SecretsEngine {
         }
     }
 
-    /// Every `secrets.*`, `project.*` and `secret.*` method.
+    /// Every `secrets.*`, `project.*`, `secret.*` and `account.*` method.
     pub fn handles(req: &Request) -> bool {
         matches!(
             req,
@@ -267,6 +276,11 @@ impl SecretsEngine {
                 | Request::SecretShare(_)
                 | Request::SecretUnshare(_)
                 | Request::SecretMaterialize(_)
+                | Request::AccountList { .. }
+                | Request::AccountSet(_)
+                | Request::AccountRemove(_)
+                | Request::AccountCheck { .. }
+                | Request::AccountMaterialize(_)
         )
     }
 
@@ -295,6 +309,13 @@ impl SecretsEngine {
             Request::SecretShare(s) => value_of(self.share(&s)),
             Request::SecretUnshare(s) => value_of(self.unshare(&s)),
             Request::SecretMaterialize(m) => self.materialize(m).map(Reply::Sensitive),
+            Request::AccountList { project } => value_of(self.account_list(&project)),
+            Request::AccountSet(a) => value_of(self.account_set(a)),
+            Request::AccountRemove(r) => value_of(self.account_remove(&r)),
+            Request::AccountCheck { project, name } => {
+                value_of(self.account_check(&project, &name))
+            }
+            Request::AccountMaterialize(m) => self.account_materialize(m).map(Reply::Sensitive),
             _ => Err(bad_request("not a secrets method")),
         }
     }
@@ -516,8 +537,17 @@ impl SecretsEngine {
                     super::sanitize_for_terminal(&p.common_dir)
                 ))
             })?;
+        // L21: the directory's identity guards the project against a reused path.
+        let identity = crate::workspace::dir_identity(&dir);
         self.store()?
-            .upsert_project(&display_path(&dir), &p.name, self.now())
+            .resolve_project(
+                &display_path(&dir),
+                &p.name,
+                identity.as_deref(),
+                &|d| crate::workspace::dir_identity(Path::new(d)),
+                self.now(),
+            )
+            .map(|(project, _)| project)
             .map_err(store_error)
     }
 
@@ -665,9 +695,40 @@ impl SecretsEngine {
         })
     }
 
-    /// One vault write for all entries; every precondition is checked inside the write's
-    /// closure, on the database as it is on disk (it may run twice). The group id, the answered
-    /// requests and their events are recorded only after the write.
+    /// One vault write into `project`'s group, created when it is missing. `change` runs on the
+    /// database as it is on disk, once per attempt (it may run twice); every precondition belongs
+    /// in it. The group used is recorded after the write — after a NotDurable one too, since `K`
+    /// may hold the change. The caller holds `publish` (T6-1).
+    fn write_group<T>(
+        &self,
+        project: &ProjectInfo,
+        change: impl Fn(&mut Database, GroupId) -> Result<T, HostlerError>,
+    ) -> Result<T, HostlerError> {
+        let before = group_of(project);
+        let used: Mutex<Option<GroupId>> = Mutex::new(None);
+        let result = self.with_vault(|v| {
+            v.write(|db: &mut Database| {
+                let group = layout::ensure_group(db, before, &project.name);
+                let out = change(db, group)?;
+                if let Ok(mut used) = used.lock() {
+                    *used = Some(group);
+                }
+                Ok(out)
+            })
+        });
+        if matches!(&result, Ok(_) | Err(VaultError::NotDurable))
+            && let Some(group) = used.lock().ok().and_then(|g| *g)
+            && Some(group) != before
+        {
+            self.store()?
+                .set_project_group(&project.id, Some(&group.uuid().to_string()))
+                .map_err(store_error)?;
+        }
+        result.map_err(|e| e.to_hostler())
+    }
+
+    /// One vault write for all entries; every precondition is checked inside the write. The
+    /// answered requests and their events are recorded only after it.
     fn store_values(
         &self,
         project: &ProjectInfo,
@@ -676,48 +737,24 @@ impl SecretsEngine {
     ) -> Result<Vec<String>, HostlerError> {
         let _publishing = self.publishing();
         let project = &self.current(project)?;
-        let before = group_of(project);
-        let used: Mutex<Option<GroupId>> = Mutex::new(None);
-        let result = self.with_vault(|v| {
-            v.write(|db: &mut Database| {
-                let mut existing = Vec::new();
-                for (name, _) in entries {
-                    match before.map(|g| layout::lookup(db, g, name)) {
-                        Some(Lookup::Duplicate) => return Err(duplicate_entries(name)),
-                        Some(Lookup::Value(_)) if !overwrite => existing.push(name.clone()),
-                        _ => {}
-                    }
+        self.write_group(project, |db, group| {
+            let mut existing = Vec::new();
+            for (name, _) in entries {
+                match layout::lookup(db, group, name) {
+                    Lookup::Duplicate => return Err(duplicate_entries(name)),
+                    Lookup::Value(_) if !overwrite => existing.push(name.clone()),
+                    _ => {}
                 }
-                if !existing.is_empty() {
-                    return Err(errors::secret_exists(&existing));
-                }
-                let group = layout::ensure_group(db, before, &project.name);
-                for (name, value) in entries {
-                    layout::put(db, group, name, value);
-                }
-                if let Ok(mut used) = used.lock() {
-                    *used = Some(group);
-                }
-                Ok(group)
-            })
-        });
-        // NotDurable: `K` may hold the change, so the group it used is recorded too.
-        let group = match &result {
-            Ok(group) => Some(*group),
-            Err(VaultError::NotDurable) => used.lock().ok().and_then(|g| *g),
-            Err(e) => return Err(e.to_hostler()),
-        };
+            }
+            if !existing.is_empty() {
+                return Err(errors::secret_exists(&existing));
+            }
+            for (name, value) in entries {
+                layout::put(db, group, name, value);
+            }
+            Ok(())
+        })?;
         let store = self.store()?;
-        if let Some(group) = group
-            && Some(group) != before
-        {
-            store
-                .set_project_group(&project.id, Some(&group.uuid().to_string()))
-                .map_err(store_error)?;
-        }
-        if let Err(e) = result {
-            return Err(e.to_hostler());
-        }
         let now = self.now();
         let mut answered = Vec::new();
         let mut changed = Vec::new();
@@ -1210,7 +1247,7 @@ impl SecretsEngine {
             return Err(e);
         }
 
-        let mut encoded = encode_answer(&values)?;
+        let mut encoded = encode_answer(&values, answer_bound(&values))?;
         let mask = MaskSet::new(values.iter().map(|v| v.value.expose().as_bytes().to_vec()));
         let masked = mask.mask_all(m.command.expose().as_bytes());
         let recorded = keep_head(&String::from_utf8_lossy(&masked), HISTORY_COMMAND_BYTES);
@@ -1254,14 +1291,14 @@ mod tests {
         }
     }
 
-    struct World {
-        engine: Arc<SecretsEngine>,
-        dir: tempfile::TempDir,
+    pub(super) struct World {
+        pub(super) engine: Arc<SecretsEngine>,
+        pub(super) dir: tempfile::TempDir,
         table: Arc<FakeTable>,
         events: broadcast::Receiver<Event>,
     }
 
-    fn world() -> World {
+    pub(super) fn world() -> World {
         world_with(|_, _| {})
     }
 
@@ -1295,18 +1332,21 @@ mod tests {
     }
 
     impl World {
-        fn call(&self, req: Request) -> Result<Value, HostlerError> {
+        pub(super) fn call(&self, req: Request) -> Result<Value, HostlerError> {
             match self.engine.dispatch(req)? {
                 Reply::Value(v) => Ok(v),
                 Reply::Sensitive(_) => panic!("unexpected sensitive reply"),
             }
         }
 
-        fn call_as<T: serde::de::DeserializeOwned>(&self, req: Request) -> Result<T, HostlerError> {
+        pub(super) fn call_as<T: serde::de::DeserializeOwned>(
+            &self,
+            req: Request,
+        ) -> Result<T, HostlerError> {
             self.call(req).map(|v| serde_json::from_value(v).unwrap())
         }
 
-        fn repo(&self, name: &str) -> ProjectRef {
+        pub(super) fn repo(&self, name: &str) -> ProjectRef {
             let git = self.dir.path().join("repos").join(name).join(".git");
             std::fs::create_dir_all(&git).unwrap();
             std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -1316,7 +1356,7 @@ mod tests {
             }
         }
 
-        fn unlock_new(&self) {
+        pub(super) fn unlock_new(&self) {
             self.call(Request::SecretsUnlock(Unlock {
                 password: SecretValue::new(PASSWORD.into()),
                 key_file: None,
@@ -1326,13 +1366,13 @@ mod tests {
             .unwrap();
         }
 
-        fn approved_repo(&self, name: &str) -> ProjectRef {
+        pub(super) fn approved_repo(&self, name: &str) -> ProjectRef {
             let p = self.repo(name);
             self.call(Request::ProjectApprove(p.clone())).unwrap();
             p
         }
 
-        fn project(&self, p: &ProjectRef) -> ProjectInfo {
+        pub(super) fn project(&self, p: &ProjectRef) -> ProjectInfo {
             self.call_as(Request::ProjectResolve(p.clone())).unwrap()
         }
 
@@ -1439,7 +1479,7 @@ mod tests {
         }
 
         /// The recorded materializations: `(names_json, workspace, command)`.
-        fn history(&self) -> Vec<(String, String, String)> {
+        pub(super) fn history(&self) -> Vec<(String, String, String)> {
             let conn = rusqlite::Connection::open(self.dir.path().join("hostler.db")).unwrap();
             let mut stmt = conn
                 .prepare("SELECT names_json, workspace, command FROM secret_materializations")
@@ -1468,7 +1508,7 @@ mod tests {
     }
 
     /// A second vault on the same file saves an outside change, the way KeePassXC would.
-    fn outside_write(kdbx: &Path, f: impl Fn(&mut Database)) {
+    pub(super) fn outside_write(kdbx: &Path, f: impl Fn(&mut Database)) {
         let mut outside = Vault::new(kdbx.to_path_buf());
         outside.unlock(key()).unwrap();
         outside
@@ -2340,9 +2380,9 @@ mod tests {
                 value: SecretValue::new("\"".repeat(super::super::MAX_VALUE_BYTES)),
             })
             .collect();
-        let e = encode_answer(&big).unwrap_err();
+        let e = encode_answer(&big, answer_bound(&big)).unwrap_err();
         assert_eq!(e.message, "the requested secrets are too large for one run");
-        let small = encode_answer(&big[..1]).unwrap();
+        let small = encode_answer(&big[..1], answer_bound(&big[..1])).unwrap();
         assert!(small.len() > super::super::MAX_VALUE_BYTES);
     }
 

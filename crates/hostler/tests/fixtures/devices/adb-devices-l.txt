@@ -1,0 +1,9 @@
+List of devices attached
+FAKE0TECNO01       device usb:0-1.2.2 product:LH7n-RU model:TECNO_LH7n device:TECNO-LH7n transport_id:10
+fake0xia               device usb:0-1.2.4 product:vermeer_ru model:23113RKC6G device:vermeer transport_id:7
+FAKE0HUAWEI0001       device usb:0-2.1 product:ELE-L29EEA model:ELE_L29 device:HWELE transport_id:2
+FAKE0SAMS01            device usb:0-2.3.1 product:psqxxx model:SM_S937B device:psq transport_id:11
+10.0.0.7:5555    device product:psqxxx model:SM_S937B device:psq transport_id:12
+emulator-5554          device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emu64a transport_id:14
+FAKE0OFFLINE   unauthorized usb:0-3 transport_id:15
+

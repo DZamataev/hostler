@@ -48,7 +48,11 @@ enum QueueCommand {
     Release {
         #[arg(long)]
         id: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Free the slot while its command may still run; the process is not stopped. \
+                    An agent uses --force only with the operator's explicit permission."
+        )]
         force: bool,
     },
     /// The number of heavy tasks that may run at once.
@@ -167,9 +171,15 @@ fn entry_line(e: &HeavyEntry, now_ms: i64, prefix: &str) -> String {
         EntrySource::Hostler => String::new(),
         EntrySource::RnLookyLedger => " [rn-looky ledger]".into(),
     };
+    // Another agent's command, kind, directory and (an rn-looky ledger's) id are text, not
+    // terminal control (FR-5).
     format!(
         "  {prefix}{}  {}  PID {}  {time}  {}  ({}){source}",
-        e.id, e.kind, e.holder.pid, e.command, e.cwd
+        crate::secrets::sanitize_for_terminal(&e.id),
+        crate::secrets::sanitize_for_terminal(&e.kind),
+        e.holder.pid,
+        crate::secrets::sanitize_for_terminal(&e.command),
+        crate::secrets::sanitize_for_terminal(&e.cwd)
     )
 }
 
@@ -202,25 +212,30 @@ fn print_history(items: &Vec<HeavyHistoryItem>) {
     }
     let now_ms = SystemClock.now_ms();
     for i in items {
-        let outcome = serde_json::to_value(i.outcome)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let exit = i.exit_code.map_or_else(|| "-".into(), |c| c.to_string());
-        println!(
-            "{} ago  {outcome:<9}  exit {exit:<3}  {}  {}  ({})  {}",
-            since(now_ms, i.finished_at_ms),
-            i.kind,
-            i.command,
-            i.cwd,
-            i.id
-        );
+        println!("{}", history_line(i, now_ms));
     }
+}
+
+fn history_line(i: &HeavyHistoryItem, now_ms: i64) -> String {
+    let outcome = serde_json::to_value(i.outcome)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let exit = i.exit_code.map_or_else(|| "-".into(), |c| c.to_string());
+    format!(
+        "{} ago  {outcome:<9}  exit {exit:<3}  {}  {}  ({})  {}",
+        since(now_ms, i.finished_at_ms),
+        crate::secrets::sanitize_for_terminal(&i.kind),
+        crate::secrets::sanitize_for_terminal(&i.command),
+        crate::secrets::sanitize_for_terminal(&i.cwd),
+        crate::secrets::sanitize_for_terminal(&i.id)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::heavy::{HeavyOutcome, HeavyState};
 
     #[test]
     fn since_accepts_units_and_rejects_the_rest() {
@@ -231,5 +246,54 @@ mod tests {
         for bad in ["", "d", "1w", "-1h", "1.5h", "h1"] {
             assert!(parse_since(bad).is_err(), "{bad}");
         }
+    }
+
+    fn holder() -> crate::procs::ProcessIdentity {
+        crate::procs::ProcessIdentity {
+            pid: 42,
+            boot_id: "b1".into(),
+            start_time: 1,
+        }
+    }
+
+    #[test]
+    fn queue_lines_sanitize_another_agents_command_and_cwd() {
+        // FR-5: an rn-looky ledger's id is another agent's text too.
+        let entry = HeavyEntry {
+            id: "looky:x\u{1b}]0;PWNED\u{7}\u{1b}[2J".into(),
+            ticket: 1,
+            kind: "other".into(),
+            command: "make \u{1b}]0;PWNED\u{7}".into(),
+            cwd: "/work/d\u{1b}[2J".into(),
+            workspace_root: None,
+            holder: holder(),
+            child: None,
+            group: None,
+            state: HeavyState::Running,
+            enqueued_at_ms: 0,
+            granted_at_ms: Some(0),
+            source: EntrySource::Hostler,
+        };
+        let line = entry_line(&entry, 1_000, "");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{7}'), "{line:?}");
+        assert!(line.contains('\u{FFFD}'), "{line:?}");
+
+        let item = HeavyHistoryItem {
+            id: entry.id.clone(),
+            ticket: entry.ticket,
+            kind: entry.kind.clone(),
+            command: entry.command.clone(),
+            cwd: entry.cwd.clone(),
+            workspace_root: None,
+            enqueued_at_ms: 0,
+            granted_at_ms: Some(0),
+            finished_at_ms: 1_000,
+            exit_code: Some(0),
+            outcome: HeavyOutcome::Ok,
+        };
+        let line = history_line(&item, 2_000);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{7}'), "{line:?}");
     }
 }

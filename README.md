@@ -4,8 +4,9 @@ The resource coordinator for parallel AI agents. Several agents work on one mach
 compete for things it has only one of — CPU during a native build, a test phone, the screen, a
 test account. hostler hands those resources out in turn instead of letting the agents race.
 
-**Status: pre-release.** The first slices are the machine-wide heavy queue and per-project secrets.
-Devices, screen control and the desktop app follow.
+**Status: pre-release.** The machine-wide heavy queue, per-project secrets, claims on the screen,
+test accounts and devices (P3b-1: Android everywhere, iOS on macOS) are implemented. The desktop
+app follows.
 
 ## Install from source
 
@@ -41,8 +42,8 @@ hostler queue capacity set 2          # 1–16, default 1
 hostler guide heavy                   # the full agent guide
 ```
 
-`hostler queue release --id <id> --force` frees a slot while its command may still run. Agents use
-`--force` only with the operator's explicit permission.
+`hostler queue release --id <id> --force` frees a slot while its command may still run. An agent
+uses --force only with the operator's explicit permission.
 
 ## Secrets
 
@@ -92,6 +93,73 @@ replaces a file it has not checked.
 
 > hostler protects against accidental exposure and against agents that follow this guide: values never appear in any hostler output, log, error, event, history row, Debug print or panic message, and no command prints a value. It does not protect against a malicious process of your own OS user: such a process can talk to the socket, run `hostler run --secret X -- sh -c 'echo $X | base64'`, or read hostler's memory.
 
+## Claims: the screen, test accounts and devices
+
+The screen (this machine's desktop session), each project's test accounts and the registered
+devices are exclusive, one workspace at a time. A claim is either a **lease** — `hostler run
+--screen` / `--account` / `--device` holds the resource for one command and releases it when the
+command ends — or a **hold**:
+
+```sh
+hostler hold screen                     # TTL 30 minutes: --ttl MIN, --while-parent, --while-pid PID
+hostler hold account qa-user
+hostler hold device pixel-9             # --boot for a shut-down AVD or simulator (headless)
+hostler hold renew <id>
+hostler release <id>
+hostler run --screen -- ./drive-the-gui
+hostler run --heavy --account qa-user -- ./integration
+hostler run --device auto:android -- ./gradlew connectedAndroidTest
+hostler account set qa-user --field session   # a person; the value at a hidden prompt or on stdin
+```
+
+Further runs and holds of the same workspace join its claim (accounts, devices, and the screen
+under a hold); another workspace waits, with a line naming the holder, its command and your
+position. `--max-wait` bounds the whole run (default 5 minutes when a claim is asked for);
+`--no-wait` exits **75**; both need `--heavy` or a claim flag (otherwise exit **2**); Ctrl+C
+withdraws. A run that took a resource ends with one summary line per resource.
+Seizing a live holder is `--force --confirmation <screen|name|device-alias>`, which stops every
+process using the resource first. An agent uses --force only with the operator's explicit permission.
+
+Account fields arrive as `HOSTLER_ACCOUNT_NAME` and `HOSTLER_ACCOUNT_<FIELD>` and are masked like
+secrets. There is no `account request` yet: a person sets accounts up. Claims belong to a workspace
+(one checkout) and survive restarts and `git worktree move`. `hostler status` shows the heavy
+queue, every resource and the secrets database; `hostler guide holds`, `hostler guide screen`,
+`hostler guide accounts` and `hostler guide devices` are the full agent guides.
+
+## Devices
+
+Phones, emulators and simulators are resources too. A person registers a physical phone; agents may
+add, rename and remove AVDs and simulators:
+
+```sh
+hostler devices tools --detect        # once, from the person's own shell
+hostler devices list                  # registered and new physical devices; --all for more
+hostler devices add SERIAL0001        # a person types the model
+hostler devices add Pixel_9           # an AVD or simulator: an agent may
+hostler run --device pixel-9 -- ./gradlew connectedAndroidTest
+hostler hold device pixel-9           # keep it across commands
+hostler hold device auto:ios:simulator --boot
+hostler devices forget-sessions pixel-9   # a person, while agent-device cannot be read
+```
+
+`--device` takes an alias or id, or `auto`, `auto:<platform>`, `auto:<platform>:<kind>`; `auto`
+takes this workspace's live claim or reservation, then the first free compatible device. A named
+device that is not connected is waited for, never substituted. `--boot` boots an existing AVD or
+simulator headless; hostler shuts it down 2 minutes after its last claim and session unless a hold
+keeps it. The command gets `HOSTLER_DEVICE_ID`, `HOSTLER_DEVICE_ALIAS`, `HOSTLER_DEVICE_PLATFORM`,
+`HOSTLER_LEASE_ID`, `ANDROID_SERIAL` (Android) or `HOSTLER_DEVICE_UDID` (iOS), and
+`HOSTLER_AGENT_DEVICE_ID`.
+
+An agent-device session counts as your workspace's use and never blocks it; it blocks every other
+workspace until `agent-device close`. Inside a run, pass `--serial "$ANDROID_SERIAL"` or `--udid
+"$HOSTLER_DEVICE_UDID"`. A run that ends with its session open prints the exact close command. A
+hostler takeover closes the holder's sessions; the device alias is the `--confirmation` token, and
+`--force` with `auto` exits 2. An agent uses --force only with the operator's explicit permission.
+
+`hostler guide devices` covers onboarding, telemetry, installs, the two agent-device shapes, the
+freshness gate after a claim ends, and the person-only `devices forget-sessions` escape when
+agent-device cannot be read. `hostler status` shows the registered devices and a count of new ones.
+
 ## Service
 
 ```sh
@@ -100,8 +168,11 @@ hostler service start | stop | restart
 hostler service install | uninstall   # register with launchd / systemd / Task Scheduler
 ```
 
-`stop`, `restart`, `install` and `uninstall` refuse while heavy tasks run unless `--force`. After
-upgrading the binary, run `hostler service restart` so the service matches the CLI's contract.
+`stop`, `restart`, `install` and `uninstall` refuse while heavy tasks or claim runs run, or a
+takeover is in progress, unless `--force`. An agent uses --force only with the operator's explicit
+permission. After upgrading the binary, run `hostler service restart` so the service matches the
+CLI's contract. A service hostler starts itself gets a clean environment (never a run's injected
+values), and `HOSTLER_HOME` must be an absolute path (a relative one is refused).
 
 All read commands accept `--json` and print the contract's `Envelope`.
 

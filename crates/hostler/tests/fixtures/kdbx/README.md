@@ -13,3 +13,13 @@ Recreate:
   printf 'fixture-pass-1\n' | keepassxc-cli mkdir -q kxc-3.1-aes.kdbx fixture
   printf 'fixture-pass-1\nfixture-token-value\n' | keepassxc-cli add -q -p kxc-3.1-aes.kdbx fixture/TOKEN
   (key file: add `--set-key-file kxc-keyfile.keyx` to db-create and `-k kxc-keyfile.keyx` to mkdir/add)
+
+## account-fields.kdbx (P3a Task 9)
+
+Written 2026-11-07 by keepass 0.17.0, Argon2id 2 it / 1 MiB. Password `pw-acct-1`. Group `proj`:
+- entry `qa-user`, tag `hostler-account`, protected custom fields `session` = `sess-value-1234`,
+  `env` = `stage`
+- entry `API_KEY` (a P2 secret), Password `secret-1234`
+
+Checked with keepassxc-cli 2.7.10: `show -a session` prints the value; plain `show` hides custom
+fields and lists the tag.

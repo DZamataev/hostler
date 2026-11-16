@@ -120,7 +120,11 @@ hostler run --heavy --secret API_KEY -- ./gradlew integrationTest
   command ends, including on Ctrl+C. A later run and the service sweep what a killed wrapper
   leaves behind (once the wrapper and command are dead).
 - Both flags are repeatable and can be combined; two secrets may not set the same environment
-  variable. `--secret` and `--secret-file` compose with `--heavy` (same queue, same exit codes).
+  variable.
+- A secret may not be put into a variable a hostler service started from inside the run would keep:
+  `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TMPDIR`, `LC_*`, `XDG_*`, `RUST_LOG`, the Windows profile
+  and system names, and every `HOSTLER_*` name (any case). Such a name is a usage error (exit 2);
+  give the secret another variable with `NAME=VAR`. `--secret` and `--secret-file` compose with `--heavy` (same queue, same exit codes).
 - Prefer `--secret-file` for tools that log their environment: an environment variable is visible
   in process listings and diagnostics, a path is not the value.
 
@@ -195,7 +199,7 @@ what to do: the `recovery` command where the code has one, otherwise the human s
 | `not_interactive` | A person-only command needs a real terminal and got a pipe or no terminal. | the same command, `hostler <cmd>`, in a terminal |
 | `not_in_project` | The directory is not a usable git checkout: not inside one, its `.git`/`commondir` does not resolve, or its path is not valid UTF-8. | run from the project |
 | `config_invalid` | `hostler.toml` has a problem; the message names the line, never a value. | fix the reported line |
-| `service_unavailable` | The service could not be reached or started. | `hostler service run` (while it is stopping: `hostler service start`) |
+| `service_unavailable` | The service could not be reached or started. | `hostler service start` |
 | `contract_mismatch` | The running service speaks another contract version. | `hostler service restart` |
 | `internal` | An unexpected hostler failure, or an import file over 1 MiB or unreadable (fixed text; the path is not repeated). | report it; do not retry blindly |
 

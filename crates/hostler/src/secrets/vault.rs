@@ -1920,8 +1920,15 @@ mod tests {
                         placed.push(name);
                     }
                     n += 1;
-                    // Paced so that hostler's saves get through too; varied to move the race.
+                    // Bursts of five, varied to move the race, then a quiet spell so that
+                    // hostler's saves get through too: refusing a file that never stops
+                    // changing (`KeepsChanging`) is right, and would make the liveness check
+                    // below mean nothing. A save takes longer on Windows, so it gets more room.
                     std::thread::sleep(Duration::from_micros(500 * (n % 7)));
+                    if n % 5 == 0 {
+                        let quiet = if cfg!(windows) { 100 } else { 25 };
+                        std::thread::sleep(Duration::from_millis(quiet));
+                    }
                 }
                 placed
             })

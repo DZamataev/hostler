@@ -42,6 +42,8 @@ impl Home {
             )
             .env_remove("HOSTLER_TEST_CONTRACT_VERSION")
             .env_remove("HOSTLER_TEST_EXIT_AFTER_COMMIT")
+            // L58: a service this command starts stops when this test process is gone.
+            .env("HOSTLER_TEST_OWNER_PID", std::process::id().to_string())
             .stdin(Stdio::null());
         c
     }
@@ -119,9 +121,17 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// L58 (FR1-1): a service `Client::connect_or_start_with` starts in-process is spawned by the
+/// library, not by a `Command` of ours, so it needs the test owner from the client.
+fn offer_test_owner() {
+    #[cfg(debug_assertions)]
+    hostler::client::set_test_owner_pid(std::process::id());
+}
+
 #[tokio::test]
 async fn first_call_auto_starts_service() {
     let home = Home::new();
+    offer_test_owner();
     let before = home.run(&["service", "status"]);
     assert_eq!(before.status.code(), Some(3));
     assert!(stdout(&before).contains("not running"));
@@ -233,6 +243,7 @@ fn long_home_service_binds() {
 #[tokio::test]
 async fn mismatched_client_gets_contract_mismatch_not_unavailable() {
     let home = Home::new();
+    offer_test_owner();
     let mut service = home.service(&[("HOSTLER_TEST_CONTRACT_VERSION", "999")]);
     let paths = home.paths();
 
@@ -301,6 +312,7 @@ impl ServiceManager for PanicManager {
 #[tokio::test]
 async fn custom_home_never_uses_manager() {
     let home = Home::new();
+    offer_test_owner();
     let paths = home.paths();
     assert!(paths.custom_home);
     let mut client = Client::connect_or_start_with(&paths, &PanicManager, BIN.as_ref())
@@ -325,6 +337,7 @@ impl ServiceManager for FailingManager {
 #[tokio::test]
 async fn installed_manager_failure_never_spawns() {
     let home = Home::new();
+    offer_test_owner();
     // A default-home view of the same directory: the registration applies.
     let paths = Paths::under(home.home.clone(), false);
     paths.ensure_dirs().unwrap();
