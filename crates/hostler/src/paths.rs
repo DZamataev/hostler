@@ -56,11 +56,17 @@ impl Paths {
 
     /// `HOSTLER_HOME` or the OS default, then `ensure_dirs`.
     pub fn resolve() -> anyhow::Result<Paths> {
-        let (home, custom_home) =
-            chosen_home(std::env::var_os("HOSTLER_HOME"), Paths::default_home()?)?;
-        let paths = Paths::under(home, custom_home);
+        let paths = Paths::planned()?;
         paths.ensure_dirs()?;
         Ok(paths)
+    }
+
+    /// The paths `resolve` would give, without creating or checking any directory (to name the
+    /// socket in an error from `ensure_dirs`, plan P4 R1-2).
+    pub fn planned() -> anyhow::Result<Paths> {
+        let (home, custom_home) =
+            chosen_home(std::env::var_os("HOSTLER_HOME"), Paths::default_home()?)?;
+        Ok(Paths::under(home, custom_home))
     }
 
     /// Pure mapping of a home directory to all state paths.

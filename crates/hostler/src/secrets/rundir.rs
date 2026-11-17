@@ -160,19 +160,57 @@ fn private_file(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-/// Removes run directories whose wrapper and command are both gone; the number removed.
+/// `owner.json` as stored, its boot ids unfilled (review f1-r1): an identity read back from disk
+/// is judged by the boot id it was written with, never completed with the current one.
+#[derive(Deserialize)]
+struct StoredOwner {
+    wrapper: StoredIdentity,
+    child: Option<StoredIdentity>,
+}
+
+#[derive(Deserialize)]
+struct StoredIdentity {
+    pid: u32,
+    #[serde(default)]
+    boot_id: String,
+    start_time: u64,
+}
+
+/// A stored identity's liveness: one stored without a boot id (by a sandboxed client before it
+/// learned the boot) cannot be placed in this boot, so it counts as gone.
+fn stored_gone(id: &StoredIdentity, table: &dyn ProcessTable) -> bool {
+    if id.boot_id.is_empty() {
+        return true;
+    }
+    let id = ProcessIdentity {
+        pid: id.pid,
+        boot_id: id.boot_id.clone(),
+        start_time: id.start_time,
+    };
+    matches!(liveness(&id, table), Liveness::Dead(_))
+}
+
+/// A client's sweep: removes run directories whose wrapper and command are both gone; the
+/// number removed. A client that does not know the boot id (an agent sandbox, before the service
+/// told it) judges no stored identity: it leaves owned directories to a later sweep (review
+/// f1-r1).
 pub fn sweep(runs: &Path) -> usize {
     match SysProcessTable::new() {
-        Ok(table) => sweep_with(runs, &table, SystemTime::now()),
+        Ok(table) => sweep_with(runs, &table, table.boot_id_known(), SystemTime::now()),
         Err(_) => 0,
     }
 }
 
-fn sweep_with(runs: &Path, table: &dyn ProcessTable, now: SystemTime) -> usize {
+/// The service's sweep, with its own process table (its real boot id).
+pub fn sweep_with_table(runs: &Path, table: &dyn ProcessTable) -> usize {
+    sweep_with(runs, table, true, SystemTime::now())
+}
+
+fn sweep_with(runs: &Path, table: &dyn ProcessTable, judge_owners: bool, now: SystemTime) -> usize {
     let Ok(entries) = fs::read_dir(runs) else {
         return 0;
     };
-    let gone = |id: &ProcessIdentity| matches!(liveness(id, table), Liveness::Dead(_));
+    let gone = |id: &StoredIdentity| stored_gone(id, table);
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -181,8 +219,9 @@ fn sweep_with(runs: &Path, table: &dyn ProcessTable, now: SystemTime) -> usize {
         }
         let owner = fs::read(path.join(OWNER))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Owner>(&bytes).ok());
+            .and_then(|bytes| serde_json::from_slice::<StoredOwner>(&bytes).ok());
         let dead = match owner {
+            Some(_) if !judge_owners => false,
             Some(owner) => gone(&owner.wrapper) && owner.child.as_ref().is_none_or(gone),
             None => entry
                 .metadata()
@@ -371,13 +410,46 @@ mod tests {
         make("both-dead", dead(), Some(dead()));
         make("dead-no-child", dead(), None);
         fs::create_dir(runs.join("unowned")).unwrap();
-        assert_eq!(sweep_with(runs, &table, now), 2);
+        assert_eq!(sweep_with(runs, &table, true, now), 2);
         let left = |name: &str| runs.join(name).exists();
         assert!(left("live-wrapper") && left("live-child") && left("unowned"));
         assert!(!left("both-dead") && !left("dead-no-child"));
         // An owner file that never appeared: removed once the dir is old.
-        assert_eq!(sweep_with(runs, &table, now + UNOWNED_AGE * 2), 1);
+        assert_eq!(sweep_with(runs, &table, true, now + UNOWNED_AGE * 2), 1);
         assert!(!left("unowned"));
         assert_eq!(sweep(&runs.join("missing")), 0);
+    }
+
+    /// Review f1-r1: an `owner.json` stored without a boot id (by a sandboxed client of the first
+    /// F-1 round) is never taken for this boot, even when its pid and start time are a live
+    /// process's now; and a sweep that does not know the boot id judges no stored owner.
+    #[test]
+    fn a_stored_owner_without_a_boot_id_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path();
+        let table = crate::procs::fake::FakeTable::new("boot-b");
+        table.insert(4242, None, Some(777));
+        let reused = ProcessIdentity {
+            pid: 4242,
+            boot_id: String::new(),
+            start_time: 777,
+        };
+        let live = ProcessIdentity {
+            boot_id: "boot-b".into(),
+            ..reused.clone()
+        };
+        for (name, wrapper) in [("empty-boot", reused), ("live", live)] {
+            std::mem::forget(RunDir::create_for(runs, name, wrapper).unwrap());
+        }
+        let stored = fs::read_to_string(runs.join("empty-boot").join(OWNER)).unwrap();
+        assert!(stored.contains("\"boot_id\":\"\""), "{stored}");
+        let now = SystemTime::now();
+        // A client that does not know the boot id removes no owned directory.
+        assert_eq!(sweep_with(runs, &table, false, now), 0);
+        assert!(runs.join("empty-boot").exists() && runs.join("live").exists());
+        // The service (its real boot id) removes the one it cannot place, keeps the live one.
+        assert_eq!(sweep_with_table(runs, &table), 1);
+        assert!(!runs.join("empty-boot").exists());
+        assert!(runs.join("live").exists());
     }
 }

@@ -129,6 +129,120 @@ fn definitions_without_managed_are_outdated() {
     }
 }
 
+// ---- P4 Task 4: ProcessType and the registered binary (pure; every OS) ----
+
+/// The service and the emulators and adb server it starts must not be throttled (P4 call 15).
+#[test]
+fn launchd_plist_has_process_type() {
+    let (_dir, paths) = paths();
+    let plist = manager::launchd::render_definition(Path::new(EXE), &paths);
+    assert!(
+        plist.contains("<key>ProcessType</key>\n  <string>Interactive</string>"),
+        "{plist}"
+    );
+    assert!(manager::launchd::definition_is_current(&plist));
+}
+
+/// A plist from before P4 (no `ProcessType`, or another type) reads `Outdated`, so `service
+/// status` and doctor point at `hostler service install`.
+#[test]
+fn old_plist_is_outdated() {
+    let (_dir, paths) = paths();
+    let plist = manager::launchd::render_definition(Path::new(EXE), &paths);
+    let without = plist.replace(
+        "  <key>ProcessType</key>\n  <string>Interactive</string>\n",
+        "",
+    );
+    assert_ne!(plist, without);
+    assert!(!manager::launchd::definition_is_current(&without));
+    let standard = plist.replace("<string>Interactive</string>", "<string>Standard</string>");
+    assert!(!manager::launchd::definition_is_current(&standard));
+    // Whitespace launchd or an editor may reflow is not a difference.
+    let reflowed = plist.replace(
+        "<key>ProcessType</key>\n  <string>Interactive</string>",
+        "<key>ProcessType</key>\t<string>Interactive</string>",
+    );
+    assert!(manager::launchd::definition_is_current(&reflowed));
+    // `Interactive` elsewhere (a path) is not a ProcessType.
+    let elsewhere = without.replace(
+        "<key>RunAtLoad</key>",
+        "<key>Note</key>\n  <string>Interactive</string>\n  <key>RunAtLoad</key>",
+    );
+    assert!(!manager::launchd::definition_is_current(&elsewhere));
+}
+
+#[test]
+fn launchd_exe_from_plist() {
+    let (_dir, paths) = paths();
+    let odd = "/Users/a & b/<bin>/hostler";
+    let plist = manager::launchd::render_definition(Path::new(odd), &paths);
+    assert_eq!(
+        manager::launchd::exe_from_plist(&plist).as_deref(),
+        Some(Path::new(odd))
+    );
+    assert_eq!(manager::launchd::exe_from_plist("<plist></plist>"), None);
+}
+
+#[test]
+fn systemd_exe_from_unit() {
+    let (_dir, paths) = paths();
+    for exe in [
+        EXE,
+        "/home/alice/build%h/hostler",
+        "/home/alice/my bin/hostler",
+        "/home/alice/a\"b\\c/hostler",
+    ] {
+        let unit = manager::systemd::render_definition(Path::new(exe), &paths);
+        assert_eq!(
+            manager::systemd::exe_from_unit(&unit).as_deref(),
+            Some(Path::new(exe)),
+            "{unit}"
+        );
+    }
+    assert_eq!(manager::systemd::exe_from_unit("[Service]\n"), None);
+    assert_eq!(
+        manager::systemd::exe_from_unit("ExecStart=\"unterminated\n"),
+        None
+    );
+}
+
+/// R1-10: the hostler path is the quoted token after `--headless`, never `<Command>`.
+#[test]
+fn windows_exe_from_arguments() {
+    let program_files = r"C:\Program Files\hostler\hostler.exe";
+    let from = manager::windows::exe_from_arguments;
+    assert_eq!(
+        from(&format!(
+            "--headless \"{program_files}\" service run --managed"
+        ))
+        .as_deref(),
+        Some(Path::new(program_files))
+    );
+    assert_eq!(
+        from(&format!(
+            "--headless &quot;{program_files}&quot; service run --managed"
+        ))
+        .as_deref(),
+        Some(Path::new(program_files))
+    );
+    assert_eq!(
+        from(r"--headless C:\hostler\hostler.exe service run --managed").as_deref(),
+        Some(Path::new(r"C:\hostler\hostler.exe"))
+    );
+    assert_eq!(from("garbage"), None);
+    assert_eq!(from(""), None);
+    assert_eq!(from("--headless \"\" service run --managed"), None);
+    // As rendered: the XML's `<Arguments>` round-trips.
+    let (_dir, paths) = paths();
+    let xml = manager::windows::render_definition(Path::new(program_files), &paths);
+    let arguments = xml
+        .split_once("<Arguments>")
+        .and_then(|(_, rest)| rest.split_once("</Arguments>"))
+        .unwrap()
+        .0;
+    assert_eq!(from(arguments).as_deref(), Some(Path::new(program_files)));
+}
+
 // ---- Registration changes against a real service, with an injected registrar ----
 
 mod changes {
@@ -142,6 +256,7 @@ mod changes {
     use hostler::paths::Paths;
     use hostler::procs::{SysProcessTable, current_identity};
     use hostler::service::ServiceManager;
+    use hostler::service::lifecycle::StopRule;
     use hostler::service::manager::{self, ChangeRefused, Registrar};
     use hostler::store::Store;
     use tempfile::TempDir;
@@ -343,9 +458,13 @@ mod changes {
             })
         };
 
-        let result =
-            manager::install_service(&home.default_paths(), false, BIN.as_ref(), fake.clone())
-                .await;
+        let result = manager::install_service(
+            &home.default_paths(),
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Explicit { force: false },
+        )
+        .await;
         stop.store(true, Ordering::SeqCst);
         let racers = racer.join().unwrap();
 
@@ -375,9 +494,13 @@ mod changes {
         let before = home.status_json();
         let fake = Arc::new(FakeRegistrar::new(home.clone()));
 
-        let result =
-            manager::install_service(&home.default_paths(), false, BIN.as_ref(), fake.clone())
-                .await;
+        let result = manager::install_service(
+            &home.default_paths(),
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Explicit { force: false },
+        )
+        .await;
         assert!(matches!(result, Err(ChangeRefused::Busy(_))), "{result:?}");
         assert!(fake.changes.lock().unwrap().is_empty());
         assert!(fake.started.lock().unwrap().is_empty());
@@ -478,7 +601,10 @@ mod changes {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
             client
-                .call(Request::ServiceShutdown { if_idle: false })
+                .call(Request::ServiceShutdown {
+                    if_idle: false,
+                    refuse_if_unlocked: false,
+                })
                 .await
                 .unwrap();
             assert_eq!(serving.await.unwrap().unwrap(), RunEnd::Stopped);
@@ -493,7 +619,7 @@ mod changes {
     async fn start_switches_to_the_manager_when_a_registration_appears() {
         use std::sync::atomic::AtomicUsize;
 
-        use hostler::client::Client;
+        use hostler::client::{Client, Replace};
 
         struct AppearsAfterFirstCheck {
             home: Arc<Home>,
@@ -520,8 +646,13 @@ mod changes {
             started: Mutex::new(None),
         });
         let asked = Instant::now();
-        let client =
-            Client::connect_or_start_with(&home.default_paths(), &manager, "true".as_ref()).await;
+        let client = Client::connect_or_start_with(
+            &home.default_paths(),
+            &manager,
+            "true".as_ref(),
+            Replace::Never,
+        )
+        .await;
         assert!(client.is_ok(), "{:?}", client.err());
         assert!(
             asked.elapsed() < Duration::from_millis(5500),
@@ -565,14 +696,18 @@ mod changes {
     }
 
     async fn start_with_slow(slow: Slow) {
-        use hostler::client::Client;
+        use hostler::client::{Client, Replace};
 
         let home = Home::new();
         let asked = Instant::now();
         // `true` stands in for a hostler binary whose directly spawned service never serves.
-        let result =
-            Client::connect_or_start_with(&home.default_paths(), &Arc::new(slow), "true".as_ref())
-                .await;
+        let result = Client::connect_or_start_with(
+            &home.default_paths(),
+            &Arc::new(slow),
+            "true".as_ref(),
+            Replace::Never,
+        )
+        .await;
         let elapsed = asked.elapsed();
         let err = match result {
             Ok(_) => panic!("no service can answer"),
@@ -622,7 +757,7 @@ mod changes {
     /// serves: the error says the registration may be outdated and how to refresh it.
     #[tokio::test]
     async fn a_managed_start_without_a_service_points_to_reinstall() {
-        use hostler::client::Client;
+        use hostler::client::{Client, Replace};
 
         let home = Home::new();
         // L58: a service this process started itself must watch this test process.
@@ -634,8 +769,13 @@ mod changes {
             slow_start: false,
             checks: Default::default(),
         });
-        let err = match Client::connect_or_start_with(&home.default_paths(), &manager, BIN.as_ref())
-            .await
+        let err = match Client::connect_or_start_with(
+            &home.default_paths(),
+            &manager,
+            BIN.as_ref(),
+            Replace::Never,
+        )
+        .await
         {
             Ok(_) => panic!("nothing was started"),
             Err(e) => e,
@@ -647,5 +787,290 @@ mod changes {
             !home.running(),
             "a service was spawned despite the registration"
         );
+    }
+
+    // ---- P4 Task 4: every stop is probe → may_stop → the atomic shutdown (R2-2) ----
+
+    /// A `FakeRegistrar` whose installed definition reads `state`.
+    struct WithState {
+        fake: Arc<FakeRegistrar>,
+        state: manager::RegistrationState,
+    }
+
+    impl ServiceManager for WithState {
+        fn is_installed(&self) -> bool {
+            self.fake.is_installed()
+        }
+
+        fn start(&self) -> anyhow::Result<()> {
+            self.fake.start()
+        }
+    }
+
+    impl Registrar for WithState {
+        fn register(&self, exe: &std::path::Path, paths: &Paths) -> anyhow::Result<()> {
+            self.fake.register(exe, paths)
+        }
+
+        fn unregister(&self) -> anyhow::Result<()> {
+            self.fake.unregister()
+        }
+
+        fn registration(&self) -> manager::RegistrationState {
+            self.state
+        }
+    }
+
+    /// A `hostler service run` speaking `contract` (only the service gets the variable).
+    fn service_speaking(home: &Home, contract: &str) -> Child {
+        let child = home
+            .hostler()
+            .env("HOSTLER_TEST_CONTRACT_VERSION", contract)
+            .args(["service", "run"])
+            .spawn()
+            .unwrap();
+        let pid = u64::from(child.id());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while home.status_json()["data"]["pid"].as_u64() != Some(pid) {
+            assert!(Instant::now() < deadline, "the test service never answered");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child
+    }
+
+    /// One heavy entry marked running, held by `holder`.
+    #[cfg_attr(not(unix), allow(dead_code))] // its test is Unix-only
+    fn seed_running_entry_of(home: &Home, holder: hostler::procs::ProcessIdentity) {
+        let store = Store::open(&home.default_paths().db).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let req = HeavyAcquire {
+            id: id.clone(),
+            kind: "gradle".into(),
+            command: "./gradlew assemble".into(),
+            cwd: "/work/app".into(),
+            workspace_root: None,
+            holder,
+            reentrant_token: None,
+            no_wait: false,
+        };
+        store.insert_waiting(&req, 0).unwrap();
+        store.mark_running(&id, 0).unwrap();
+    }
+
+    /// R1-3: a busy older service is kept with the recovery `service install`; once its work
+    /// has ended, that install replaces it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_then_install_replaces() {
+        use hostler::client::{Client, Replace};
+
+        let home = Arc::new(Home::new());
+        let mut work = Command::new("sleep").arg("60").spawn().unwrap();
+        let table = SysProcessTable::new().unwrap();
+        seed_running_entry_of(
+            &home,
+            hostler::procs::identity_of(&table, work.id()).unwrap(),
+        );
+        let mut old = service_speaking(&home, "3");
+        let fake = Arc::new(FakeRegistrar::new(home.clone()));
+        let paths = home.default_paths();
+
+        let err =
+            match Client::connect_or_start_with(&paths, &fake, BIN.as_ref(), Replace::OnMismatch)
+                .await
+            {
+                Ok(_) => panic!("a busy older service was replaced"),
+                Err(e) => e,
+            };
+        assert_eq!(err.code, hostler::contract::ErrorCode::ContractMismatch);
+        let recovery = err.recovery.clone().unwrap();
+        assert!(recovery.contains("hostler service install"), "{recovery}");
+        assert!(fake.started.lock().unwrap().is_empty());
+        assert_eq!(
+            home.status_json()["data"]["pid"].as_u64(),
+            Some(u64::from(old.id()))
+        );
+
+        // The work ends; the service reaps it.
+        work.kill().unwrap();
+        work.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while home.status_json()["data"]["running_heavy"] != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the dead holder was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let installed = manager::install_service(
+            &paths,
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Explicit { force: false },
+        )
+        .await;
+        assert!(
+            matches!(installed, Ok(manager::Installed { stopped: true })),
+            "{installed:?}"
+        );
+        assert_eq!(*fake.changes.lock().unwrap(), ["register"]);
+        assert!(exits_within(&mut old, Duration::from_secs(10)).is_some());
+        let client = Client::connect(&paths).await;
+        assert!(client.is_ok(), "{:?}", client.err());
+        assert_eq!(home.status_json()["data"]["contract_version"], 4);
+    }
+
+    /// R2-2: an automatic install probes first; a newer service is never stopped and nothing
+    /// is registered. A typed install of the same state stops it (today's behaviour).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_probes_before_stopping() {
+        use hostler::service::lifecycle::{AutoPurpose, StopRefusal};
+
+        let home = Arc::new(Home::new());
+        let mut newer = service_speaking(&home, "5");
+        let fake = Arc::new(FakeRegistrar::new(home.clone()));
+        let paths = home.default_paths();
+        for state in [
+            manager::RegistrationState::Outdated,
+            manager::RegistrationState::Absent,
+        ] {
+            let registrar = Arc::new(WithState {
+                fake: fake.clone(),
+                state,
+            });
+            let result = manager::install_service(
+                &paths,
+                BIN.as_ref(),
+                registrar,
+                StopRule::Automatic(AutoPurpose::Maintain),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ChangeRefused::NotStopped {
+                        reason: StopRefusal::NewerService
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        let replace = manager::install_service(
+            &paths,
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Automatic(AutoPurpose::Replace),
+        )
+        .await;
+        assert!(
+            matches!(
+                replace,
+                Err(ChangeRefused::NotStopped {
+                    reason: StopRefusal::NewerService
+                })
+            ),
+            "{replace:?}"
+        );
+        assert!(
+            fake.changes.lock().unwrap().is_empty(),
+            "register was called"
+        );
+        assert!(
+            newer.try_wait().unwrap().is_none(),
+            "the newer service stopped"
+        );
+        assert_eq!(
+            home.status_json()["data"]["pid"].as_u64(),
+            Some(u64::from(newer.id()))
+        );
+
+        let typed = manager::install_service(
+            &paths,
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Explicit { force: false },
+        )
+        .await;
+        assert!(
+            matches!(typed, Ok(manager::Installed { stopped: true })),
+            "{typed:?}"
+        );
+        assert!(exits_within(&mut newer, Duration::from_secs(10)).is_some());
+        assert_eq!(*fake.changes.lock().unwrap(), ["register"]);
+        assert_eq!(home.status_json()["data"]["contract_version"], 4);
+    }
+
+    /// R2-2: the registration-maintenance exception. A same-version, idle, locked service with
+    /// an outdated definition (no `ProcessType`) is stopped atomically, re-registered and
+    /// started again; with a `Current` definition nothing is touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintain_same_outdated_idle_locked_reinstalls() {
+        use hostler::service::lifecycle::{AutoPurpose, StopRefusal};
+
+        let home = Arc::new(Home::new());
+        home.start();
+        let before = home.status_json();
+        assert_eq!(before["data"]["secrets_unlocked"], false);
+        let fake = Arc::new(FakeRegistrar::new(home.clone()));
+        let paths = home.default_paths();
+        let maintain = StopRule::Automatic(AutoPurpose::Maintain);
+
+        for state in [
+            manager::RegistrationState::Current,
+            manager::RegistrationState::Unknown,
+        ] {
+            let registrar = Arc::new(WithState {
+                fake: fake.clone(),
+                state,
+            });
+            let result = manager::install_service(&paths, BIN.as_ref(), registrar, maintain).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ChangeRefused::NotStopped {
+                        reason: StopRefusal::CurrentDefinition
+                    })
+                ),
+                "{state:?}: {result:?}"
+            );
+            assert_eq!(home.status_json()["data"]["pid"], before["data"]["pid"]);
+        }
+        // `Replace` never stops a same-version service (P4-L8, R1-2).
+        let replace = manager::install_service(
+            &paths,
+            BIN.as_ref(),
+            fake.clone(),
+            StopRule::Automatic(AutoPurpose::Replace),
+        )
+        .await;
+        assert!(
+            matches!(
+                replace,
+                Err(ChangeRefused::NotStopped {
+                    reason: StopRefusal::NotNewer
+                })
+            ),
+            "{replace:?}"
+        );
+        assert!(fake.changes.lock().unwrap().is_empty());
+
+        let registrar = Arc::new(WithState {
+            fake: fake.clone(),
+            state: manager::RegistrationState::Outdated,
+        });
+        let installed = manager::install_service(&paths, BIN.as_ref(), registrar, maintain).await;
+        assert!(
+            matches!(installed, Ok(manager::Installed { stopped: true })),
+            "{installed:?}"
+        );
+        assert_eq!(*fake.changes.lock().unwrap(), ["register"]);
+        assert!(
+            !fake.started.lock().unwrap().is_empty(),
+            "never started again"
+        );
+        let after = home.status_json();
+        assert_eq!(after["ok"], true, "{after}");
+        assert_ne!(after["data"]["pid"], before["data"]["pid"]);
     }
 }

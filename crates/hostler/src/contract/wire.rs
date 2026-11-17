@@ -32,8 +32,16 @@ pub enum Request {
     },
     #[serde(rename = "service.status")]
     ServiceStatus,
+    /// `refuse_if_unlocked` (P4, additive): a P4+ service refuses with `ServiceBusy` (details
+    /// `{secrets: "unlocked"}`) while its secrets database is unlocked. Absent (every 0.0.3
+    /// client) reads `false`; `false` is not sent, so the frame stays the 0.0.3 shape, and an
+    /// older service ignores the field.
     #[serde(rename = "service.shutdown")]
-    ServiceShutdown { if_idle: bool },
+    ServiceShutdown {
+        if_idle: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refuse_if_unlocked: bool,
+    },
     #[serde(rename = "heavy.acquire")]
     HeavyAcquire(HeavyAcquire),
     #[serde(rename = "heavy.attach")]
@@ -419,7 +427,10 @@ mod tests {
                 client: "cli".into(),
             },
             Request::ServiceStatus,
-            Request::ServiceShutdown { if_idle: true },
+            Request::ServiceShutdown {
+                if_idle: true,
+                refuse_if_unlocked: false,
+            },
             Request::HeavyAcquire(HeavyAcquire {
                 id: "6f1e6a9a".into(),
                 kind: "gradle".into(),
@@ -522,7 +533,11 @@ mod tests {
         let status = serde_json::to_value(Request::ServiceStatus).unwrap();
         assert_eq!(status, json!({"method": "service.status"}));
 
-        let shutdown = serde_json::to_value(Request::ServiceShutdown { if_idle: true }).unwrap();
+        let shutdown = serde_json::to_value(Request::ServiceShutdown {
+            if_idle: true,
+            refuse_if_unlocked: false,
+        })
+        .unwrap();
         assert_eq!(
             shutdown,
             json!({"method": "service.shutdown", "params": {"if_idle": true}})
@@ -541,7 +556,94 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<Request>(shutdown).unwrap(),
-            Request::ServiceShutdown { if_idle: true }
+            Request::ServiceShutdown {
+                if_idle: true,
+                refuse_if_unlocked: false,
+            }
+        );
+    }
+
+    /// P4's additive lifecycle fields (R1-6): a 0.0.3 `service.status` answer (no
+    /// `secrets_unlocked`) reads `None`, a 0.0.3 `service.shutdown` (no `refuse_if_unlocked`)
+    /// reads `false`, and 0.0.3's shapes still read the P4 frames (no `deny_unknown_fields`).
+    #[test]
+    fn lifecycle_additions_read_both_ways() {
+        let old_status = json!({
+            "service_version": "0.0.3",
+            "contract_version": 4,
+            "pid": 42,
+            "running_heavy": 1,
+            "waiting_heavy": 0,
+        });
+        let status: ServiceStatus = serde_json::from_value(old_status.clone()).unwrap();
+        assert_eq!(status.secrets_unlocked, None);
+        // `None` is not sent: a P4 service that cannot say answers the 0.0.3 shape.
+        assert_eq!(serde_json::to_value(&status).unwrap(), old_status);
+        for unlocked in [false, true] {
+            let status = ServiceStatus {
+                secrets_unlocked: Some(unlocked),
+                ..status.clone()
+            };
+            let value = serde_json::to_value(&status).unwrap();
+            assert_eq!(value["secrets_unlocked"], unlocked);
+            assert_eq!(
+                serde_json::from_value::<ServiceStatus>(value.clone()).unwrap(),
+                status
+            );
+            // 0.0.3's `ServiceStatus` reads a P4 answer.
+            #[derive(Deserialize)]
+            #[allow(dead_code)]
+            struct OldStatus {
+                service_version: String,
+                contract_version: u32,
+                pid: u32,
+                running_heavy: u32,
+                waiting_heavy: u32,
+            }
+            assert!(serde_json::from_value::<OldStatus>(value).is_ok());
+        }
+
+        let old_shutdown = json!({"method": "service.shutdown", "params": {"if_idle": true}});
+        assert_eq!(
+            serde_json::from_value::<Request>(old_shutdown.clone()).unwrap(),
+            Request::ServiceShutdown {
+                if_idle: true,
+                refuse_if_unlocked: false,
+            }
+        );
+        // `false` is not sent: an explicit stop is the 0.0.3 frame, byte for byte.
+        assert_eq!(
+            serde_json::to_value(Request::ServiceShutdown {
+                if_idle: true,
+                refuse_if_unlocked: false,
+            })
+            .unwrap(),
+            old_shutdown
+        );
+        let refusing = Request::ServiceShutdown {
+            if_idle: true,
+            refuse_if_unlocked: true,
+        };
+        let value = serde_json::to_value(&refusing).unwrap();
+        assert_eq!(
+            value,
+            json!({"method": "service.shutdown",
+                   "params": {"if_idle": true, "refuse_if_unlocked": true}})
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(value.clone()).unwrap(),
+            refusing
+        );
+        // 0.0.3's `Request` reads it and ignores the field.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "method", content = "params")]
+        enum OldRequest {
+            #[serde(rename = "service.shutdown")]
+            ServiceShutdown { if_idle: bool },
+        }
+        assert_eq!(
+            serde_json::from_value::<OldRequest>(value).unwrap(),
+            OldRequest::ServiceShutdown { if_idle: true }
         );
     }
 
@@ -590,6 +692,8 @@ mod tests {
             pid: 42,
             running_heavy: 0,
             waiting_heavy: 1,
+            secrets_unlocked: None,
+            boot_id: None,
         };
         assert_eq!(
             serde_json::to_value(status).unwrap()["contract_version"],
@@ -1217,7 +1321,10 @@ mod tests {
     fn frame_debug_counts_the_payload_bytes() {
         let shutdown = ClientFrame {
             id: 1,
-            request: Request::ServiceShutdown { if_idle: true },
+            request: Request::ServiceShutdown {
+                if_idle: true,
+                refuse_if_unlocked: false,
+            },
         };
         assert_eq!(
             format!("{shutdown:?}"),

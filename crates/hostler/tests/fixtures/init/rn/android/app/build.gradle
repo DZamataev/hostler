@@ -1,0 +1,28 @@
+apply plugin: "com.android.application"
+apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+
+android {
+    namespace 'com.looky.app'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.looky.app'
+        minSdkVersion 26
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+        }
+    }
+
+    flavorDimensions "brand"
+    productFlavors {
+        pulse {
+            applicationId 'com.pro.pulse'
+        }
+        staging {
+            applicationId "com.looky.${brand}"
+        }
+    }
+}

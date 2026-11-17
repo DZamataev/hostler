@@ -398,7 +398,8 @@ enum What {
 async fn hold(what: What, options: HoldOptions) -> Result<Held, Failure> {
     let cwd = cwd()?;
     let current = crate::project::current(&cwd).map_err(refusal)?;
-    let table = spawn::process_table().map_err(|e| Failure::from(internal(&format!("{e:#}"))))?;
+    let table =
+        spawn::process_table().map_err(|e| Failure::from(crate::client::process_error(&e)))?;
     // Binding is refused before a service is needed (a bad pid must fail at once).
     let bound = binding(&options, &table)?;
     let paths = paths()?;
@@ -460,7 +461,7 @@ async fn hold(what: What, options: HoldOptions) -> Result<Held, Failure> {
         token.as_deref().unwrap_or("a named device's alias"),
     )?;
     let requester =
-        current_identity(&table).map_err(|e| Failure::from(internal(&format!("{e:#}"))))?;
+        current_identity(&table).map_err(|e| Failure::from(crate::client::process_error(&e)))?;
     let ttl_ms = bound
         .is_none()
         .then(|| (options.ttl.unwrap_or(DEFAULT_TTL_MIN) * 60_000.0).round() as u64);
@@ -606,12 +607,18 @@ async fn release_retrying(
         match client.call(release).await {
             Ok(_) => return true,
             Err(e) if e.code == ErrorCode::ClaimNotHeld => return true,
+            // Never retried (P4 R1-3).
+            Err(e) if crate::client::is_sandbox_denied(&e) => return false,
             Err(e) if e.code == ErrorCode::ServiceUnavailable && Instant::now() < until => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if let Ok(paths) = Paths::resolve()
-                    && let Ok(fresh) = Client::connect(&paths).await
-                {
-                    *client = fresh;
+                match crate::client::resolve_paths() {
+                    Ok(paths) => match Client::connect(&paths).await {
+                        Ok(fresh) => *client = fresh,
+                        Err(e) if crate::client::is_sandbox_denied(&e) => return false,
+                        Err(_) => {}
+                    },
+                    Err(e) if crate::client::is_sandbox_denied(&e) => return false,
+                    Err(_) => {}
                 }
             }
             Err(_) => return false,
@@ -805,13 +812,14 @@ async fn release(id: String, force: bool, confirmation: Option<String>) -> Resul
     let current = crate::project::current(&cwd).map_err(refusal)?;
     let paths = paths()?;
     spawn::let_service_observe_self();
-    let table = spawn::process_table().map_err(|e| Failure::from(internal(&format!("{e:#}"))))?;
+    let table =
+        spawn::process_table().map_err(|e| Failure::from(crate::client::process_error(&e)))?;
     let mut client = connect(&paths).await?;
     let workspace = workspace::resolve(&mut client, &current)
         .await
         .map_err(refusal)?;
     let requester =
-        current_identity(&table).map_err(|e| Failure::from(internal(&format!("{e:#}"))))?;
+        current_identity(&table).map_err(|e| Failure::from(crate::client::process_error(&e)))?;
     let Some(claim) = live_claim(&mut client, &id).await else {
         let outcome: ReleaseOutcome = decode(
             client
@@ -1072,11 +1080,12 @@ fn cwd() -> Result<std::path::PathBuf, Failure> {
 }
 
 fn paths() -> Result<Paths, Failure> {
-    Paths::resolve().map_err(|e| Failure::from(internal(&format!("{e:#}"))))
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    crate::client::resolve_paths().map_err(Failure::from)
 }
 
 async fn connect(paths: &Paths) -> Result<Client, Failure> {
-    Client::connect_or_start(paths, &OsManager)
+    Client::connect_or_start(paths, &OsManager, crate::cli::REPLACE_ON_START)
         .await
         .map_err(refusal)
 }

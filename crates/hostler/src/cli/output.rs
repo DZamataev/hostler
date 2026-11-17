@@ -10,17 +10,13 @@ use serde_json::json;
 use crate::client::Client;
 use crate::contract::wire::Request;
 use crate::contract::{Envelope, ErrorCode, HostlerError};
-use crate::paths::Paths;
 use crate::service::manager::OsManager;
 
 pub(crate) async fn call<T: DeserializeOwned>(request: Request) -> Result<T, HostlerError> {
-    let paths = Paths::resolve().map_err(|e| HostlerError {
-        code: ErrorCode::Internal,
-        message: format!("{e:#}"),
-        details: json!({}),
-        recovery: None,
-    })?;
-    let mut client = Client::connect_or_start(&paths, &OsManager).await?;
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths()?;
+    let mut client =
+        Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START).await?;
     let value = client.call(request).await?;
     serde_json::from_value(value).map_err(|e| HostlerError {
         code: ErrorCode::Internal,

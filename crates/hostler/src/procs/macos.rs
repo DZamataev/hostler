@@ -25,10 +25,9 @@ pub(super) fn boot_id() -> anyhow::Result<String> {
         )
     };
     if rc != 0 || len == 0 {
-        anyhow::bail!(
-            "sysctl kern.bootsessionuuid: {}",
-            std::io::Error::last_os_error()
-        );
+        // The io::Error stays the source: a sandbox's EPERM is told apart (P4 Task 9 F-1).
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context("sysctl kern.bootsessionuuid"));
     }
     let mut buf = vec![0u8; len];
     // SAFETY: `buf` is writable for `len` bytes and `len` tells the kernel that size.
@@ -42,10 +41,9 @@ pub(super) fn boot_id() -> anyhow::Result<String> {
         )
     };
     if rc != 0 {
-        anyhow::bail!(
-            "sysctl kern.bootsessionuuid: {}",
-            std::io::Error::last_os_error()
-        );
+        // The io::Error stays the source: a sandbox's EPERM is told apart (P4 Task 9 F-1).
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context("sysctl kern.bootsessionuuid"));
     }
     buf.truncate(len.min(buf.len()));
     let id = String::from_utf8(buf)?;

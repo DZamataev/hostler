@@ -12,7 +12,10 @@ pub fn main(topic: Option<String>, json: bool) -> ExitCode {
     let Some(topic) = topic else {
         let topics: Vec<TopicSummary> = guide::TOPICS
             .iter()
-            .map(|(name, summary)| TopicSummary { name, summary })
+            .map(|t| TopicSummary {
+                name: t.name,
+                summary: t.summary,
+            })
             .collect();
         if json {
             print_json(Envelope {

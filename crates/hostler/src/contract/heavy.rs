@@ -143,6 +143,14 @@ pub struct ServiceStatus {
     pub pid: u32,
     pub running_heavy: u32,
     pub waiting_heavy: u32,
+    /// P4 (additive): whether the secrets database is unlocked. A P4+ service fills it; a
+    /// 0.0.3 service omits it, which reads `None` ("cannot say", treated as live work).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_unlocked: Option<bool>,
+    /// P4 (additive, Task 9 F-1 r1): the service's boot id, for a client that may not read its
+    /// own (`procs::learn_boot_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 #[cfg(test)]

@@ -136,7 +136,7 @@ fn a_service_stops_at_once_when_its_test_owner_never_existed() {
 #[cfg(debug_assertions)]
 #[test]
 fn an_in_process_start_carries_the_test_owner() {
-    use hostler::client::Client;
+    use hostler::client::{Client, Replace};
     use hostler::contract::wire::Request;
     use hostler::service::NoManager;
 
@@ -149,9 +149,10 @@ fn an_in_process_start_carries_the_test_owner() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let mut client = Client::connect_or_start_with(&paths, &NoManager, common::BIN.as_ref())
-            .await
-            .expect("the client starts the service itself");
+        let mut client =
+            Client::connect_or_start_with(&paths, &NoManager, common::BIN.as_ref(), Replace::Never)
+                .await
+                .expect("the client starts the service itself");
         client
             .call(Request::ServiceStatus)
             .await

@@ -1,0 +1,3 @@
+#!/bin/sh
+# A synthetic Gradle wrapper: detection is by this file's name, and nothing runs it.
+exec java -jar "$(dirname "$0")/gradle/wrapper/gradle-wrapper.jar" "$@"

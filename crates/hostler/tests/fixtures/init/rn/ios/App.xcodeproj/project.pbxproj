@@ -1,0 +1,51 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin XCBuildConfiguration section */
+		AAAAAAAAAAAAAAAAAAAAAAAA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				INFOPLIST_FILE = App/Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = com.looky.app;
+			};
+			name = Debug;
+		};
+		BBBBBBBBBBBBBBBBBBBBBBBB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				INFOPLIST_FILE = App/Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.looky.flavor.$(BRAND)";
+			};
+			name = Release;
+		};
+		CCCCCCCCCCCCCCCCCCCCCCCC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_BUNDLE_IDENTIFIER = com.looky.appTests;
+			};
+			name = Debug;
+		};
+		DDDDDDDDDDDDDDDDDDDDDDDD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_BUNDLE_IDENTIFIER = com.looky.appUITests;
+			};
+			name = Debug;
+		};
+		EEEEEEEEEEEEEEEEEEEEEEEE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_BUNDLE_IDENTIFIER = com.looky.tests;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+	};
+	rootObject = FFFFFFFFFFFFFFFFFFFFFFFF /* Project object */;
+}

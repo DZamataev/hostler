@@ -121,6 +121,23 @@ impl Drop for Client {
     }
 }
 
+/// `details.reason` of a `ServiceUnavailable` when this process may not reach the socket (an
+/// agent sandbox): never "not running", and never a start attempt (plan P4 R1-1, Task 4).
+pub const SANDBOX_DENIED: &str = "sandbox_denied";
+
+/// Whether a start path replaces a running service whose contract does not match (plan P4
+/// D-Q1). Ordinary commands pass `cli::REPLACE_ON_START`; `hostler service start`, `doctor
+/// --fix` and `init --write` pass `OnMismatch`. Task 4 implements `OnMismatch`; until then
+/// both return the mismatch as is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replace {
+    /// A newer client may stop an idle, locked, older service and start its own (probe →
+    /// `may_stop(Automatic(Replace))` → atomic stop).
+    OnMismatch,
+    /// Return `ContractMismatch` as is.
+    Never,
+}
+
 /// `ServiceUnavailable` with a machine-readable `details.reason`.
 pub fn unavailable(reason: &str, message: String, socket: &SocketName) -> HostlerError {
     HostlerError {
@@ -129,6 +146,154 @@ pub fn unavailable(reason: &str, message: String, socket: &SocketName) -> Hostle
         details: json!({ "reason": reason, "socket": socket_display(socket) }),
         recovery: Some("hostler service start".into()),
     }
+}
+
+/// `ServiceUnavailable` with `reason: sandbox_denied` (plan P4 R1-1): this process may not
+/// reach the socket (`EPERM`/`EACCES`, e.g. an agent sandbox). Its recovery never starts a
+/// service: a service started from inside the sandbox would serve only the sandbox. It names the
+/// directory that may not be searched on the socket's path (P4-L18), else the socket's directory.
+pub fn sandbox_denied(socket: &SocketName, cause: &std::io::Error) -> HostlerError {
+    let dir = match socket {
+        SocketName::File(path) => {
+            denied_dir(path).or_else(|| path.parent().map(std::path::Path::to_path_buf))
+        }
+        SocketName::Namespaced(_) => None,
+    };
+    sandbox_denied_at(socket, cause, dir.as_deref())
+}
+
+/// `sandbox_denied` naming `dir` (`details.dir`, and the recovery's permissions hint).
+pub fn sandbox_denied_at(
+    socket: &SocketName,
+    cause: &std::io::Error,
+    dir: Option<&Path>,
+) -> HostlerError {
+    let mut error = unavailable(
+        SANDBOX_DENIED,
+        "this process may not reach hostler's socket (an agent sandbox?)".into(),
+        socket,
+    );
+    error.details["cause"] = Value::String(cause.to_string());
+    if let Some(dir) = dir {
+        error.details["dir"] = Value::String(dir.display().to_string());
+    }
+    error.recovery = Some(crate::service::lifecycle::sandbox_recovery(dir));
+    error
+}
+
+/// The first directory on `path`'s way (from the root) that this process may not search: the
+/// parent of the first component whose metadata read is `PermissionDenied`.
+fn denied_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let mut ancestors: Vec<&Path> = path.ancestors().collect();
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .find_map(|step| match std::fs::symlink_metadata(step) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                step.parent().map(Path::to_path_buf)
+            }
+            _ => None,
+        })
+}
+
+/// `Paths::resolve`, with a `PermissionDenied` while checking or creating the state and socket
+/// directories reported as `sandbox_denied` (plan P4 R1-2): a sandbox that may not search the
+/// socket's directory chain fails there, before any connect. Other failures are `Internal`.
+/// Every CLI state-path resolution goes through it (P4 R2-2).
+pub fn resolve_paths() -> Result<Paths, HostlerError> {
+    Paths::resolve().map_err(|e| {
+        sandbox_denied_in(&e).unwrap_or_else(|| HostlerError {
+            code: ErrorCode::Internal,
+            message: format!("{e:#}"),
+            details: json!({}),
+            recovery: None,
+        })
+    })
+}
+
+/// The `sandbox_denied` an error from `Paths::resolve` (or a step that wraps it) stands for,
+/// when its cause is `PermissionDenied`; it names the directory that may not be searched.
+pub fn sandbox_denied_in(e: &anyhow::Error) -> Option<HostlerError> {
+    let cause = e
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .find(|io| io.kind() == std::io::ErrorKind::PermissionDenied)?;
+    let planned = Paths::planned().ok()?;
+    let mut checked = vec![planned.home.clone(), planned.log_dir.clone()];
+    if let SocketName::File(socket) = &planned.socket {
+        checked.push(socket.clone());
+    }
+    let dir = checked
+        .iter()
+        .find_map(|path| denied_dir(path))
+        .or_else(|| match &planned.socket {
+            SocketName::File(socket) => socket.parent().map(Path::to_path_buf),
+            SocketName::Namespaced(_) => Some(planned.home.clone()),
+        });
+    Some(sandbox_denied_at(&planned.socket, cause, dir.as_deref()))
+}
+
+/// The error for a failure to read this process's own information (its identity, the process
+/// table): a `PermissionDenied` is `sandbox_denied` with the P4-L18 recovery (P4 Task 9 F-1), so
+/// a sandbox never shows as `internal`; anything else is `internal`.
+pub fn process_error(e: &anyhow::Error) -> HostlerError {
+    if crate::procs::permission_denied(e) {
+        let mut error = HostlerError {
+            code: ErrorCode::ServiceUnavailable,
+            message: "this process may not read its own process information (an agent sandbox?)"
+                .into(),
+            details: json!({ "reason": SANDBOX_DENIED, "cause": format!("{e:#}") }),
+            recovery: Some(crate::service::lifecycle::sandbox_recovery(None)),
+        };
+        if let Ok(planned) = Paths::planned() {
+            error.details["socket"] = Value::String(socket_display(&planned.socket));
+        }
+        return error;
+    }
+    HostlerError {
+        code: ErrorCode::Internal,
+        message: format!("{e:#}"),
+        details: json!({}),
+        recovery: None,
+    }
+}
+
+/// Whether `e` is a `sandbox_denied` (plan P4 R1-1).
+pub fn is_sandbox_denied(e: &HostlerError) -> bool {
+    e.code == ErrorCode::ServiceUnavailable && e.details["reason"] == SANDBOX_DENIED
+}
+
+/// A failed connect: `PermissionDenied` is a sandbox denial on Unix (the Codex and Claude Code
+/// seatbelts answer `EPERM`); everything else reads as "not running". Windows' pipe errors are
+/// unchanged.
+fn connect_failed(e: std::io::Error, socket: &SocketName) -> HostlerError {
+    #[cfg(unix)]
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return sandbox_denied(socket, &e);
+    }
+    unavailable(
+        "not_running",
+        format!("the hostler service is not running ({e})"),
+        socket,
+    )
+}
+
+/// Debug builds: `HOSTLER_TEST_CONNECT_ERRNO=EPERM|EACCES` fails every connect with that errno,
+/// standing in for an agent sandbox's seatbelt (which CI cannot run).
+#[cfg(debug_assertions)]
+fn test_connect_error() -> Option<std::io::Error> {
+    #[cfg(unix)]
+    let errno = match std::env::var("HOSTLER_TEST_CONNECT_ERRNO").ok()?.as_str() {
+        "EPERM" => libc::EPERM,
+        "EACCES" => libc::EACCES,
+        _ => return None,
+    };
+    #[cfg(not(unix))]
+    let errno = std::env::var("HOSTLER_TEST_CONNECT_ERRNO")
+        .ok()?
+        .parse::<i32>()
+        .ok()?;
+    Some(std::io::Error::from_raw_os_error(errno))
 }
 
 pub fn socket_display(socket: &SocketName) -> String {
@@ -241,7 +406,12 @@ impl Client {
             contract_version: CONTRACT_VERSION,
             client: format!("hostler {}", env!("CARGO_PKG_VERSION")),
         };
-        client.call_within(hello, HELLO_TIMEOUT).await?;
+        let reply = client.call_within(hello, HELLO_TIMEOUT).await?;
+        // F-1 r1: a client that may not read the boot id takes the service's, before it
+        // persists or compares any identity.
+        if let Some(boot_id) = reply["boot_id"].as_str() {
+            crate::procs::learn_boot_id(boot_id);
+        }
         Ok(client)
     }
 
@@ -252,6 +422,10 @@ impl Client {
         check_socket_owner(socket)?;
         let name = socket_name(socket)
             .map_err(|e| unavailable("bad_socket_name", e.to_string(), socket))?;
+        #[cfg(debug_assertions)]
+        if let Some(e) = test_connect_error() {
+            return Err(connect_failed(e, socket));
+        }
         let stream = match timeout(CONNECT_TIMEOUT, Stream::connect(name)).await {
             Err(_) => {
                 return Err(unavailable(
@@ -262,13 +436,7 @@ impl Client {
                     socket,
                 ));
             }
-            Ok(Err(e)) => {
-                return Err(unavailable(
-                    "not_running",
-                    format!("the hostler service is not running ({e})"),
-                    socket,
-                ));
-            }
+            Ok(Err(e)) => return Err(connect_failed(e, socket)),
             Ok(Ok(stream)) => stream,
         };
         let (recv, send) = tokio::io::split(stream);
@@ -295,10 +463,15 @@ impl Client {
     /// `connect`; when the service is unavailable, starts it and retries until 5 s have passed
     /// in total — OS-manager calls included. With an OS registration for this home, only the OS
     /// manager may start it (a spawned service would inherit the caller's sandbox); without one,
-    /// a detached `hostler service run` is spawned. A `ContractMismatch` is returned as is.
+    /// a detached `hostler service run` is spawned. A `sandbox_denied` is returned at once: no
+    /// start, no spawn, no retry (plan P4 R1-1). On a `ContractMismatch`, `replace` decides
+    /// (plan P4 Task 4, D-Q1): `Never` returns it with a direction-aware recovery;
+    /// `OnMismatch` stops an older, idle, locked service (probe → `may_stop(Automatic(Replace))`
+    /// → the atomic `service.shutdown`) and starts this one, at most once per call.
     pub async fn connect_or_start<M: ServiceManager + Clone + 'static>(
         paths: &Paths,
         manager: &M,
+        replace: Replace,
     ) -> Result<Client, HostlerError> {
         let exe = std::env::current_exe().map_err(|e| {
             unavailable(
@@ -307,7 +480,7 @@ impl Client {
                 &paths.socket,
             )
         })?;
-        Client::connect_or_start_with(paths, manager, &exe).await
+        Client::connect_or_start_with(paths, manager, &exe, replace).await
     }
 
     /// `connect_or_start` with an explicit hostler executable (tests run from another binary).
@@ -316,10 +489,21 @@ impl Client {
         paths: &Paths,
         manager: &M,
         exe: &Path,
+        replace: Replace,
     ) -> Result<Client, HostlerError> {
+        // The contract of the service this call replaced, if it did.
+        let mut replaced = None;
         match Client::connect(paths).await {
             Ok(client) => return Ok(client),
-            Err(e) if e.code == ErrorCode::ContractMismatch => return Err(e),
+            Err(e) if e.code == ErrorCode::ContractMismatch => match replace {
+                Replace::Never => return Err(mismatch::kept(paths, e).await),
+                Replace::OnMismatch => match mismatch::replace_older(paths, e).await? {
+                    mismatch::Replaced::Stopped { old_contract } => replaced = Some(old_contract),
+                    mismatch::Replaced::Gone => {}
+                    mismatch::Replaced::Matches(client) => return Ok(*client),
+                },
+            },
+            Err(e) if is_sandbox_denied(&e) => return Err(e),
             Err(_) => {}
         }
         let deadline = Instant::now() + START_TIMEOUT;
@@ -354,8 +538,21 @@ impl Client {
             }
             sleep(START_RETRY_EVERY.min(deadline - now)).await;
             match timeout_at(deadline, Client::connect(paths)).await {
-                Ok(Ok(client)) => return Ok(client),
-                Ok(Err(e)) if e.code == ErrorCode::ContractMismatch => return Err(e),
+                Ok(Ok(client)) => {
+                    if let Some(old) = replaced {
+                        eprintln!(
+                            "[hostler] replaced an older hostler service (contract {old} → \
+                             {CONTRACT_VERSION})"
+                        );
+                    }
+                    return Ok(client);
+                }
+                // The service just started mismatches: the registration runs another hostler,
+                // which no further replacement fixes (at most one per call).
+                Ok(Err(e)) if e.code == ErrorCode::ContractMismatch => {
+                    return Err(mismatch::after_start(paths, e, replaced.is_some()).await);
+                }
+                Ok(Err(e)) if is_sandbox_denied(&e) => return Err(e),
                 Ok(Err(e)) => {
                     last = Some(e);
                     // A registration appeared after our check: the spawned service steps aside
@@ -517,6 +714,224 @@ impl Client {
     }
 }
 
+/// A contract mismatch on a start path (plan P4 Task 4): direction-aware texts, and the
+/// replacement of an older service (R1-2, R1-3, R1-6).
+mod mismatch {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::service::lifecycle::{
+        self, AutoPurpose, Direction, INSTALL_RECOVERY, StopRefusal, StopRule,
+    };
+    use crate::service::manager::RegistrationState;
+    use crate::service::{self, StopRefused, Stopping};
+
+    /// How long a replacement waits for the old service to exit: `stop_service`'s
+    /// lock-and-exit wait, with a shorter bound.
+    pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(15);
+
+    /// R1-3: `service restart` would start the same old registered binary again.
+    pub(super) const BUSY_RECOVERY: &str = "when its work has finished: hostler service install \
+         (registers this hostler and restarts the service; this locks the secrets database)";
+
+    /// R1-6: only explicit, and only with the person's agreement, since it locks the database.
+    pub(super) const UNLOCKED_RECOVERY: &str = "hostler service install (registers this hostler \
+         and restarts the service; this locks the secrets database, so only with the person's \
+         agreement)";
+
+    pub(super) enum Replaced {
+        /// The old service accepted the stop and is gone.
+        Stopped { old_contract: u32 },
+        /// No service runs any more.
+        Gone,
+        /// The service changed since the hello and now matches.
+        Matches(Box<Client>),
+    }
+
+    /// `(contract, version)` of the service, from the hello's `ContractMismatch` details.
+    fn service_versions(e: &HostlerError) -> (u32, String) {
+        let contract = e.details["service_contract"]
+            .as_u64()
+            .and_then(|c| u32::try_from(c).ok())
+            .unwrap_or(0);
+        let version = e.details["service_version"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        (contract, version)
+    }
+
+    fn direction(e: &HostlerError) -> Direction {
+        let (contract, version) = service_versions(e);
+        lifecycle::replace_direction(lifecycle::this_client(), (contract, &version))
+    }
+
+    /// The registered binary, read off this thread within 2 s (`schtasks` can hang). A custom
+    /// home has no registration of its own: the default home's is not named.
+    async fn registered_exe(paths: &Paths) -> Option<PathBuf> {
+        if paths.custom_home {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::service::manager::registered_exe());
+        });
+        timeout(Duration::from_secs(2), rx).await.ok()?.ok()?
+    }
+
+    /// Older or unknown direction: the texts of R1-2, never a start or stop command.
+    async fn not_newer(paths: &Paths, mut e: HostlerError, direction: Direction) -> HostlerError {
+        let (contract, version) = service_versions(&e);
+        let (mine, my_version) = lifecycle::this_client();
+        let exe = registered_exe(paths).await;
+        if direction == Direction::Older {
+            e.message = format!(
+                "this hostler (contract {mine}, version {my_version}) is older than the running \
+                 service (contract {contract}, version {version})"
+            );
+            e.recovery = Some(StopRefusal::NewerService.recovery(exe.as_deref()));
+        } else {
+            e.message =
+                format!("cannot compare hostler {my_version} with the running service's {version}");
+            e.recovery = Some(StopRefusal::UnknownVersion.recovery(exe.as_deref()));
+        }
+        e.details["direction"] = json!(direction_id(direction));
+        e
+    }
+
+    fn direction_id(direction: Direction) -> &'static str {
+        match direction {
+            Direction::Newer => "newer",
+            Direction::Same => "same",
+            Direction::Older => "older",
+            Direction::Unknown => "unknown",
+        }
+    }
+
+    /// `Replace::Never` (D-Q1): the mismatch as is, with a recovery that fits its direction.
+    pub(super) async fn kept(paths: &Paths, mut e: HostlerError) -> HostlerError {
+        match direction(&e) {
+            d @ (Direction::Older | Direction::Unknown) => not_newer(paths, e, d).await,
+            d => {
+                // `hostler service start` replaces it when it may.
+                e.recovery = Some("hostler service start".into());
+                e.details["direction"] = json!(direction_id(d));
+                e
+            }
+        }
+    }
+
+    /// A service this call just started mismatches: the registration runs another hostler.
+    pub(super) async fn after_start(
+        paths: &Paths,
+        mut e: HostlerError,
+        replaced: bool,
+    ) -> HostlerError {
+        match direction(&e) {
+            d @ (Direction::Older | Direction::Unknown) => not_newer(paths, e, d).await,
+            d => {
+                let (contract, _) = service_versions(&e);
+                e.message = if replaced {
+                    format!(
+                        "the older hostler service was stopped, but the one the OS registration \
+                         started is older too (contract {contract}): the registration runs an \
+                         older hostler"
+                    )
+                } else {
+                    format!("{}; the OS registration runs an older hostler", e.message)
+                };
+                e.recovery = Some(INSTALL_RECOVERY.into());
+                e.details["direction"] = json!(direction_id(d));
+                e
+            }
+        }
+    }
+
+    /// `Replace::OnMismatch`: probe → `may_stop(Automatic(Replace))` → the atomic stop, on one
+    /// connection; then waits for the old service to exit. Any refusal leaves it running.
+    pub(super) async fn replace_older(
+        paths: &Paths,
+        e: HostlerError,
+    ) -> Result<Replaced, HostlerError> {
+        let rule = StopRule::Automatic(AutoPurpose::Replace);
+        match service::request_stop(paths, rule, RegistrationState::Unknown).await {
+            Ok(Stopping::NotRunning) => Ok(Replaced::Gone),
+            Ok(Stopping::Accepted { process, status }) => {
+                service::wait_gone(paths, process.as_ref(), REPLACE_WAIT)
+                    .await
+                    .map_err(|refused| match refused {
+                        StopRefused::Busy(e) | StopRefused::Failed(e) => e,
+                        StopRefused::NotStopped(r) => refusal(e.clone(), r),
+                    })?;
+                Ok(Replaced::Stopped {
+                    old_contract: status.contract_version,
+                })
+            }
+            // The service changed since the hello (another client replaced it): ask again.
+            Err(StopRefused::NotStopped(StopRefusal::NotNewer)) => {
+                match Client::connect(paths).await {
+                    Ok(client) => Ok(Replaced::Matches(Box::new(client))),
+                    Err(again) if again.code == ErrorCode::ContractMismatch => {
+                        Err(kept(paths, again).await)
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Err(StopRefused::NotStopped(r @ StopRefusal::NewerService)) => {
+                Err(with_refusal(not_newer(paths, e, Direction::Older).await, r))
+            }
+            Err(StopRefused::NotStopped(r @ StopRefusal::UnknownVersion)) => Err(with_refusal(
+                not_newer(paths, e, Direction::Unknown).await,
+                r,
+            )),
+            Err(StopRefused::NotStopped(r)) => Err(refusal(e, r)),
+            Err(StopRefused::Busy(busy)) => Err(busy_older(e, busy)),
+            Err(StopRefused::Failed(failed)) => Err(failed),
+        }
+    }
+
+    fn with_refusal(mut e: HostlerError, r: StopRefusal) -> HostlerError {
+        e.details["refusal"] = json!(r.id());
+        e
+    }
+
+    /// A refusal of an older service (direction `Newer`): nothing was stopped.
+    fn refusal(mut e: HostlerError, r: StopRefusal) -> HostlerError {
+        if r == StopRefusal::UnlockedOrUnknown {
+            e.message = "the running hostler service is older; its secrets database is unlocked \
+                         (or it cannot say)"
+                .into();
+            e.recovery = Some(UNLOCKED_RECOVERY.into());
+        } else {
+            e.message = format!("{}; {}", e.message, r.message());
+            e.recovery = Some(r.recovery(None));
+        }
+        e.details["direction"] = json!("newer");
+        with_refusal(e, r)
+    }
+
+    /// The older service answered `ServiceBusy` to the atomic stop: it keeps running.
+    fn busy_older(mut e: HostlerError, busy: HostlerError) -> HostlerError {
+        let (contract, _) = service_versions(&e);
+        e.message =
+            format!("the running hostler service is older (contract {contract}) and has live work");
+        let field = |name: &str| match &busy.details[name] {
+            Value::Null => json!([]),
+            v => v.clone(),
+        };
+        e.details["busy"] = json!({
+            "running": field("running"),
+            "leases": field("leases"),
+            "plans": field("plans"),
+            "secrets": busy.details["secrets"].clone(),
+            "message": busy.message,
+        });
+        e.details["direction"] = json!("newer");
+        e.recovery = Some(BUSY_RECOVERY.into());
+        e
+    }
+}
+
 /// Runs a (blocking) OS-manager call on its own thread, bounded by `deadline`. A plain thread,
 /// not `spawn_blocking`: a call that never returns must not keep the process from exiting.
 async fn off_thread<M, T>(
@@ -624,6 +1039,11 @@ fn check_socket_owner(socket: &SocketName) -> Result<(), HostlerError> {
         return Ok(());
     };
     let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        // A socket directory this process may not search (EACCES): a sandbox, never "not
+        // running" (plan P4 R1-1).
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return sandbox_denied(socket, &e);
+        }
         unavailable(
             "not_running",
             format!(
@@ -1102,6 +1522,25 @@ fn environment_block(vars: Vec<(Vec<u16>, Vec<u16>)>, home: &[u16]) -> Vec<u16> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P4 Task 9 F-1: a sandbox's EPERM on this process's own information is `sandbox_denied`
+    /// with the P4-L18 recovery, never `internal`.
+    #[test]
+    fn process_errors_are_classified() {
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("cannot read the start time of the current process 1");
+        let e = process_error(&denied);
+        assert!(is_sandbox_denied(&e), "{e:?}");
+        assert!(
+            e.recovery
+                .as_deref()
+                .unwrap()
+                .ends_with("see: hostler guide sandbox")
+        );
+        let other = process_error(&anyhow::anyhow!("something else"));
+        assert_eq!(other.code, ErrorCode::Internal);
+        assert_eq!(other.recovery, None);
+    }
 
     /// L48 (FR-4): the names a run may not inject a value under.
     #[test]

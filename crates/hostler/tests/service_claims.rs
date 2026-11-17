@@ -72,7 +72,10 @@ fn idle_stop(home: &Home) -> Result<Value, hostler::contract::HostlerError> {
         .block_on(async {
             Client::connect_lifecycle(&paths)
                 .await?
-                .call(Request::ServiceShutdown { if_idle: true })
+                .call(Request::ServiceShutdown {
+                    if_idle: true,
+                    refuse_if_unlocked: false,
+                })
                 .await
         })
 }

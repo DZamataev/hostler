@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use hostler::client::Client;
+use hostler::client::{Client, Replace};
 use hostler::contract::heavy::HeavyAcquire;
 use hostler::contract::wire::Request;
 use hostler::contract::{CONTRACT_VERSION, ErrorCode};
@@ -137,9 +137,10 @@ async fn first_call_auto_starts_service() {
     assert!(stdout(&before).contains("not running"));
 
     let paths = home.paths();
-    let mut client = Client::connect_or_start_with(&paths, &NoManager, BIN.as_ref())
-        .await
-        .unwrap();
+    let mut client =
+        Client::connect_or_start_with(&paths, &NoManager, BIN.as_ref(), Replace::Never)
+            .await
+            .unwrap();
     let status = client.call(Request::ServiceStatus).await.unwrap();
     assert_eq!(status["contract_version"], CONTRACT_VERSION);
     assert_eq!(home.pid(), status["pid"].as_u64().unwrap());
@@ -247,13 +248,24 @@ async fn mismatched_client_gets_contract_mismatch_not_unavailable() {
     let mut service = home.service(&[("HOSTLER_TEST_CONTRACT_VERSION", "999")]);
     let paths = home.paths();
 
-    let err = match Client::connect_or_start_with(&paths, &NoManager, BIN.as_ref()).await {
+    let err = match Client::connect_or_start_with(&paths, &NoManager, BIN.as_ref(), Replace::Never)
+        .await
+    {
         Ok(_) => panic!("a contract-999 service accepted a contract-1 client"),
         Err(e) => e,
     };
     assert_eq!(err.code, ErrorCode::ContractMismatch);
     assert_eq!(err.details["service_contract"], 999);
-    assert_eq!(err.recovery.as_deref(), Some("hostler service restart"));
+    // P4 Task 4 (R1-2): this client is older than a contract-999 service: never a restart.
+    assert_eq!(err.details["direction"], "older");
+    assert!(
+        err.recovery
+            .as_deref()
+            .unwrap()
+            .contains("cargo install hostler"),
+        "{:?}",
+        err.recovery
+    );
 
     // Without hello, a versioned call is refused the same way.
     let mut raw = Client::connect_lifecycle(&paths).await.unwrap();
@@ -315,9 +327,10 @@ async fn custom_home_never_uses_manager() {
     offer_test_owner();
     let paths = home.paths();
     assert!(paths.custom_home);
-    let mut client = Client::connect_or_start_with(&paths, &PanicManager, BIN.as_ref())
-        .await
-        .unwrap();
+    let mut client =
+        Client::connect_or_start_with(&paths, &PanicManager, BIN.as_ref(), Replace::Never)
+            .await
+            .unwrap();
     assert!(client.call(Request::ServiceStatus).await.is_ok());
 }
 
@@ -341,10 +354,13 @@ async fn installed_manager_failure_never_spawns() {
     // A default-home view of the same directory: the registration applies.
     let paths = Paths::under(home.home.clone(), false);
     paths.ensure_dirs().unwrap();
-    let err = match Client::connect_or_start_with(&paths, &FailingManager, BIN.as_ref()).await {
-        Ok(_) => panic!("no service may run"),
-        Err(e) => e,
-    };
+    let err =
+        match Client::connect_or_start_with(&paths, &FailingManager, BIN.as_ref(), Replace::Never)
+            .await
+        {
+            Ok(_) => panic!("no service may run"),
+            Err(e) => e,
+        };
     assert_eq!(err.code, ErrorCode::ServiceUnavailable);
     assert_eq!(err.details["reason"], "manager_start_failed");
     assert!(
@@ -377,7 +393,8 @@ async fn start_retry_window_is_five_seconds_in_total() {
 
     let started = Instant::now();
     // `true` stands in for a hostler binary whose service never comes up.
-    let result = Client::connect_or_start_with(&paths, &NoManager, "true".as_ref()).await;
+    let result =
+        Client::connect_or_start_with(&paths, &NoManager, "true".as_ref(), Replace::Never).await;
     let elapsed = started.elapsed();
     let err = match result {
         Ok(_) => panic!("a silent listener cannot complete hello"),

@@ -27,29 +27,19 @@ pub fn parse(src: &str) -> Result<Vec<DotenvEntry>, Vec<DotenvProblem>> {
 
     for (index, raw) in src.lines().enumerate() {
         let line = index + 1;
-        let mut text = raw.trim_start();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = text.strip_prefix("export")
-            && rest.starts_with(char::is_whitespace)
-        {
-            text = rest.trim_start();
-        }
-        let Some(equals) = text.find('=') else {
-            problems.push(problem(line, "missing `=`"));
-            continue;
+        let (name, value_start) = match head(raw, line) {
+            Ok(None) => continue,
+            Ok(Some(head)) => head,
+            Err(problem) => {
+                problems.push(problem);
+                continue;
+            }
         };
-        let name = text[..equals].trim();
-        if !valid_secret_name(name) {
-            problems.push(problem(line, invalid_name_message(name)));
-            continue;
-        }
         if !seen.insert(name.to_string()) {
             problems.push(problem(line, format!("duplicate name {name}")));
             continue;
         }
-        match parse_value(&text[equals + 1..]) {
+        match parse_value(&raw[value_start..]) {
             Ok(value) => entries.push(DotenvEntry {
                 line,
                 name: name.to_string(),
@@ -66,36 +56,99 @@ pub fn parse(src: &str) -> Result<Vec<DotenvEntry>, Vec<DotenvProblem>> {
     }
 }
 
+/// The line and name of every `KEY=…` line of a file that `parse` accepts whole (plan P4 Task 3;
+/// fix round 1, R1-1). Any problem at all — a missing `=`, an invalid or duplicate name, a value
+/// shape `parse` rejects — gives no names, and no text right of a `=` is kept: the value is only
+/// validated, never built.
+pub fn names(src: &str) -> Vec<(usize, String)> {
+    let mut names = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, raw) in src.lines().enumerate() {
+        let line = index + 1;
+        let (name, value_start) = match head(raw, line) {
+            Ok(None) => continue,
+            Ok(Some(head)) => head,
+            Err(_) => return Vec::new(),
+        };
+        if !seen.insert(name.to_string()) || !value_shape_ok(&raw[value_start..]) {
+            return Vec::new();
+        }
+        names.push((line, name.to_string()));
+    }
+    names
+}
+
+/// A line's name and the byte offset of the text right of its `=`; `None` for a blank or
+/// comment line. This is the one place the name rules live: `parse` and `names` both call it.
+fn head(raw: &str, line: usize) -> Result<Option<(&str, usize)>, DotenvProblem> {
+    let mut text = raw.trim_start();
+    if text.is_empty() || text.starts_with('#') {
+        return Ok(None);
+    }
+    if let Some(rest) = text.strip_prefix("export")
+        && rest.starts_with(char::is_whitespace)
+    {
+        text = rest.trim_start();
+    }
+    // `text` is a suffix of `raw`, so this offset also indexes `raw`.
+    let start = raw.len() - text.len();
+    let Some(equals) = text.find('=') else {
+        return Err(problem(line, "missing `=`"));
+    };
+    let name = text[..equals].trim();
+    if !valid_secret_name(name) {
+        return Err(problem(line, invalid_name_message(name)));
+    }
+    Ok(Some((name, start + equals + 1)))
+}
+
 fn parse_value(raw: &str) -> Result<String, &'static str> {
+    // Decoded bytes never exceed the source, so one reservation means no reallocation can
+    // leave an earlier plaintext buffer unerased.
+    let mut value = Zeroizing::new(String::with_capacity(raw.trim_start().len()));
+    scan_value(raw, |c| value.push(c))?;
+    Ok(std::mem::take(&mut *value))
+}
+
+/// Whether a value's shape is one `parse` accepts, without decoding it: `names` validates every
+/// value this way, so it never builds a `SecretValue` and never keeps value text (fix round 1,
+/// R1-1).
+fn value_shape_ok(raw: &str) -> bool {
+    scan_value(raw, |_| {}).is_ok()
+}
+
+/// The value rules, shared by `parse`, which decodes into `push`, and `names`, which passes a
+/// no-op sink and only learns whether the shape is valid.
+fn scan_value(raw: &str, mut push: impl FnMut(char)) -> Result<(), &'static str> {
     let text = raw.trim_start();
     if let Some(rest) = text.strip_prefix('\'') {
         let Some(end) = rest.find('\'') else {
             return Err("unclosed quote");
         };
         check_trailing(&rest[end + 1..])?;
-        return Ok(erasing_value(&rest[..end]));
+        for c in rest[..end].chars() {
+            push(c);
+        }
+        return Ok(());
     }
     if let Some(rest) = text.strip_prefix('"') {
-        // Decoded bytes never exceed the source, so one reservation means no reallocation can
-        // leave an earlier plaintext buffer unerased.
-        let mut value = Zeroizing::new(String::with_capacity(rest.len()));
         let mut chars = rest.char_indices();
         while let Some((index, c)) = chars.next() {
             match c {
                 '"' => {
                     check_trailing(&rest[index + 1..])?;
-                    return Ok(std::mem::take(&mut *value));
+                    return Ok(());
                 }
                 '\\' => match chars.next() {
-                    Some((_, 'n')) => value.push('\n'),
-                    Some((_, 'r')) => value.push('\r'),
-                    Some((_, 't')) => value.push('\t'),
-                    Some((_, '"')) => value.push('"'),
-                    Some((_, '\\')) => value.push('\\'),
+                    Some((_, 'n')) => push('\n'),
+                    Some((_, 'r')) => push('\r'),
+                    Some((_, 't')) => push('\t'),
+                    Some((_, '"')) => push('"'),
+                    Some((_, '\\')) => push('\\'),
                     Some(_) => return Err("invalid escape in a quoted value"),
                     None => return Err("unclosed quote"),
                 },
-                c => value.push(c),
+                c => push(c),
             }
         }
         return Err("unclosed quote");
@@ -108,14 +161,10 @@ fn parse_value(raw: &str) -> Result<String, &'static str> {
             break;
         }
     }
-    Ok(text[..end].trim_end().to_string())
-}
-
-/// A single-quoted literal: built in an erasing buffer with its final capacity.
-fn erasing_value(text: &str) -> String {
-    let mut value = Zeroizing::new(String::with_capacity(text.len()));
-    value.push_str(text);
-    std::mem::take(&mut *value)
+    for c in text[..end].trim_end().chars() {
+        push(c);
+    }
+    Ok(())
 }
 
 fn check_trailing(rest: &str) -> Result<(), &'static str> {
@@ -244,6 +293,33 @@ mod tests {
         assert_eq!(
             problems[1].message,
             "unexpected text after the closing quote"
+        );
+    }
+
+    #[test]
+    fn names_give_nothing_for_a_file_with_any_problem() {
+        for source in [
+            "GOOD=ok\nBAD=\"unterminated\n",
+            "GOOD=ok\nBAD=\"hunter2\\q\"\n",
+            "GOOD=ok\nBAD='hunter2'tail\n",
+            "A=one\nA=two\n",
+            "GOOD=ok\nBAD-NAME=hunter2\n",
+            "GOOD=ok\nNO_EQUALS\n",
+        ] {
+            assert!(
+                names(source).is_empty(),
+                "{source:?} gave {:?}",
+                names(source)
+            );
+        }
+        // A file with no problem keeps its names, and no value.
+        assert_eq!(
+            names("GOOD=ok\n# c\n\nOTHER=\"x\"\nexport THIRD='y'\n"),
+            vec![
+                (1, "GOOD".to_owned()),
+                (4, "OTHER".to_owned()),
+                (5, "THIRD".to_owned()),
+            ]
         );
     }
 }

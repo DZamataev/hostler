@@ -719,7 +719,7 @@ fn stdin_rejects_invalid_utf8() {
 }
 
 #[test]
-fn an_unknown_config_table_warns_once_on_stderr() {
+fn an_unknown_config_table_is_a_problem() {
     let home = Home::new();
     let repo = home.make_repo("app");
     fs::write(
@@ -728,21 +728,24 @@ fn an_unknown_config_table_warns_once_on_stderr() {
     )
     .unwrap();
 
-    let message = "[hostler] hostler.toml: [dev] is not used by this hostler version";
+    // P4's schema: an unknown table is a problem with its line, not a warning.
     let out = run(&home, &repo, &["project"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stderr(&out).matches(message).count(), 1, "{}", stderr(&out));
-    assert!(stdout(&out).contains("app"), "{}", stdout(&out));
-
-    // `--json` keeps stdout pure; the warning is still on stderr, once.
-    let out = run(&home, &repo, &["project", "--json"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stdout(&out).trim_start().starts_with('{'),
+        stderr(&out).contains("line 4: unknown table [dev]"),
         "{}",
-        stdout(&out)
+        stderr(&out)
     );
-    assert_eq!(stderr(&out).matches(message).count(), 1, "{}", stderr(&out));
+
+    // `--json` keeps stdout pure: the problem is in the envelope, with its line.
+    let out = run(&home, &repo, &["project", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "config_invalid", "{value}");
+    assert_eq!(
+        value["error"]["details"]["problems"][0]["line"], 4,
+        "{value}"
+    );
 
     // A control character in the table name is replaced before it reaches the terminal.
     fs::write(
@@ -751,7 +754,7 @@ fn an_unknown_config_table_warns_once_on_stderr() {
     )
     .unwrap();
     let out = run(&home, &repo, &["project"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("a\u{FFFD}b"), "{}", stderr(&out));
     assert!(!stderr(&out).contains('\u{1b}'), "{}", stderr(&out));
 }

@@ -118,7 +118,9 @@ fn run(args: UnlockArgs) -> Result<ExitCode, HostlerError> {
 /// `KillUserProcesses=yes` ends it with an SSH session), and the unlock goes with it.
 fn unregistered_service_warning() -> Option<String> {
     use crate::service::manager::{OsManager, RegistrationState};
-    let custom_home = crate::paths::Paths::resolve()
+    // Only the home choice matters here: no directory is touched (P4 R2-2), so a denied one
+    // never hides the note; the unlock itself reports a `sandbox_denied`.
+    let custom_home = crate::paths::Paths::planned()
         .map(|paths| paths.custom_home)
         .unwrap_or(false);
     if custom_home {

@@ -108,7 +108,7 @@ The queue lives in one per-user background service. You normally never manage it
 starts it on demand. When you do:
 
 ```sh
-hostler service status            # running/not, pid, versions, socket
+hostler service status            # running/not, pid, versions, socket; exit 0 running, 3 not running
 hostler service status --json
 hostler service start
 hostler service stop              # refused while work runs, unless --force
@@ -131,10 +131,14 @@ environment: it inherits none of the variables of the command that triggered the
 `--secret`/`--account` values never reach the long-lived service. It keeps only what it needs
 (home, user, locale, temp, `HOSTLER_HOME`).
 
-After upgrading the hostler binary, run `hostler service restart` so the service runs the new
-binary and contract. A service with a different contract version is reported by clients as
-`contract_mismatch`; its recovery command is `hostler service restart`. Also restart when
-`hostler service status` shows a version or contract different from the CLI.
+After upgrading the hostler binary, a newer client and the running service can disagree about the
+contract. An ordinary command never replaces a service on its own: it answers
+`contract_mismatch` and names the fix. `hostler service start` (or `hostler doctor --fix`) stops
+an older service and starts this hostler, but only when the service has no live work — no heavy
+task, no run holding a claim, no takeover — and its secrets database is locked; otherwise the
+error says `when its work has finished: hostler service install …`, and an install, like a
+restart, locks the database. An older client never stops a newer service: use the binary the
+error names, or `cargo install hostler`. `hostler service status` shows both versions.
 
 The service keeps queue state in SQLite, so a restart does not lose tickets: waiting clients
 reattach and keep their place, and a running task releases into the restarted service.
@@ -143,19 +147,13 @@ reattach and keep their place, and a running task releases into the restarted se
 
 The service must run outside your sandbox, because it owns the machine-wide queue and outlives any
 one agent. Register it with the OS once (`hostler service install`); it then starts at logon and
-clients only talk to it.
+clients only talk to it over its socket (`hostler.sock` in hostler's state directory;
+`hostler service status` prints the exact path).
 
-A sandboxed agent needs permission for exactly two things: running the `hostler` binary, and
-connecting to the service's local socket:
-
-- macOS: `~/Library/Application Support/io.github.dzamataev.hostler/hostler.sock`
-- Linux: `~/.local/share/hostler/hostler.sock`
-- with a long home path, the socket moves to `/tmp/hostler-<uid>-<hash>/hostler.sock`
-- Windows: the named pipe `\\.\pipe\hostler-<user>-<hash>`
-
-If hostler cannot start or reach its service from inside the sandbox, heavy runs fall open with a
-warning and the command runs unqueued. Tell the operator; the sandbox or the service registration
-needs fixing.
+A sandbox that denies the socket makes the command answer `sandbox_denied` — never "not running" —
+and hostler starts nothing. A sandboxed `hostler run --heavy` fails open: it warns that hostler is
+unavailable, prints the line that says what to allow, and runs the command unqueued. `hostler guide
+sandbox` has what each agent sandbox must allow: Claude Code's setting and Codex's rule file.
 
 ## JSON
 

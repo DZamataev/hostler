@@ -1039,7 +1039,10 @@ fn idle_stop_is_refused_while_a_takeover_is_in_progress() {
         .block_on(async {
             Client::connect_lifecycle(&paths)
                 .await?
-                .call(Request::ServiceShutdown { if_idle: true })
+                .call(Request::ServiceShutdown {
+                    if_idle: true,
+                    refuse_if_unlocked: false,
+                })
                 .await
         })
         .unwrap_err();

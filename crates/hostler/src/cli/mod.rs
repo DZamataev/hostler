@@ -1,8 +1,10 @@
 pub mod account;
 pub mod claim_wait;
 pub mod devices;
+pub mod doctor;
 pub mod guide;
 pub mod hold;
+pub mod init;
 pub mod output;
 pub mod project;
 pub mod queue;
@@ -22,6 +24,14 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use crate::client::Replace;
+
+/// Whether ordinary commands replace an older service on a contract
+/// mismatch (D-Q1, owner 2026-11-16: limited). `Never`: they return `ContractMismatch` with the
+/// recovery `hostler service start`; only `hostler service start`, `hostler doctor --fix` and
+/// `hostler init --write` pass `Replace::OnMismatch`.
+pub const REPLACE_ON_START: Replace = Replace::Never;
 
 /// Machine-wide resource coordination for parallel agents.
 #[derive(Debug, Parser)]
@@ -73,6 +83,10 @@ enum Command {
     Workspace(workspace::WorkspaceArgs),
     /// Phones, emulators and simulators: register them, see who holds them, their installs.
     Devices(devices::DevicesArgs),
+    /// Set this project up for hostler (preview; --write applies).
+    Init(init::InitArgs),
+    /// Check hostler and this project; --fix applies the safe fixes.
+    Doctor(doctor::DoctorArgs),
     /// Internal: the gate launcher of `run --heavy`.
     #[command(name = "__gate", hide = true)]
     Gate {
@@ -108,6 +122,8 @@ pub fn main() -> ExitCode {
         Command::Status(args) => status::main(args),
         Command::Workspace(args) => workspace::main(args),
         Command::Devices(args) => devices::main(args),
+        Command::Init(args) => init::main(args),
+        Command::Doctor(args) => doctor::main(args),
         Command::Gate { fd, job, command } => {
             std::process::exit(spawn::gate_main(fd, job.as_deref(), &command))
         }

@@ -8,6 +8,7 @@
 //! at once. A poisoned vault mutex counts as locked, a poisoned store mutex as `Internal`.
 
 mod accounts;
+pub(crate) use accounts::MAX_ACCOUNT_FIELDS;
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -62,6 +63,29 @@ pub enum Reply {
     Sensitive(Zeroizing<String>),
 }
 
+/// What `SecretsEngine::gate` guards.
+#[derive(Default)]
+struct Gate {
+    /// Admitted `secrets.unlock` (create too) and `secrets.lock` jobs not yet finished: each may
+    /// change the lock state, so an automatic shutdown counts them as an unlocked database.
+    vault_jobs: u32,
+}
+
+/// An admitted job; finishing it (dropping this) takes it off `Gate::vault_jobs`.
+struct Admitted<'a> {
+    engine: &'a SecretsEngine,
+    vault_job: bool,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        if self.vault_job {
+            let mut gate = self.engine.gate();
+            gate.vault_jobs = gate.vault_jobs.saturating_sub(1);
+        }
+    }
+}
+
 pub struct SecretsEngine {
     /// Serializes choosing a project's group, writing to it, publishing its UUID and answering
     /// pending requests — against other writes (T6-1) and a request's check-and-insert (T6-3).
@@ -74,6 +98,9 @@ pub struct SecretsEngine {
     /// `vault.preserved_files()`, refreshed after every vault call.
     preserved: Mutex<Vec<String>>,
     closing: AtomicBool,
+    /// Admission of secrets jobs against an automatic shutdown (plan P4 R1-1): `closing` is
+    /// checked and set under it, and it counts the admitted jobs that may unlock the vault.
+    gate: Mutex<Gate>,
     last_prune_ms: AtomicI64,
     table: Arc<dyn ProcessTable>,
     clock: Arc<dyn Clock>,
@@ -245,6 +272,7 @@ impl SecretsEngine {
             unlocked: AtomicBool::new(unlocked),
             preserved: Mutex::new(preserved),
             closing: AtomicBool::new(false),
+            gate: Mutex::new(Gate::default()),
             last_prune_ms: AtomicI64::new(i64::MIN),
             table,
             clock,
@@ -286,9 +314,7 @@ impl SecretsEngine {
 
     /// Blocking: the KDF runs here, so callers use the blocking pool.
     pub fn dispatch(&self, req: Request) -> Result<Reply, HostlerError> {
-        if self.closing.load(Ordering::SeqCst) {
-            return Err(errors::service_stopping());
-        }
+        let _admitted = self.admit(&req)?;
         match req {
             Request::SecretsStatus => value_of(self.status()),
             Request::SecretsUnlock(u) => value_of(self.unlock(u)),
@@ -357,9 +383,86 @@ impl SecretsEngine {
         }
     }
 
+    /// Whether the database is unlocked, or a vault job (an unlock's KDF among them) is under
+    /// way: `service.status`'s `secrets_unlocked` and `service.shutdown`'s `refuse_if_unlocked`
+    /// (plan P4 R1-6). Read-only; a busy vault counts as unlocked, so an automatic stop never
+    /// cuts an unlock in progress short.
+    pub fn is_unlocked(&self) -> bool {
+        let gate = self.gate();
+        self.unlocked_under(&gate)
+    }
+
+    /// Unlocked, or a job that may unlock it is admitted or holds the vault. With the gate held.
+    fn unlocked_under(&self, gate: &Gate) -> bool {
+        gate.vault_jobs > 0
+            || self.unlocked.load(Ordering::SeqCst)
+            || matches!(
+                self.vault.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+    }
+
+    fn gate(&self) -> MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Admits one job, or `service_stopping()` once admission is closed. Checked under the gate,
+    /// so a job is either admitted before an automatic shutdown decides (and counted) or
+    /// refused after it (plan P4 R1-1).
+    fn admit(&self, req: &Request) -> Result<Admitted<'_>, HostlerError> {
+        let mut gate = self.gate();
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(errors::service_stopping());
+        }
+        let vault_job = matches!(req, Request::SecretsUnlock(_) | Request::SecretsLock);
+        if vault_job {
+            gate.vault_jobs += 1;
+        }
+        Ok(Admitted {
+            engine: self,
+            vault_job,
+        })
+    }
+
     /// Later dispatches answer `service_stopping()`.
     pub fn begin_shutdown(&self) {
+        let _gate = self.gate();
         self.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// An automatic shutdown's secrets check (plan P4 R1-1): in one step under the gate, closes
+    /// admission only when the database is locked and no admitted job may unlock it. `false`:
+    /// admission stays open and the stop must be refused.
+    pub fn close_if_locked(&self) -> bool {
+        let gate = self.gate();
+        if self.unlocked_under(&gate) {
+            return false;
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Reopens admission after `close_if_locked` when the stop was refused for another reason.
+    pub fn reopen_admission(&self) {
+        let _gate = self.gate();
+        self.closing.store(false, Ordering::SeqCst);
+    }
+
+    /// Debug builds: `HOSTLER_TEST_UNLOCK_PAUSE=<file>` holds an admitted unlock before it takes
+    /// the vault while `<file>` exists (up to 60 s), after writing `<file>.admitted`; the
+    /// deterministic schedule of plan P4 R1-1's race.
+    #[cfg(debug_assertions)]
+    fn test_unlock_pause() {
+        let Some(pause) = std::env::var_os("HOSTLER_TEST_UNLOCK_PAUSE").map(PathBuf::from) else {
+            return;
+        };
+        let mut admitted = pause.clone().into_os_string();
+        admitted.push(".admitted");
+        let _ = std::fs::write(&admitted, b"");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pause.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Drops the database and the key (erased) once the vault jobs are drained.
@@ -471,6 +574,9 @@ impl SecretsEngine {
     }
 
     fn unlock(&self, u: Unlock) -> Result<SecretsStatus, HostlerError> {
+        self.at("unlock_admitted");
+        #[cfg(debug_assertions)]
+        Self::test_unlock_pause();
         let remembered = self
             .store()?
             .setting(KEY_FILE_SETTING)
@@ -2108,6 +2214,55 @@ mod tests {
         let state = |n: &str| list.secrets.iter().find(|s| s.name == n).unwrap().state;
         assert_eq!(state("A"), SecretState::Missing);
         assert_eq!(state("B"), SecretState::Set);
+    }
+
+    /// P4 R1-1: an admitted unlock that has not reached the vault yet keeps an automatic
+    /// shutdown from closing admission; once it is done the database reads unlocked.
+    #[test]
+    fn admitted_unlock_blocks_close_if_locked() {
+        let w = world();
+        let reached = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let (r, go) = (reached.clone(), release.clone());
+        *w.engine.hook.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == "unlock_admitted" {
+                r.store(true, Ordering::SeqCst);
+                while !go.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }));
+        let unlock = in_thread(&w, |e| {
+            e.dispatch(Request::SecretsUnlock(Unlock {
+                password: SecretValue::new(PASSWORD.into()),
+                key_file: None,
+                forget_key_file: false,
+                create: true,
+            }))
+            .map(|_| ())
+        });
+        wait_for(&reached);
+        // Locked flag, free vault mutex: only the admission count tells.
+        assert!(!w.engine.unlocked.load(Ordering::SeqCst));
+        assert!(w.engine.is_unlocked());
+        assert!(
+            !w.engine.close_if_locked(),
+            "closed admission under an admitted unlock"
+        );
+        // Admission stays open.
+        w.call(Request::SecretsStatus).unwrap();
+        release.store(true, Ordering::SeqCst);
+        unlock.join().unwrap().unwrap();
+        assert!(w.engine.is_unlocked());
+        assert!(!w.engine.close_if_locked());
+        // Locked and idle: it closes, and refuses new work; reopening admits again.
+        w.call(Request::SecretsLock).unwrap();
+        assert!(!w.engine.is_unlocked());
+        assert!(w.engine.close_if_locked());
+        let e = w.call(Request::SecretsStatus).unwrap_err();
+        assert_eq!(e.details["reason"], "stopping");
+        w.engine.reopen_admission();
+        w.call(Request::SecretsStatus).unwrap();
     }
 
     #[test]

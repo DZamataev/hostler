@@ -200,7 +200,7 @@ what to do: the `recovery` command where the code has one, otherwise the human s
 | `not_in_project` | The directory is not a usable git checkout: not inside one, its `.git`/`commondir` does not resolve, or its path is not valid UTF-8. | run from the project |
 | `config_invalid` | `hostler.toml` has a problem; the message names the line, never a value. | fix the reported line |
 | `service_unavailable` | The service could not be reached or started. | `hostler service start` |
-| `contract_mismatch` | The running service speaks another contract version. | `hostler service restart` |
+| `contract_mismatch` | The running service speaks another contract version. | `hostler service start` (replaces an idle, locked older service), or the newer binary the error names |
 | `internal` | An unexpected hostler failure, or an import file over 1 MiB or unreadable (fixed text; the path is not repeated). | report it; do not retry blindly |
 
 Errors never contain a value, the master password or key-file bytes.

@@ -339,7 +339,8 @@ pub(crate) async fn ready_device(
     };
     // Its own connection: the service answers one connection's requests in order, so the
     // release after a Ctrl+C must not queue behind the boot (P3bT7-2).
-    let paths = Paths::resolve().map_err(|e| NotReady::Refused(internal(format!("{e:#}"))))?;
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths().map_err(NotReady::Refused)?;
     let mut booting = Client::connect(&paths).await.map_err(NotReady::Refused)?;
     let booted = tokio::select! {
         biased;
@@ -622,6 +623,8 @@ impl Claims {
             .unwrap_or_else(|| TokioInstant::now() + RETRY_BUDGET);
         loop {
             match tokio::time::timeout_at(deadline, self.client.call(request.clone())).await {
+                // Never retried (P4 R1-3).
+                Ok(Err(e)) if crate::client::is_sandbox_denied(&e) => return Err(e),
                 Ok(Err(e)) if e.code == ErrorCode::ServiceUnavailable => {
                     if self.ending && self.end_by.is_none() {
                         eprintln!(
@@ -645,10 +648,11 @@ impl Claims {
                 }
             }
             tokio::time::sleep(RETRY_PAUSE).await;
-            if let Ok(Ok(client)) =
-                tokio::time::timeout_at(deadline, Client::connect(&self.paths)).await
-            {
-                self.client = client;
+            match tokio::time::timeout_at(deadline, Client::connect(&self.paths)).await {
+                Ok(Ok(client)) => self.client = client,
+                // A reconnect the sandbox denies ends the retries at once (P4 R1-3).
+                Ok(Err(e)) if crate::client::is_sandbox_denied(&e) => return Err(e),
+                _ => {}
             }
         }
     }
@@ -892,21 +896,23 @@ pub(crate) async fn main(args: RunArgs, max_wait: Option<Duration>) -> i32 {
         Ok(current) => current,
         Err(e) => return refuse(&e),
     };
-    let paths = match Paths::resolve() {
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = match crate::client::resolve_paths() {
         Ok(paths) => paths,
-        Err(e) => return refuse(&internal(format!("{e:#}"))),
-    };
-    let mut client = match Client::connect_or_start(&paths, &OsManager).await {
-        Ok(client) => client,
         Err(e) => return refuse(&e),
     };
+    let mut client =
+        match Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START).await {
+            Ok(client) => client,
+            Err(e) => return refuse(&e),
+        };
     let workspace = match workspace::resolve(&mut client, &current).await {
         Ok(workspace) => workspace,
         Err(e) => return refuse(&e),
     };
     let requester = match spawn::process_table().and_then(|t| current_identity(&t)) {
         Ok(requester) => requester,
-        Err(e) => return refuse(&internal(format!("{e:#}"))),
+        Err(e) => return refuse(&crate::client::process_error(&e)),
     };
     // 1b. The device: a name must be registered; its alias is the --confirmation token.
     let device = match &device_arg {
@@ -1373,11 +1379,11 @@ async fn heavy_slot(
     let mut heavy = match Heavy::prepare(id, kind, display, no_wait) {
         Ok(heavy) => heavy,
         Err(e) => {
-            run::warn_unavailable(&format!("{e:#}"));
+            run::warn_fail_open(&e);
             return Ok((None, signals));
         }
     };
-    match Client::connect_or_start(&heavy.paths, &OsManager).await {
+    match Client::connect_or_start(&heavy.paths, &OsManager, crate::cli::REPLACE_ON_START).await {
         Ok(client) => heavy.client = Some(client),
         Err(e) => {
             run::warn_fail_open(&e);

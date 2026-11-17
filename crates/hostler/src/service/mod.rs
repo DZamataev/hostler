@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, watch};
 use crate::bridge::looky::{LookyHeavy, RefreshedLooky};
 use crate::claims::engine::ClaimsEngine;
 use crate::claims::{ForeignClaimSource, ResourceCatalog, ScreenCatalog};
-use crate::client::Client;
+use crate::contract::heavy::ServiceStatus;
 use crate::contract::wire::Request;
 use crate::contract::{ErrorCode, HostlerError};
 use crate::devices::agent_device::AgentDeviceSource;
@@ -121,12 +121,22 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
             recovery.preserved
         );
     }
-    let swept = crate::secrets::rundir::sweep(&paths.runs);
+    let sys_table = SysProcessTable::new().context("cannot read the boot id")?;
+    // The service runs outside any agent sandbox and must know its boot: an identity a
+    // sandboxed client sends without one is completed with it (P4 Task 9 F-1).
+    anyhow::ensure!(
+        sys_table.boot_id_known(),
+        "the hostler service may not read this machine's boot id; it cannot run here (inside \
+         an agent sandbox?)"
+    );
+    crate::procs::set_local_boot_id(&sys_table.boot_id());
+    // Review f1-r1: the run-directory sweep judges stored owners with this table's real boot id,
+    // after the local boot id is known.
+    let swept = crate::secrets::rundir::sweep_with_table(&paths.runs, &sys_table);
     if swept > 0 {
         tracing::info!("removed {swept} leftover secret run director(ies)");
     }
-    let table: Arc<dyn ProcessTable> =
-        Arc::new(SysProcessTable::new().context("cannot read the boot id")?);
+    let table: Arc<dyn ProcessTable> = Arc::new(sys_table);
     // L58 (debug builds): a service a test started stops once its test process is gone, even
     // when a killed run never reached the test's own stop guard. The initial receiver stays
     // alive: a stop sent before `serve` subscribes must still be a stored value.
@@ -325,8 +335,11 @@ pub const STOP_WAIT: Duration = Duration::from_secs(40);
 
 /// Why a running service was not stopped.
 pub enum StopRefused {
-    /// `if_idle` and heavy entries run: `details.running` lists them.
+    /// The service answered `ServiceBusy`: heavy entries, leases or a takeover (`details.running`,
+    /// `leases`, `plans`), or an unlocked database for an automatic rule (`details.secrets`).
     Busy(HostlerError),
+    /// `may_stop` refused before anything was sent (an automatic rule only).
+    NotStopped(lifecycle::StopRefusal),
     Failed(HostlerError),
 }
 
@@ -339,29 +352,44 @@ fn stop_failed(message: String) -> StopRefused {
     })
 }
 
-/// Asks the running service to stop (refused while heavy entries run unless `force`) and waits
-/// until it has released its lock. `Ok(false)` when no service was running.
-pub async fn stop_service(paths: &Paths, force: bool) -> Result<bool, StopRefused> {
-    let Stopping::Accepted { process } = request_stop(paths, force).await? else {
+/// Stops the running service under `rule` (probe → `may_stop` → `service.shutdown`) and waits
+/// until it has released its lock and exited, up to `STOP_WAIT`. `Ok(false)` when no service
+/// was running. `registration` matters only to `Automatic(Maintain)`.
+pub async fn stop_service(
+    paths: &Paths,
+    rule: lifecycle::StopRule,
+    registration: manager::RegistrationState,
+) -> Result<bool, StopRefused> {
+    let Stopping::Accepted { process, .. } = request_stop(paths, rule, registration).await? else {
         return Ok(false);
     };
-    let deadline = Instant::now() + STOP_WAIT;
-    // Gone means: lock released and process exited. An OS manager asked to start the service
-    // right after would otherwise still see the old job running and do nothing.
+    wait_gone(paths, process.as_ref(), STOP_WAIT).await?;
+    Ok(true)
+}
+
+/// Waits until the service that accepted a stop is gone: lock released and process exited.
+/// An OS manager asked to start the service right after would otherwise still see the old job
+/// running and do nothing.
+pub async fn wait_gone(
+    paths: &Paths,
+    process: Option<&ProcessIdentity>,
+    limit: Duration,
+) -> Result<(), StopRefused> {
+    let deadline = Instant::now() + limit;
     let table = SysProcessTable::new().ok();
     loop {
-        let exited = match (&process, &table) {
+        let exited = match (process, &table) {
             (Some(id), Some(table)) => procs::liveness(id, table) != procs::Liveness::Alive,
             _ => true,
         };
         match lock::is_held(&paths.service_lock) {
-            Ok(false) if exited => return Ok(true),
+            Ok(false) if exited => return Ok(()),
             Ok(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             Ok(_) => {
                 return Err(stop_failed(format!(
-                    "the service accepted the stop but still runs after {STOP_WAIT:?}"
+                    "the service accepted the stop but still runs after {limit:?}"
                 )));
             }
             Err(e) => return Err(stop_failed(format!("{e:#}"))),
@@ -372,38 +400,59 @@ pub async fn stop_service(paths: &Paths, force: bool) -> Result<bool, StopRefuse
 /// What a stop request found.
 pub enum Stopping {
     NotRunning,
-    /// The service accepted the stop; `process` is its identity when it could be read.
+    /// The service accepted the stop; `process` is its identity when it could be read, and
+    /// `status` what it reported just before.
     Accepted {
         process: Option<ProcessIdentity>,
+        status: Box<ServiceStatus>,
     },
 }
 
-/// Sends `service.shutdown { if_idle: !force }` without waiting for the exit.
-pub async fn request_stop(paths: &Paths, force: bool) -> Result<Stopping, StopRefused> {
-    let mut client = match Client::connect_lifecycle(paths).await {
-        Ok(client) => client,
-        Err(e) if e.details["reason"] == "not_running" => return Ok(Stopping::NotRunning),
-        Err(e) => return Err(StopRefused::Failed(e)),
-    };
+/// The one way any path stops a service (plan P4 R2-2), without waiting for the exit: on one
+/// lifecycle connection, `service.status` (the probe), then `lifecycle::may_stop(rule, …)`, then
+/// `service.shutdown` with the rule's fields: `Explicit { force }` sends `if_idle: !force,
+/// refuse_if_unlocked: false`; every `Automatic` rule sends `if_idle: true, refuse_if_unlocked:
+/// true`, which the service re-checks atomically under its engine locks. The stop reaches the
+/// very service that was probed. A `ServiceBusy` is a refusal, never retried with less.
+pub async fn request_stop(
+    paths: &Paths,
+    rule: lifecycle::StopRule,
+    registration: manager::RegistrationState,
+) -> Result<Stopping, StopRefused> {
     // `service.status` is frozen, so this works against any service version; a service that
     // cannot answer it cannot accept a shutdown either.
-    let status = client
-        .call(Request::ServiceStatus)
-        .await
-        .map_err(StopRefused::Failed)?;
-    let process = status["pid"]
-        .as_u64()
-        .and_then(|pid| u32::try_from(pid).ok())
-        .and_then(|pid| procs::identity_of(&SysProcessTable::new().ok()?, pid));
+    let (mut client, status) = match lifecycle::probe_connection(paths).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(Stopping::NotRunning),
+        Err(e) => return Err(StopRefused::Failed(e)),
+    };
+    let probe = lifecycle::Probe::Running {
+        contract: status.contract_version,
+        version: status.service_version.clone(),
+        secrets_unlocked: status.secrets_unlocked,
+        pid: status.pid,
+    };
+    lifecycle::may_stop(rule, lifecycle::this_client(), &probe, registration)
+        .map_err(StopRefused::NotStopped)?;
+    let process = SysProcessTable::new()
+        .ok()
+        .and_then(|table| procs::identity_of(&table, status.pid));
+    let (if_idle, refuse_if_unlocked) = rule.shutdown_fields();
     match client
-        .call(Request::ServiceShutdown { if_idle: !force })
+        .call(Request::ServiceShutdown {
+            if_idle,
+            refuse_if_unlocked,
+        })
         .await
     {
         Ok(_) => {}
         Err(e) if e.code == ErrorCode::ServiceBusy => return Err(StopRefused::Busy(e)),
         Err(e) => return Err(StopRefused::Failed(e)),
     }
-    Ok(Stopping::Accepted { process })
+    Ok(Stopping::Accepted {
+        process,
+        status: Box::new(status),
+    })
 }
 
 #[cfg(all(test, debug_assertions))]

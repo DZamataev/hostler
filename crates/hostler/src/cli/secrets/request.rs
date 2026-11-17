@@ -164,12 +164,13 @@ async fn request(name: String, reason: String, max_wait: Option<Duration>, json:
     let _ = stop.now().await;
     let waiter = (|| {
         let project = current_project()?;
-        let paths = Paths::resolve().map_err(|e| internal(format!("{e:#}")))?;
+        // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+        let paths = crate::client::resolve_paths()?;
         // Before the request names this process (W-3: a non-elevated service on Windows must be
         // able to judge an elevated requester's liveness).
         spawn::let_service_observe_self();
-        let table = spawn::process_table().map_err(|e| internal(format!("{e:#}")))?;
-        let requester = current_identity(&table).map_err(|e| internal(format!("{e:#}")))?;
+        let table = spawn::process_table().map_err(|e| crate::client::process_error(&e))?;
+        let requester = current_identity(&table).map_err(|e| crate::client::process_error(&e))?;
         Ok::<_, HostlerError>(Waiter {
             paths,
             client: None,
@@ -380,7 +381,8 @@ struct Waiter {
 impl Waiter {
     /// The first `secret.request`: one connection (the service started if needed), no retry.
     async fn first(&mut self) -> Result<SecretRequestInfo, HostlerError> {
-        let client = Client::connect_or_start(&self.paths, &OsManager).await?;
+        let client =
+            Client::connect_or_start(&self.paths, &OsManager, crate::cli::REPLACE_ON_START).await?;
         let client = self.client.insert(client);
         decode(
             client
@@ -439,6 +441,8 @@ impl Waiter {
                 None => Some(attempt.await),
             };
             match result {
+                // Never retried (P4 R1-3).
+                Some(Err(e)) if crate::client::is_sandbox_denied(&e) => return Err(e),
                 Some(Err(e)) if e.code == ErrorCode::ServiceUnavailable => last = Some(e),
                 Some(result) => return result.and_then(decode),
                 None => {}

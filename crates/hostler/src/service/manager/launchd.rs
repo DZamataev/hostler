@@ -8,6 +8,10 @@ use super::xml_escape;
 
 pub const LABEL: &str = "io.github.dzamataev.hostler";
 
+/// `ProcessType` is `Interactive`: the service is on agents' request path, and the emulators
+/// and adb server it starts are part of its launchd job. Unset (or `Standard`) applies "light
+/// resource limits … throttling its CPU usage and I/O bandwidth" (`man launchd.plist`);
+/// `Interactive` has "the same resource limitations as apps, that is to say, none" (P4 call 15).
 pub fn render_definition(exe: &Path, paths: &Paths) -> String {
     let exe = xml_escape(&exe.display().to_string());
     let stdout = xml_escape(&paths.log_dir.join("service.out").display().to_string());
@@ -27,6 +31,8 @@ pub fn render_definition(exe: &Path, paths: &Paths) -> String {
     <string>run</string>
     <string>--managed</string>
   </array>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>RunAtLoad</key>
   <true/>
   <key>ThrottleInterval</key>
@@ -46,9 +52,39 @@ pub fn render_definition(exe: &Path, paths: &Paths) -> String {
     )
 }
 
-/// A plist from before `--managed` starts a service that steps aside.
+/// A plist from before `--managed` starts a service that steps aside; one from before P4 has
+/// no `ProcessType` `Interactive`, so launchd throttles the service and what it starts.
 pub fn definition_is_current(plist: &str) -> bool {
     plist.contains("<string>--managed</string>")
+        && value_after_key(plist, "ProcessType")
+            .is_some_and(|value| value == "<string>Interactive</string>")
+}
+
+/// The element right after `<key>{key}</key>`, whitespace trimmed.
+fn value_after_key<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("<key>{key}</key>");
+    let rest = plist[plist.find(&marker)? + marker.len()..].trim_start();
+    let end = rest.find('>')? + 1;
+    let element = &rest[..end];
+    if element.ends_with("/>") {
+        return Some(element);
+    }
+    let name = element.trim_start_matches('<').trim_end_matches('>');
+    let close = format!("</{name}>");
+    Some(&rest[..rest.find(&close)? + close.len()])
+}
+
+/// `ProgramArguments[0]` of a plist (R1-10), XML-unescaped.
+pub fn exe_from_plist(plist: &str) -> Option<std::path::PathBuf> {
+    let array = value_after_key(plist, "ProgramArguments")?;
+    let first = array.split_once("<string>")?.1.split_once("</string>")?.0;
+    let exe = super::xml_unescape(first);
+    (!exe.trim().is_empty()).then(|| exe.into())
+}
+
+#[cfg(target_os = "macos")]
+pub fn registered_exe() -> Option<std::path::PathBuf> {
+    exe_from_plist(&std::fs::read_to_string(plist_path()?).ok()?)
 }
 
 #[cfg(target_os = "macos")]
@@ -83,10 +119,11 @@ fn current_uid() -> u32 {
 fn launchctl(args: &[&str]) -> anyhow::Result<super::CommandOutcome> {
     use anyhow::Context;
 
-    let output = std::process::Command::new("launchctl")
-        .args(args)
-        .output()
-        .context("cannot run launchctl")?;
+    let output = super::output_within(
+        std::process::Command::new("launchctl").args(args),
+        super::MANAGER_CALL_TIMEOUT,
+    )
+    .context("cannot run launchctl")?;
     Ok(super::CommandOutcome::from_output(output))
 }
 

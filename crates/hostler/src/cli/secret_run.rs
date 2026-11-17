@@ -182,8 +182,9 @@ pub async fn setup(
     let specs = specs(secrets, files)?;
     let cwd = std::env::current_dir().map_err(|e| refused(internal(format!("no cwd: {e}"))))?;
     let current = crate::cli::secrets::current_at(&cwd).map_err(refused)?;
-    let paths = Paths::resolve().map_err(|e| refused(internal(format!("{e:#}"))))?;
-    let mut client = Client::connect_or_start(&paths, &OsManager)
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths().map_err(refused)?;
+    let mut client = Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START)
         .await
         .map_err(refused)?;
     setup_in(&specs, &current, &paths, run_id, display, &mut client).await

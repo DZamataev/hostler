@@ -1,0 +1,36 @@
+# ~/.codex/rules/hostler.rules  (or <trusted project>/.codex/rules/hostler.rules)
+prefix_rule(
+    pattern = ["hostler", ["status", "release", "workspace", "guide", "init", "doctor"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", "hold", ["screen", "account", "device", "renew"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", "devices", ["list", "show", "installs", "tools"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", "service", ["status", "start"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", "queue", ["history", "--json"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", "secret", ["status", "list", "request", "requests"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
+prefix_rule(
+    pattern = ["hostler", ["account", "project"], "list"],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)

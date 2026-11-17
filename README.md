@@ -5,7 +5,7 @@ compete for things it has only one of — CPU during a native build, a test phon
 test account. hostler hands those resources out in turn instead of letting the agents race.
 
 **Status: pre-release.** The machine-wide heavy queue, per-project secrets, claims on the screen,
-test accounts and devices (P3b-1: Android everywhere, iOS on macOS) are implemented. The desktop
+test accounts and devices (Android everywhere, iOS on macOS) are implemented. The desktop
 app follows.
 
 ## Install from source
@@ -15,6 +15,21 @@ cargo install --path crates/hostler
 ```
 
 The binary is `hostler`; it needs no daemon setup — clients start the per-user service on demand.
+
+## Set a project up
+
+```sh
+hostler init              # preview: toolchain, app ids, the proposed hostler.toml, the steps
+hostler init --write      # write hostler.toml (only when absent) and the agent-docs block
+hostler doctor            # every check with its fix; --fix applies the safe ones
+```
+
+`hostler init` never rewrites an existing `hostler.toml`, never writes a user-level agent config
+and never commits; it prints the person-only steps (approve the project, unlock the database,
+import an env file, set an account) instead of running them, and places one marked block
+(`<!-- hostler:begin -->` … `<!-- hostler:end -->`) in the project's agent docs. `hostler doctor`
+exits 0 when no problem remains, 1 when one does, and 78 when it cannot run. `hostler guide init`
+and `hostler guide doctor` are the full detail.
 
 ## Heavy queue
 
@@ -170,9 +185,21 @@ hostler service install | uninstall   # register with launchd / systemd / Task S
 
 `stop`, `restart`, `install` and `uninstall` refuse while heavy tasks or claim runs run, or a
 takeover is in progress, unless `--force`. An agent uses --force only with the operator's explicit
-permission. After upgrading the binary, run `hostler service restart` so the service matches the
-CLI's contract. A service hostler starts itself gets a clean environment (never a run's injected
+permission. A service hostler starts itself gets a clean environment (never a run's injected
 values), and `HOSTLER_HOME` must be an absolute path (a relative one is refused).
+
+After upgrading the binary, `hostler service start` replaces an older service that has no live
+work and a locked secrets database; an older client never stops a newer service, and a stop or a
+restart locks the database (a person runs `hostler unlock` after it). `hostler doctor` names the
+side that is old.
+
+## Agent sandboxes
+
+The service runs outside any agent's sandbox; a sandboxed agent needs the socket. In Claude Code,
+add `sandbox.network.allowUnixSockets: ["<socket path>"]` to the settings; in Codex, install the
+rule file `hostler guide sandbox` prints — Codex's `.rules` exec policy runs a matched
+`hostler …` command outside the sandbox. A denial is `sandbox_denied`, never "not running", and
+hostler starts nothing; a sandboxed `hostler run --heavy` then runs unqueued after one warning.
 
 All read commands accept `--json` and print the contract's `Envelope`.
 

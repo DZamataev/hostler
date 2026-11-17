@@ -21,7 +21,6 @@ use crate::contract::claims::{
 use crate::contract::wire::{Event, Request};
 use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::{Clock, SystemClock};
-use crate::paths::Paths;
 use crate::secrets::sanitize_for_terminal;
 
 /// The default wait of a claim command when none is given (D7).
@@ -499,6 +498,10 @@ async fn wait_queued(
                 Ok(other) => return Ok(other),
                 Err(e) => return Err(Gave::Failed(e)),
             },
+            // A sandbox denies every attempt alike: no reconnect (P4 R2-1).
+            Raced::Done(Err(e)) if crate::client::is_sandbox_denied(&e) => {
+                return Err(Gave::Failed(e));
+            }
             Raced::Done(Err(e)) if e.code == ErrorCode::ServiceUnavailable => {
                 match stop.race(io.reconnect(RECONNECT_BUDGET)).await {
                     Raced::Stopped(stopped) => return Err(give_up(io, req, stopped).await),
@@ -600,12 +603,7 @@ impl ClaimsIo for Live<'_> {
 
     /// A fresh connection to the running service; never starts one (the request is in the store).
     async fn reconnect(&mut self, within: Duration) -> Result<(), HostlerError> {
-        let paths = Paths::resolve().map_err(|e| HostlerError {
-            code: ErrorCode::Internal,
-            message: format!("{e:#}"),
-            details: serde_json::json!({}),
-            recovery: None,
-        })?;
+        let paths = crate::client::resolve_paths()?;
         let deadline = TokioInstant::now() + within;
         loop {
             match Client::connect(&paths).await {
@@ -613,6 +611,8 @@ impl ClaimsIo for Live<'_> {
                     *self.client = client;
                     return Ok(());
                 }
+                // Never retried (P4 R1-3).
+                Err(e) if crate::client::is_sandbox_denied(&e) => return Err(e),
                 Err(e) => {
                     if TokioInstant::now() + RETRY_PAUSE >= deadline {
                         return Err(e);
@@ -1258,6 +1258,67 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(stop.wait().await, Stopped::TimedOut);
+    }
+
+    /// One claims event, then silence; counts reconnects.
+    struct DeniedAttachIo {
+        answers: VecDeque<Result<Value, HostlerError>>,
+        seen: Vec<Request>,
+        event: Option<Event>,
+        reconnects: usize,
+    }
+
+    impl ClaimsIo for DeniedAttachIo {
+        async fn call(&mut self, request: Request) -> Result<Value, HostlerError> {
+            self.seen.push(request);
+            self.answers.pop_front().expect("an answer for every call")
+        }
+
+        async fn next_event(&mut self) -> Option<Event> {
+            match self.event.take() {
+                Some(event) => Some(event),
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn reconnect(&mut self, _within: Duration) -> Result<(), HostlerError> {
+            self.reconnects += 1;
+            Ok(())
+        }
+    }
+
+    /// P4 R2-1: an attach the sandbox denies ends the wait at once: no reconnect, no re-attach.
+    #[tokio::test]
+    async fn a_denied_attach_makes_no_reconnect() {
+        let socket = crate::paths::SocketName::File("/tmp/x/hostler.sock".into());
+        let denied = crate::client::sandbox_denied(
+            &socket,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let mut io = DeniedAttachIo {
+            answers: vec![Ok(queued()), Err(denied)].into(),
+            seen: Vec::new(),
+            event: Some(Event::ClaimsChanged(
+                crate::contract::claims::fixtures::snapshot(),
+            )),
+            reconnects: 0,
+        };
+        let req = crate::contract::claims::fixtures::request();
+        let mut stop = Stop {
+            since: Instant::now(),
+            max_wait: Some(Duration::from_secs(60)),
+            signals: None,
+        };
+        let gave = run(&mut io, &req, &SCREEN, &mut stop, false)
+            .await
+            .unwrap_err();
+        match gave {
+            Gave::Failed(e) => assert_eq!(e.details["reason"], "sandbox_denied", "{e:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(io.reconnects, 0, "a sandbox denial was retried");
+        assert_eq!(io.seen.len(), 2, "{:?}", io.seen);
+        assert!(matches!(io.seen[1], Request::ClaimsAttach { .. }));
     }
 
     #[tokio::test]

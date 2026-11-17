@@ -150,6 +150,14 @@ fn start(env: &[(&str, &str)], stdin_tty: bool, drain: bool) -> Session {
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         command.pre_exec(move || {
+            // A test run started as a `&` shell job inherits SIGINT and SIGQUIT ignored, and
+            // an ignored signal stays ignored across exec: the probe would never die of the
+            // Ctrl-C these tests type. Every child starts with the default dispositions.
+            for sig in [libc::SIGINT, libc::SIGQUIT] {
+                if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             if libc::setsid() == -1 || libc::ioctl(tty, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -370,6 +378,32 @@ fn pty_ctrl_d_on_empty_input_is_no_value() {
 #[test]
 fn pty_ctrl_c_restores_the_terminal() {
     let mut s = spawn(&[], true);
+    s.wait_for_prompt();
+    s.type_bytes([b"ab".as_slice(), &[s.key(libc::VINTR)]].concat());
+    let status = s.wait(Duration::from_secs(5));
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    s.assert_restored();
+}
+
+/// Carry-over "tty_pty under an inherited `SIG_IGN`": with SIGINT ignored in this test process
+/// (as in a `&` shell job), the probe still dies of the Ctrl-C typed at its terminal, because
+/// `start` resets the disposition in every child.
+#[test]
+fn pty_child_dies_of_sigint_when_the_parent_ignores_it() {
+    struct Restore(libc::sighandler_t);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: puts back the disposition `signal` returned below.
+            unsafe { libc::signal(libc::SIGINT, self.0) };
+        }
+    }
+    let mut s = {
+        // SAFETY: SIG_IGN is a valid disposition; it is restored right after the spawn.
+        let previous = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        assert_ne!(previous, libc::SIG_ERR);
+        let _restore = Restore(previous);
+        spawn(&[], true)
+    };
     s.wait_for_prompt();
     s.type_bytes([b"ab".as_slice(), &[s.key(libc::VINTR)]].concat());
     let status = s.wait(Duration::from_secs(5));

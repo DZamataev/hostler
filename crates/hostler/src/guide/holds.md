@@ -201,7 +201,7 @@ The takeover stops **every** live process that uses the resource for the holding
 - each of its leases, joined runs included (the run's process group, or its wrapper when no child
   has registered yet);
 - a process-bound hold's bound process;
-- a stoppable foreign claim, through its own stopper (P3b: an agent-device session);
+- a stoppable foreign claim, through its own stopper (an agent-device session);
 - every nested run — on any resource, heavy entries included — whose holder descends from one of
   those (a nested run has its own process group, so the outer group's signal would miss it).
 
@@ -298,9 +298,9 @@ only by the service. Claims belong to that id, so they survive a restart and a `
   repaired (`git worktree repair`).
 - A **moved** main checkout keeps its id, and its project follows it: the approval and the KeePass
   group link stay. A different repository at the old path is a new, unapproved project.
-- A project created before P3a has no stored filesystem identity yet; it gets one at its next
-  resolve. Until then it binds to whatever directory sits at its recorded path at the first command
-  after the upgrade — move a repository before running anything in its old place.
+- A project created by an older hostler may have no stored filesystem identity yet; it gets one
+  at its next resolve. Until then it binds to whatever directory sits at its recorded path at the
+  first command after the upgrade — move a repository before running anything in its old place.
 
 `hostler workspace` prints this checkout's id, path and project; `hostler workspace list` prints
 every recorded workspace; `hostler status` includes this checkout's id and path when it is
@@ -348,7 +348,7 @@ command where the code has one, otherwise the human step.
 | `queue_busy` | A `hold --no-wait` that could not get the resource, or 512 claims and waiting requests live on this machine. | `hostler status`; wait or release some |
 | `withdrawn` | The request was withdrawn by an operator, or interrupted. | — |
 | `bad_request` | A usage problem (a bad `--confirmation`, `--while-pid`, `--distinct` on a claim you hold). | fix the call |
-| `contract_mismatch` | The running service speaks another contract version. | `hostler service restart` |
+| `contract_mismatch` | The running service speaks another contract version. | `hostler service start` (replaces an idle, locked older service), or the newer binary the error names |
 
 ## JSON
 

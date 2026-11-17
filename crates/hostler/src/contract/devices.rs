@@ -1,6 +1,7 @@
 //! Contract types of devices: inventory, telemetry, installs, tools (plan P3b, Task 1).
 //!
-//! Every type here is part of contract v4; P4 (MCP) and P5 (the app) read them as they are.
+//! Every type here is part of contract v4; the CLI's `--json` and a future app read them as they
+//! are.
 
 use std::collections::BTreeMap;
 

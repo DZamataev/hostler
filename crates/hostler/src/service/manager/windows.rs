@@ -74,6 +74,33 @@ pub fn definition_is_current(xml: &str) -> bool {
         && arguments.trim_end().ends_with(" service run --managed")
 }
 
+/// The hostler path in a task's `<Arguments>` (R1-10), never `<Command>` (conhost): unescaped,
+/// `--headless` stripped, then the token in double quotes, or else (unquoted) everything up to
+/// ` service run --managed`. Pure, so it is tested on every OS.
+pub fn exe_from_arguments(arguments: &str) -> Option<std::path::PathBuf> {
+    let arguments = super::xml_unescape(arguments);
+    let rest = arguments.trim();
+    let rest = rest.strip_prefix("--headless").unwrap_or(rest).trim_start();
+    let exe = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"')?.0,
+        None => rest.strip_suffix(" service run --managed")?.trim(),
+    };
+    (!exe.is_empty()).then(|| exe.into())
+}
+
+#[cfg(windows)]
+pub fn registered_exe() -> Option<std::path::PathBuf> {
+    let output = super::output_within(
+        std::process::Command::new("schtasks").args(["/Query", "/TN", TASK_NAME, "/XML"]),
+        super::MANAGER_CALL_TIMEOUT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    exe_from_arguments(element(&decode_query_output(&output.stdout), "Arguments")?)
+}
+
 /// The text of the first `<tag>…</tag>` in `xml`.
 fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
@@ -105,10 +132,10 @@ fn decode_query_output(bytes: &[u8]) -> String {
 pub fn registration() -> super::RegistrationState {
     use super::RegistrationState;
 
-    let output = match std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME, "/XML"])
-        .output()
-    {
+    let output = match super::output_within(
+        std::process::Command::new("schtasks").args(["/Query", "/TN", TASK_NAME, "/XML"]),
+        super::MANAGER_CALL_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(_) => return RegistrationState::Unknown,
     };
@@ -169,10 +196,11 @@ fn write_task_xml(path: &Path, xml: &str) -> std::io::Result<()> {
 fn schtasks(args: &[&str]) -> anyhow::Result<super::CommandOutcome> {
     use anyhow::Context;
 
-    let output = std::process::Command::new("schtasks")
-        .args(args)
-        .output()
-        .context("cannot run schtasks")?;
+    let output = super::output_within(
+        std::process::Command::new("schtasks").args(args),
+        super::MANAGER_CALL_TIMEOUT,
+    )
+    .context("cannot run schtasks")?;
     Ok(super::CommandOutcome::from_output(output))
 }
 

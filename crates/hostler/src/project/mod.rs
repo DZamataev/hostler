@@ -162,7 +162,7 @@ pub fn current(cwd: &Path) -> Result<Current, HostlerError> {
     check_lossless(&checkout.common_dir)?;
     check_lossless(&checkout.workspace_root)?;
     let config = config::load(&checkout.workspace_root)?;
-    warn_unknown_tables(config.as_ref());
+    warn_reserved(config.as_ref());
     let name = config
         .as_ref()
         .and_then(|config| config.name.clone())
@@ -178,20 +178,24 @@ pub fn current(cwd: &Path) -> Result<Current, HostlerError> {
     })
 }
 
-/// D5: unknown top-level tables are kept for later versions; tell a person once per command.
-fn warn_unknown_tables(config: Option<&config::ProjectConfig>) {
+/// `[ranges]` is stage 2 (L73: nothing to be compatible with); tell a person once per command.
+fn warn_reserved(config: Option<&config::ProjectConfig>) {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    let Some(config) = config else {
-        return;
-    };
-    if config.unknown_tables.is_empty() || WARNED.swap(true, Ordering::Relaxed) {
-        return;
+    if let Some(note) = reserve_note(config, &WARNED) {
+        eprintln!("{note}");
     }
-    for table in &config.unknown_tables {
-        eprintln!(
-            "[hostler] hostler.toml: [{}] is not used by this hostler version",
-            crate::secrets::sanitize_for_terminal(table)
-        );
+}
+
+/// The note itself: at most one line per process, whatever `current()` was called for.
+fn reserve_note(
+    config: Option<&config::ProjectConfig>,
+    warned: &AtomicBool,
+) -> Option<&'static str> {
+    let reserved = config.is_some_and(|config| config.ranges_present);
+    if reserved && !warned.swap(true, Ordering::Relaxed) {
+        Some("[hostler] hostler.toml: [ranges] is reserved for a later hostler version")
+    } else {
+        None
     }
 }
 
@@ -310,5 +314,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let error = find_checkout(&dir.path().join("missing")).unwrap_err();
         assert_eq!(error.code, ErrorCode::NotInProject);
+    }
+
+    /// The `[ranges]` note: once per process, and only for a config that holds the table.
+    #[test]
+    fn ranges_is_reserved_and_warned_once() {
+        let mut config = config::ProjectConfig::default();
+        let warned = AtomicBool::new(false);
+        // A config without `[ranges]` never notes it, and does not use up the one note.
+        assert_eq!(reserve_note(Some(&config), &warned), None);
+        assert_eq!(reserve_note(None, &warned), None);
+        assert!(!warned.load(Ordering::Relaxed));
+
+        config.ranges_present = true;
+        assert_eq!(
+            reserve_note(Some(&config), &warned),
+            Some("[hostler] hostler.toml: [ranges] is reserved for a later hostler version")
+        );
+        assert_eq!(reserve_note(Some(&config), &warned), None);
     }
 }

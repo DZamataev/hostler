@@ -66,6 +66,36 @@ pub fn definition_is_current(unit: &str) -> bool {
     })
 }
 
+/// `ExecStart`'s first word (R1-10): unquotes a leading `"…"` (with `\\` and `\"`) and turns
+/// `%%` back into `%`, undoing `quote_exec`.
+pub fn exe_from_unit(unit: &str) -> Option<std::path::PathBuf> {
+    let line = unit
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("ExecStart="))?
+        .trim_start();
+    let word = if let Some(quoted) = line.strip_prefix('"') {
+        let mut word = String::new();
+        let mut chars = quoted.chars();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => word.push(chars.next()?),
+                c => word.push(c),
+            }
+        }
+        word
+    } else {
+        line.split_whitespace().next()?.to_owned()
+    };
+    let word = word.replace("%%", "%");
+    (!word.is_empty()).then(|| word.into())
+}
+
+#[cfg(target_os = "linux")]
+pub fn registered_exe() -> Option<std::path::PathBuf> {
+    exe_from_unit(&std::fs::read_to_string(unit_path()?).ok()?)
+}
+
 #[cfg(target_os = "linux")]
 pub fn registration() -> super::RegistrationState {
     super::registration_of_file(unit_path().as_deref(), definition_is_current)
@@ -118,11 +148,13 @@ fn unit_path() -> Option<std::path::PathBuf> {
 fn systemctl(args: &[&str]) -> anyhow::Result<super::CommandOutcome> {
     use anyhow::Context;
 
-    let output = std::process::Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .context("cannot run systemctl --user")?;
+    let output = super::output_within(
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .args(args),
+        super::MANAGER_CALL_TIMEOUT,
+    )
+    .context("cannot run systemctl --user")?;
     Ok(super::CommandOutcome::from_output(output))
 }
 
@@ -130,12 +162,11 @@ fn systemctl(args: &[&str]) -> anyhow::Result<super::CommandOutcome> {
 fn require_user_systemd() -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-        .context(
-            "systemctl --user is unavailable; hostler will keep starting the service directly",
-        )?;
+    let output = super::output_within(
+        std::process::Command::new("systemctl").args(["--user", "show-environment"]),
+        super::MANAGER_CALL_TIMEOUT,
+    )
+    .context("systemctl --user is unavailable; hostler will keep starting the service directly")?;
     anyhow::ensure!(
         output.status.success(),
         "systemctl --user is unavailable (no user systemd instance); \

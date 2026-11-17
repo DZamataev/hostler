@@ -25,7 +25,7 @@ use crate::secrets::layout::{self, AccountLookup};
 use crate::secrets::value::SecretValue;
 
 /// T1-5: one entry's fields become `HOSTLER_ACCOUNT_<FIELD>` variables of a run.
-const MAX_ACCOUNT_FIELDS: usize = 16;
+pub(crate) const MAX_ACCOUNT_FIELDS: usize = 16;
 
 fn check_account_name(name: &str) -> Result<(), HostlerError> {
     if valid_account_name(name) {

@@ -141,7 +141,7 @@ HOSTLER_AGENT_DEVICE_ID    # the adb transport serial or the UDID
 `ANDROID_SERIAL` and the `HOSTLER_DEVICE_*` names are set from a fresh resolve right before the
 spawn, so a USB → Wi-Fi switch during the run is followed. They are reserved: `--secret` and
 `--account` refuse an injection under `ANDROID_SERIAL`, any Android SDK name, or any `HOSTLER_*`
-name (L48).
+name.
 
 ### When the run ends
 
@@ -194,11 +194,12 @@ There are two supported shapes:
    hostler run --device pixel-9 -- agent-device open com.example.app --serial "$ANDROID_SERIAL"
    ```
 
-A live session counts as **your workspace's** use of the device. It never blocks your workspace
-(L50); it blocks every other workspace until it is closed. agent-device lets **one session hold a
-device**, so close yours before another session or an e2e slot needs it. A `--distinct` hold skips a
-device that carries your own session (P2-5); it never joins, and with an exact selector on a device
-your workspace already claims it is refused.
+A live session counts as **your workspace's** use of the device. It never blocks your workspace;
+it blocks every other workspace until it is closed. An agent-device session opened outside hostler
+shows up in hostler's view within about 5 seconds, so hold the device before opening one.
+agent-device lets **one session hold a device**, so close yours before another session or an e2e
+slot needs it. A `--distinct` hold skips a device that carries your own session; it never joins,
+and with an exact selector on a device your workspace already claims it is refused.
 
 At the end of a `run --device`, a release, or an expired or reaped hold, every live session that is
 yours or was first seen inside that claim's window prints:
@@ -215,8 +216,8 @@ cannot be read, or the read is late), the end first prints `agent-device session
 ### After a claim ends
 
 A device claim that has just ended is not granted to **another** workspace until hostler has
-completed a good sessions read that started after the end (L52). Until then the waiting line says
-`checking for agent-device sessions on {alias}`; the ending workspace itself is not delayed (L50).
+completed a good sessions read that started after the end. Until then the waiting line says
+`checking for agent-device sessions on {alias}`; the ending workspace itself is not delayed.
 `--no-wait` on that blocker waits up to one read bound (at most 6 seconds) before answering Busy.
 `--force` cannot end this wait. An agent uses --force only with the operator's explicit permission.
 
@@ -231,8 +232,8 @@ Every seizure is recorded (who, from whom, when).
 
 ### When agent-device cannot run
 
-When `~/.agent-device/device-claims` exists but agent-device cannot be read, hostler fails closed
-(L51, L54): a device that had a live session at the last good read stays blocked, and `devices list`
+When `~/.agent-device/device-claims` exists but agent-device cannot be read, hostler fails closed:
+a device that had a live session at the last good read stays blocked, and `devices list`
 and `hostler status` show `testing in progress: agent-device session {s} in {workspace} (last known
 {age} ago; agent-device status unreadable: {reason})`; a device that had none stays grantable. After
 30 seconds every device grant line and `hostler status` say `agent-device sessions unknown:
@@ -350,7 +351,7 @@ refusal is **78**; a queue outcome **75**; a signal 130/143; a usage error 2.
 | `resource_in_use` | `remove` while the device is claimed or waited for. | `hostler status` |
 | `force_required` | A takeover needs the operator's decision. | the takeover command it prints. An agent uses --force only with the operator's explicit permission. |
 | `service_unavailable` | No service; device claims fail closed. | `hostler service start` |
-| `contract_mismatch` | The service speaks another contract version. | `hostler service restart` |
+| `contract_mismatch` | The running service speaks another contract version. | `hostler service start` (replaces an idle, locked older service), or the newer binary the error names |
 
 Every read has `--json` = the contract's `Envelope<…>`: `devices list` → `DevicesSnapshot`, `show`
 → `DeviceDetail` (including `forgets`), `add`/`rename`/`note` → `DeviceInfo`, `remove` → the
@@ -361,5 +362,5 @@ service's `{removed}` answer, `reserve` → `Claim`, `unreserve` → `()` (data 
 `--force` with `auto` exits 2: there is no alias to confirm, so name the device; `--confirmation` is the device's alias. An agent uses
 --force only with the operator's explicit permission.
 
-The e2e provider (P3b-2) uses `hostler hold device auto:<platform> --distinct --while-parent`; see
+The e2e provider uses `hostler hold device auto:<platform> --distinct --while-parent`; see
 `integrations/e2e/README.md`.

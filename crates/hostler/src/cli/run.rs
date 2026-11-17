@@ -308,7 +308,8 @@ async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
     let mut heavy = match Heavy::prepare(id, kind, &display, args.no_wait) {
         Ok(heavy) => heavy,
         Err(e) => {
-            warn_unavailable(&format!("{e:#}"));
+            // A sandbox that denies the state directories says so, with its fix (P4 R1-2).
+            warn_fail_open(&e);
             return run_unqueued(
                 argv,
                 signals_now(&mut early),
@@ -319,7 +320,7 @@ async fn run(args: RunArgs, max_wait: Option<Duration>) -> i32 {
             .await;
         }
     };
-    match Client::connect_or_start(&heavy.paths, &OsManager).await {
+    match Client::connect_or_start(&heavy.paths, &OsManager, crate::cli::REPLACE_ON_START).await {
         Ok(client) => heavy.client = Some(client),
         Err(e) => {
             warn_fail_open(&e);
@@ -438,6 +439,12 @@ pub(crate) fn warn_fail_open(e: &HostlerError) {
         }
     } else {
         warn_unavailable(&e.message);
+        // P4 R1-1: a sandbox denial says what to allow (never "start the service").
+        if crate::client::is_sandbox_denied(e)
+            && let Some(recovery) = &e.recovery
+        {
+            eprintln!("[hostler] To fix: {recovery}");
+        }
     }
 }
 
@@ -631,10 +638,20 @@ impl Heavy {
         kind: String,
         display: &str,
         no_wait: bool,
-    ) -> anyhow::Result<Heavy> {
-        let paths = Paths::resolve()?;
-        let holder = current_identity(&spawn::process_table()?)?;
-        let cwd = std::env::current_dir()?;
+    ) -> Result<Heavy, HostlerError> {
+        // P4 R1-2: a `PermissionDenied` on the state or socket directories is `sandbox_denied`.
+        let paths = crate::client::resolve_paths()?;
+        let internal = |e: anyhow::Error| HostlerError {
+            code: ErrorCode::Internal,
+            message: format!("{e:#}"),
+            details: json!({}),
+            recovery: None,
+        };
+        // P4 Task 9 F-1: a sandbox that denies the process information is `sandbox_denied`.
+        let holder = spawn::process_table()
+            .and_then(|table| current_identity(&table))
+            .map_err(|e| crate::client::process_error(&e))?;
+        let cwd = std::env::current_dir().map_err(|e| internal(e.into()))?;
         Ok(Heavy {
             paths,
             client: None,
@@ -670,11 +687,16 @@ impl Heavy {
             let attempt = async {
                 let client = match slot {
                     Some(client) => client,
-                    None => slot.insert(Client::connect_or_start(paths, &OsManager).await?),
+                    None => slot.insert(
+                        Client::connect_or_start(paths, &OsManager, crate::cli::REPLACE_ON_START)
+                            .await?,
+                    ),
                 };
                 client.call(request.clone()).await
             };
             match tokio::time::timeout_at(deadline, attempt).await {
+                // Never retried (P4 R1-3): the sandbox denies every attempt alike.
+                Ok(Err(e)) if crate::client::is_sandbox_denied(&e) => return Err(e),
                 Ok(Err(e)) if e.code == ErrorCode::ServiceUnavailable => last = Some(e),
                 Ok(result) => return result,
                 Err(_) => {}

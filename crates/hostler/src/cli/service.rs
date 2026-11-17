@@ -6,12 +6,13 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 
-use crate::client::{Client, socket_display};
+use crate::client::{Client, Replace, is_sandbox_denied, socket_display};
 use crate::contract::heavy::{HeavyEntry, ServiceStatus};
 use crate::contract::secrets::{LockState, SecretsStatus};
 use crate::contract::wire::Request;
 use crate::contract::{CONTRACT_VERSION, Envelope, ErrorCode, HostlerError};
 use crate::paths::Paths;
+use crate::service::lifecycle::{self, Probe, StopRule};
 use crate::service::manager::{self, ChangeRefused, OsManager, RegistrationState};
 use crate::service::{self, StopRefused};
 
@@ -91,7 +92,15 @@ pub fn main(command: ServiceCommand) -> ExitCode {
     };
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
-        Err(e) => return setup_failed(setup_error(format!("{e:#}"), home_recovery())),
+        // P4 R1-2: a sandbox that may not search the state or socket directories.
+        Err(e) => match crate::client::sandbox_denied_in(&e) {
+            Some(denied) if matches!(command, ServiceCommand::Status { json: false }) => {
+                print_sandbox_denied(&denied);
+                return ExitCode::FAILURE;
+            }
+            Some(denied) => return setup_failed(denied),
+            None => return setup_failed(setup_error(format!("{e:#}"), home_recovery())),
+        },
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -122,7 +131,7 @@ pub fn main(command: ServiceCommand) -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            ServiceCommand::Start => start(&paths).await,
+            ServiceCommand::Start => start(&paths, Replace::OnMismatch).await,
             ServiceCommand::Install { force } => install(&paths, force).await,
             ServiceCommand::Uninstall { force } => uninstall(&paths, force).await,
             ServiceCommand::Stop { force } => match stop(&paths, force, "stop").await {
@@ -131,7 +140,9 @@ pub fn main(command: ServiceCommand) -> ExitCode {
             },
             ServiceCommand::Restart { force } => match stop(&paths, force, "restart").await {
                 Ok(()) => {
-                    let code = start(&paths).await;
+                    // The service was just stopped: a mismatch now means the registration runs
+                    // another binary, which no replacement fixes.
+                    let code = start(&paths, Replace::Never).await;
                     if code == ExitCode::SUCCESS {
                         warn_if_secrets_locked(&paths).await;
                     }
@@ -217,6 +228,19 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// `service status` for a `sandbox_denied`: never "not running" (plan P4 R1-1), since the
+/// service may well run outside this sandbox.
+fn print_sandbox_denied(e: &HostlerError) {
+    let fallback = lifecycle::sandbox_recovery(None);
+    println!(
+        "hostler cannot reach its service from here: {}",
+        e.recovery.as_deref().unwrap_or(&fallback)
+    );
+    if let Some(socket) = e.details["socket"].as_str() {
+        println!("  socket: {socket}");
+    }
+}
+
 fn print_error(e: &HostlerError) {
     eprintln!("[hostler] {}", e.message);
     if let Some(recovery) = &e.recovery {
@@ -234,8 +258,29 @@ async fn query_status(client: &mut Client) -> Result<ServiceStatus, HostlerError
     })
 }
 
-async fn start(paths: &Paths) -> ExitCode {
-    let mut client = match Client::connect_or_start(paths, &OsManager).await {
+/// One line when the running service speaks this contract but is an older hostler (P4 Task 9,
+/// Step 4): `service start` keeps it (no restart storms), and says what restarts it.
+fn older_service_note(status: &ServiceStatus) -> Option<String> {
+    use crate::service::lifecycle::{Direction, SERVICE_VERSION, replace_direction, this_client};
+
+    let direction = replace_direction(
+        this_client(),
+        (status.contract_version, &status.service_version),
+    );
+    (direction == Direction::Newer && status.contract_version == crate::contract::CONTRACT_VERSION)
+        .then(|| {
+            format!(
+                "[hostler] the running service is hostler {}, older than this hostler \
+                 {SERVICE_VERSION}; it keeps running. To run this one: hostler doctor --fix \
+                 (only while it is idle and its secrets database is locked), or the typed \
+                 hostler service restart, which locks the secrets database",
+                status.service_version
+            )
+        })
+}
+
+async fn start(paths: &Paths, replace: Replace) -> ExitCode {
+    let mut client = match Client::connect_or_start(paths, &OsManager, replace).await {
         Ok(client) => client,
         Err(e) => {
             print_error(&e);
@@ -245,6 +290,9 @@ async fn start(paths: &Paths) -> ExitCode {
     match query_status(&mut client).await {
         Ok(s) => {
             println!("hostler service is running (pid {})", s.pid);
+            if let Some(note) = older_service_note(&s) {
+                eprintln!("{note}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -273,13 +321,36 @@ async fn warn_if_secrets_locked(paths: &Paths) {
     }
 }
 
+/// What an explicit stop prints first when the service reports an unlocked database, or
+/// reports nothing (a 0.0.3 service): every stop locks it (plan P4 R1-6). It never refuses.
+pub const LOCK_WARNING: &str =
+    "this locks the secrets database; a person unlocks it again with: hostler unlock";
+
+/// Prints `LOCK_WARNING` when the running service's database is unlocked or cannot say.
+async fn warn_if_unlocked(paths: &Paths) {
+    if let Probe::Running {
+        secrets_unlocked, ..
+    } = lifecycle::probe(paths).await
+        && secrets_unlocked != Some(false)
+    {
+        eprintln!("[hostler] {LOCK_WARNING}");
+    }
+}
+
 /// Asks the service to stop and waits until it has released its lock.
 async fn stop(paths: &Paths, force: bool, verb: &str) -> Result<(), ExitCode> {
-    match service::stop_service(paths, force).await {
+    warn_if_unlocked(paths).await;
+    let rule = StopRule::Explicit { force };
+    match service::stop_service(paths, rule, RegistrationState::Unknown).await {
         Ok(false) => println!("hostler service is not running"),
         Ok(true) => println!("hostler service stopped"),
         Err(StopRefused::Busy(e)) => {
             print_busy(&e, verb);
+            return Err(ExitCode::FAILURE);
+        }
+        Err(StopRefused::NotStopped(reason)) => {
+            eprintln!("[hostler] {}", reason.message());
+            eprintln!("[hostler] To fix: {}", reason.recovery(None));
             return Err(ExitCode::FAILURE);
         }
         Err(StopRefused::Failed(e)) => {
@@ -315,14 +386,27 @@ async fn install(paths: &Paths, force: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if !paths.custom_home {
+        warn_if_unlocked(paths).await;
+    }
+    let installed = manager::install_service(
+        paths,
+        &exe,
+        std::sync::Arc::new(OsManager),
+        StopRule::Explicit { force },
+    )
+    .await;
     report_change(
-        manager::install_service(paths, force, &exe, std::sync::Arc::new(OsManager)).await,
+        installed.map(drop),
         "hostler service is registered with the OS and running",
         "install",
     )
 }
 
 async fn uninstall(paths: &Paths, force: bool) -> ExitCode {
+    if !paths.custom_home {
+        warn_if_unlocked(paths).await;
+    }
     report_change(
         manager::uninstall_service(paths, force, &OsManager).await,
         "hostler service registration removed; the service is stopped",
@@ -406,6 +490,10 @@ async fn status(paths: &Paths, json: bool) -> ExitCode {
         return ExitCode::from(code);
     }
     let socket = socket_display(&paths.socket);
+    if let Some(e) = envelope.error.as_ref().filter(|e| is_sandbox_denied(e)) {
+        print_sandbox_denied(e);
+        return ExitCode::from(code);
+    }
     match &envelope.data {
         Some(s) => {
             println!("hostler service: running");
@@ -488,7 +576,8 @@ fn outdated_registration() -> HostlerError {
 
 /// The `status` Envelope and exit code: 0 running, 3 not running, 1 any other problem. An
 /// outdated registration is a problem even while an old service still runs (it will not come
-/// back after a restart): `ok` is false, `data` still shows the running service.
+/// back after a restart): `ok` is false, `data` still shows the running service. A
+/// `sandbox_denied` is never "not running" and never hidden by the registration (exit 1).
 fn compose_status(
     result: Result<ServiceStatus, HostlerError>,
     registration: RegistrationState,
@@ -510,6 +599,14 @@ fn compose_status(
                 error: None,
             },
             0,
+        ),
+        Err(e) if is_sandbox_denied(&e) => (
+            Envelope {
+                ok: false,
+                data: None,
+                error: Some(e),
+            },
+            1,
         ),
         Err(e) => {
             let code = match e.code {
@@ -533,6 +630,35 @@ fn compose_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P4 Task 9 Step 4: an older same-contract service gets one line; others get none.
+    #[test]
+    fn older_service_note_names_the_ways_to_restart() {
+        let status = |contract, version: &str| ServiceStatus {
+            service_version: version.into(),
+            contract_version: contract,
+            pid: 1,
+            running_heavy: 0,
+            waiting_heavy: 0,
+            secrets_unlocked: Some(false),
+            boot_id: None,
+        };
+        let current = crate::contract::CONTRACT_VERSION;
+        let note = older_service_note(&status(current, "0.0.1")).unwrap();
+        assert!(
+            note.contains("hostler 0.0.1, older than this hostler"),
+            "{note}"
+        );
+        assert!(note.contains("hostler doctor --fix"), "{note}");
+        assert!(
+            note.contains("hostler service restart, which locks"),
+            "{note}"
+        );
+        let this = crate::service::lifecycle::SERVICE_VERSION;
+        assert_eq!(older_service_note(&status(current, this)), None);
+        assert_eq!(older_service_note(&status(current, "99.0.0")), None);
+        assert_eq!(older_service_note(&status(current, "dev")), None);
+    }
 
     #[test]
     fn busy_lines_sanitize_another_agents_text_and_name_the_force_rule() {
@@ -567,6 +693,8 @@ mod tests {
             pid: 42,
             running_heavy: 0,
             waiting_heavy: 0,
+            secrets_unlocked: None,
+            boot_id: None,
         }
     }
 
@@ -638,6 +766,34 @@ mod tests {
                 "{state:?}"
             );
             assert_eq!(code, NOT_RUNNING);
+        }
+    }
+
+    /// P4 R1-1: `sandbox_denied` is a problem (1), never "not running" (3), and an outdated
+    /// registration never hides it.
+    #[test]
+    fn sandbox_denied_is_not_not_running() {
+        let socket = crate::paths::SocketName::File("/tmp/x/hostler.sock".into());
+        let denied = crate::client::sandbox_denied(
+            &socket,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        for state in [
+            RegistrationState::Absent,
+            RegistrationState::Current,
+            RegistrationState::Outdated,
+            RegistrationState::Unknown,
+        ] {
+            let (env, code) = compose_status(Err(denied.clone()), state);
+            assert_eq!(code, 1, "{state:?}");
+            let error = env.error.unwrap();
+            assert_eq!(error.details["reason"], "sandbox_denied", "{state:?}");
+            assert!(
+                error
+                    .recovery
+                    .unwrap()
+                    .contains("see: hostler guide sandbox")
+            );
         }
     }
 }

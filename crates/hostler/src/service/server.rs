@@ -814,7 +814,10 @@ async fn handle_request(
             response(id, result)
         }
         Request::ServiceStatus => response(id, status(shared).await),
-        Request::ServiceShutdown { if_idle } => {
+        Request::ServiceShutdown {
+            if_idle,
+            refuse_if_unlocked,
+        } => {
             // The idle check and "grant nothing more" happen in one step under both engine
             // locks, heavy then claims; holds and reservations never block a stop.
             let mut heavy = heavy_lock(shared).await;
@@ -849,11 +852,44 @@ async fn handle_request(
                     Err(lifecycle::busy(&running, &leases, &plans)),
                 )));
             }
+            // P4 (R1-6, R1-1): an automatic stop never locks a person's unlock. Running heavy
+            // work is named first (a read under the heavy lock, so `begin_shutdown` below sees
+            // the same queue). Then, in one step under the secrets admission gate, admission
+            // closes only when the database is locked and no admitted unlock/lock job runs; a
+            // job admitted before this decision keeps the service up, one after it is refused.
+            if refuse_if_unlocked {
+                let running = match if_idle {
+                    true => heavy.snapshot().map(|s| s.running).unwrap_or_default(),
+                    false => Vec::new(),
+                };
+                if !running.is_empty() {
+                    let mut busy = lifecycle::busy(&running, &[], &[]);
+                    if shared.secrets.is_unlocked() {
+                        busy.details["secrets"] = json!("unlocked");
+                    }
+                    return Some(Reply::Frame(response::<Value>(id, Err(busy))));
+                }
+                if !shared.secrets.close_if_locked() {
+                    return Some(Reply::Frame(response::<Value>(
+                        id,
+                        Err(lifecycle::secrets_unlocked_busy()),
+                    )));
+                }
+            }
+            // A refusal from here on reopens what `close_if_locked` closed.
+            let reopen = || {
+                if refuse_if_unlocked {
+                    shared.secrets.reopen_admission();
+                }
+            };
             return Some(match heavy.begin_shutdown(if_idle) {
-                Ok(running) if !running.is_empty() => Reply::Frame(response::<Value>(
-                    id,
-                    Err(lifecycle::busy(&running, &[], &[])),
-                )),
+                Ok(running) if !running.is_empty() => {
+                    reopen();
+                    Reply::Frame(response::<Value>(
+                        id,
+                        Err(lifecycle::busy(&running, &[], &[])),
+                    ))
+                }
                 Ok(_) => {
                     // Accepted: no new claims or secrets work from here on, before any reply
                     // I/O (T6-6).
@@ -864,7 +900,10 @@ async fn handle_request(
                     shared.secrets.begin_shutdown();
                     Reply::Stop(response(id, Ok(json!({ "stopping": true }))))
                 }
-                Err(e) => Reply::Frame(response::<Value>(id, Err(e))),
+                Err(e) => {
+                    reopen();
+                    Reply::Frame(response::<Value>(id, Err(e)))
+                }
             });
         }
         _ if !conn.hello_ok => {
@@ -1272,11 +1311,13 @@ async fn overview(shared: &Shared) -> Result<Overview, HostlerError> {
 async fn status(shared: &Shared) -> Result<ServiceStatus, HostlerError> {
     let snapshot = heavy_lock(shared).await.snapshot()?;
     Ok(ServiceStatus {
-        service_version: lifecycle::SERVICE_VERSION.into(),
+        service_version: lifecycle::service_version(),
         contract_version: shared.contract_version,
         pid: std::process::id(),
         running_heavy: snapshot.running.len() as u32,
         waiting_heavy: snapshot.waiting.len() as u32,
+        secrets_unlocked: Some(shared.secrets.is_unlocked()),
+        boot_id: crate::procs::local_boot_id(),
     })
 }
 

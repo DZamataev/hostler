@@ -49,8 +49,9 @@ hostler run --screen --account qa-user -- ./ui-login
 
 The account must exist, the project must be approved and the database unlocked, or the run refuses
 with exit 78 before the command starts (`account_missing`, `secrets_locked`,
-`project_not_approved`). Ask the operator to create a missing account; there is no
-`account request` in this version (it is planned for the MCP stage) — a person sets accounts up.
+`project_not_approved`). Ask the operator to create a missing account: there is no `account
+request` in this version — account requests come with hostler's desktop app. Until then a person
+sets an account with `hostler account set`.
 
 The command sees:
 
@@ -73,7 +74,7 @@ leftmost first, longest value first), and in everything hostler records. The cla
 The account materialization history records the field names (`account:qa-user/session`) and a
 command already masked with the secret and field values.
 
-Masking has P2's limits: encoded or reformatted values, a value the command reads itself, and
+Masking has limits: encoded or reformatted values, a value the command reads itself, and
 output after the drain grace are not covered. See `hostler guide secrets`.
 
 ## Refreshing a session
@@ -125,6 +126,6 @@ never a bare object).
 | `not_interactive` | `account set` was given a terminal for stdin but no full terminal for the prompt and no piped value. | run it in a terminal, or pipe the value on stdin |
 | `not_in_project` | Not inside a git checkout. | run from the project |
 | `service_unavailable` | The service could not be reached or started. | `hostler service start` |
-| `contract_mismatch` | The running service speaks another contract version. | `hostler service restart` |
+| `contract_mismatch` | The running service speaks another contract version. | `hostler service start` (replaces an idle, locked older service), or the newer binary the error names |
 
 Values never appear in an error, a log, an event, a history row or `--json`.

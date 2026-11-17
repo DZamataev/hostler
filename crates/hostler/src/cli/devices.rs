@@ -6,7 +6,7 @@
 //! refuses them without the flag the prompt sets. Every string a device or another agent reported
 //! is sanitized before it reaches a person's terminal (L40).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
@@ -37,7 +37,6 @@ use crate::contract::{ErrorCode, HostlerError};
 use crate::devices::service::RECORDED_ENV;
 use crate::devices::tools::{detect_from_path, resolve_agent_device};
 use crate::heavy::engine::{Clock, SystemClock};
-use crate::paths::Paths;
 use crate::secrets::sanitize_for_terminal;
 use crate::service::manager::OsManager;
 
@@ -356,8 +355,9 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T, HostlerError> {
 }
 
 async fn connect() -> Result<Client, Failure> {
-    let paths = Paths::resolve().map_err(|e| internal(format!("{e:#}")))?;
-    Client::connect_or_start(&paths, &OsManager)
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths().map_err(Failure::from)?;
+    Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START)
         .await
         .map_err(Failure::from)
 }
@@ -401,7 +401,20 @@ async fn show(device: String, json: bool) -> ExitCode {
         .map_err(Failure::from)
     }
     .await;
-    emit(result, json, print_show)
+    let ours = ThisProject::load();
+    match result {
+        Ok(detail) => {
+            if json {
+                let mut value = serde_json::to_value(&detail).expect("a detail always encodes");
+                mark_apps(&mut value, detail.info.platform, &ours);
+                print_envelope(&value);
+            } else {
+                print_show(&detail, &ours);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(failure) => failure.report(json),
+    }
 }
 
 async fn add(device: String, alias: Option<String>, json: bool) -> ExitCode {
@@ -621,7 +634,20 @@ async fn installs(
         Ok(output::call(Request::DevicesInstalls { device, query }).await?)
     }
     .await;
-    emit(result, json, |events| print_installs(events))
+    let ours = ThisProject::load();
+    match result {
+        Ok(events) => {
+            if json {
+                let mut value = serde_json::to_value(&events).expect("events always encode");
+                mark_installs(&mut value, &ours);
+                print_envelope(&value);
+            } else {
+                print_installs(&events, &ours);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(failure) => failure.report(json),
+    }
 }
 
 async fn forget_sessions(alias: String, json: bool) -> ExitCode {
@@ -810,6 +836,98 @@ fn current_workspace_path() -> Option<String> {
     Some(crate::project::display_path(
         &current.checkout.workspace_root,
     ))
+}
+
+/// This checkout's declared app ids (P4 Task 2): `devices show` and `devices installs` mark the
+/// apps of the project the command runs in. Empty outside a checkout, or when `hostler.toml` has
+/// no `[apps]` or does not parse: the label is a convenience and never fails a read.
+struct ThisProject {
+    android: BTreeSet<String>,
+    ios: BTreeSet<String>,
+}
+
+impl ThisProject {
+    fn load() -> ThisProject {
+        let mut ours = ThisProject {
+            android: BTreeSet::new(),
+            ios: BTreeSet::new(),
+        };
+        let Some(config) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::project::current(&cwd).ok())
+            .and_then(|current| current.config)
+        else {
+            return ours;
+        };
+        ours.android.extend(config.apps.android);
+        ours.ios.extend(config.apps.ios);
+        ours
+    }
+
+    /// Whether this project declares the id for the device's platform.
+    fn has(&self, platform: Platform, id: &str) -> bool {
+        match platform {
+            Platform::Android => self.android.contains(id),
+            Platform::Ios => self.ios.contains(id),
+        }
+    }
+
+    /// Whether an install event's app is this project's: the platform comes from the event's
+    /// `device:<platform>:…` resource id, so an id declared for iOS never marks an Android
+    /// install. An id of no recognisable platform marks nothing.
+    fn marks(&self, event: &InstallEvent) -> bool {
+        platform_of_device(&event.device.0)
+            .is_some_and(|platform| self.has(platform, &event.app_id))
+    }
+}
+
+/// The platform in a `device:<platform>:…` resource id; `None` for anything else (a screen, an
+/// account, a malformed id), which never matches an `[apps]` list.
+fn platform_of_device(resource: &str) -> Option<Platform> {
+    let (platform, hardware) = resource.strip_prefix("device:")?.split_once(':')?;
+    if hardware.is_empty() {
+        return None;
+    }
+    match platform {
+        "android" => Some(Platform::Android),
+        "ios" => Some(Platform::Ios),
+        _ => None,
+    }
+}
+
+/// `--json`: `"this_project": true` on this project's apps. It is added to the serialised `Value`
+/// and is not a contract field.
+fn mark_apps(value: &mut Value, platform: Platform, ours: &ThisProject) {
+    let Some(apps) = value.get_mut("apps").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for app in apps {
+        let Some(id) = app.get("app_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if ours.has(platform, id) {
+            app["this_project"] = Value::Bool(true);
+        }
+    }
+}
+
+/// `--json`: `"this_project": true` on this project's install changes, by the event's platform.
+fn mark_installs(value: &mut Value, ours: &ThisProject) {
+    let Some(events) = value.as_array_mut() else {
+        return;
+    };
+    for event in events {
+        let marks = event
+            .get("device")
+            .and_then(Value::as_str)
+            .zip(event.get("app_id").and_then(Value::as_str))
+            .is_some_and(|(device, id)| {
+                platform_of_device(device).is_some_and(|platform| ours.has(platform, id))
+            });
+        if marks {
+            event["this_project"] = Value::Bool(true);
+        }
+    }
 }
 
 /// `devices tools --detect`'s work, testable without a service: PATH entries inside a registered
@@ -1018,7 +1136,7 @@ fn problem_lines(snapshot: &DevicesSnapshot) -> Vec<String> {
     lines
 }
 
-fn print_show(detail: &DeviceDetail) {
+fn print_show(detail: &DeviceDetail, ours: &ThisProject) {
     let info = &detail.info;
     let now = SystemClock.now_ms();
     println!(
@@ -1085,18 +1203,21 @@ fn print_show(detail: &DeviceDetail) {
         None => println!("  apps: no snapshot yet"),
     }
     for app in &detail.apps {
-        println!("    {}", app_line(app, now));
+        println!(
+            "    {}",
+            app_line(app, now, ours.has(info.platform, &app.app_id))
+        );
     }
 }
 
-fn print_installs(events: &[InstallEvent]) {
+fn print_installs(events: &[InstallEvent], ours: &ThisProject) {
     if events.is_empty() {
         println!("no install changes");
         return;
     }
     let now = SystemClock.now_ms();
     for event in events {
-        println!("{}", install_line(event, now));
+        println!("{}", install_line(event, now, ours.marks(event)));
     }
 }
 
@@ -1497,8 +1618,11 @@ fn forget_line(record: &ForgetRecord, now: i64) -> String {
     line
 }
 
-fn app_line(app: &crate::contract::devices::AppState, now: i64) -> String {
+fn app_line(app: &crate::contract::devices::AppState, now: i64, this_project: bool) -> String {
     let mut text = format!("{} {}", sanitize(&app.app_id), version_text(app));
+    if this_project {
+        text.push_str(" (this project)");
+    }
     let mut times = Vec::new();
     if let Some(installed) = &app.installed {
         times.push(time_label(installed, now, "installed"));
@@ -1521,7 +1645,7 @@ fn version_text(app: &crate::contract::devices::AppState) -> String {
     }
 }
 
-fn install_line(event: &InstallEvent, now: i64) -> String {
+fn install_line(event: &InstallEvent, now: i64, this_project: bool) -> String {
     let device = event
         .alias
         .as_deref()
@@ -1533,8 +1657,9 @@ fn install_line(event: &InstallEvent, now: i64) -> String {
         (None, Some(code)) => format!(" ({})", sanitize(code)),
         (None, None) => String::new(),
     };
+    let ours = if this_project { " (this project)" } else { "" };
     format!(
-        "{}: {}{version} on {device} — {}, {}",
+        "{}: {}{ours}{version} on {device} — {}, {}",
         when_text(&event.when, now),
         sanitize(&event.app_id),
         change_word(event.change),
@@ -1697,7 +1822,11 @@ mod tests {
             snapshot_at_ms: Some(now - 60_000),
             forgets: Vec::new(),
         };
-        let lines: Vec<String> = detail.apps.iter().map(|a| app_line(a, now)).collect();
+        let lines: Vec<String> = detail
+            .apps
+            .iter()
+            .map(|a| app_line(a, now, false))
+            .collect();
         assert!(lines[0].contains("first seen 2 h ago"), "{:?}", lines[0]);
         assert!(
             lines[0].contains("changed between 2 h and 1 h ago"),
@@ -1719,7 +1848,7 @@ mod tests {
         event.when = InstallTime::Device {
             at_ms: now - 7_200_000,
         };
-        let line = install_line(&event, now);
+        let line = install_line(&event, now, false);
         assert!(line.contains("com.example.app"), "{line}");
         assert!(line.contains("1.2.0 (120)"), "{line}");
         assert!(line.contains("updated"), "{line}");
@@ -1731,19 +1860,127 @@ mod tests {
 
         event.source = InstallSource::NotThroughHostler;
         assert!(
-            install_line(&event, now).contains("not through hostler"),
+            install_line(&event, now, false).contains("not through hostler"),
             "{}",
-            install_line(&event, now)
+            install_line(&event, now, false)
         );
         event.source = InstallSource::Around {
             claim_ids: vec!["c1".into(), "c2".into()],
             workspace_path: "/work/app".into(),
         };
         assert!(
-            install_line(&event, now).contains("around claim c1,c2 in /work/app"),
+            install_line(&event, now, false).contains("around claim c1,c2 in /work/app"),
             "{}",
-            install_line(&event, now)
+            install_line(&event, now, false)
         );
+    }
+
+    #[test]
+    fn this_project_marks_only_its_own_apps() {
+        let now = SystemClock.now_ms();
+        let ours = ThisProject {
+            android: BTreeSet::from(["com.example.app".to_string()]),
+            ios: BTreeSet::new(),
+        };
+        let app = |id: &str| crate::contract::devices::AppState {
+            app_id: id.into(),
+            version_name: None,
+            version_code: None,
+            installed: None,
+            updated: None,
+        };
+
+        // Human output: ` (this project)` after the id, and only for a declared app.
+        let marked = app_line(
+            &app("com.example.app"),
+            now,
+            ours.has(Platform::Android, "com.example.app"),
+        );
+        assert_eq!(marked, "com.example.app  (this project)", "{marked}");
+        let other = app_line(
+            &app("com.example.other"),
+            now,
+            ours.has(Platform::Android, "com.example.other"),
+        );
+        assert_eq!(other, "com.example.other ", "{other}");
+        // The platform matters: an Android id is not an iOS one.
+        assert!(!ours.has(Platform::Ios, "com.example.app"));
+
+        // An install's platform comes from its device resource id.
+        let android_event = fixtures::install_event();
+        assert!(ours.marks(&android_event));
+        let line = install_line(&android_event, now, ours.marks(&android_event));
+        assert!(line.contains("com.example.app (this project)"), "{line}");
+
+        // The same id declared only for iOS never marks an Android install, and does mark the
+        // iOS one.
+        let ios_only = ThisProject {
+            android: BTreeSet::new(),
+            ios: BTreeSet::from(["com.example.app".to_string()]),
+        };
+        assert!(!ios_only.marks(&android_event), "an Android install");
+        let mut ios_event = android_event.clone();
+        ios_event.device = ResourceId("device:ios:00000000-0000-4000-8000-000000000001".into());
+        assert!(ios_only.marks(&ios_event), "an iOS install");
+
+        // `--json`: the flag is added to the serialised value, and only to matching items.
+        let mut detail =
+            json!({"apps": [{"app_id": "com.example.app"}, {"app_id": "com.example.other"}]});
+        mark_apps(&mut detail, Platform::Android, &ours);
+        assert_eq!(detail["apps"][0]["this_project"], json!(true));
+        assert!(detail["apps"][1].get("this_project").is_none(), "{detail}");
+
+        let android = "device:android:SERIAL0001";
+        let ios = "device:ios:00000000-0000-4000-8000-000000000001";
+        let mut events = json!([
+            {"device": android, "app_id": "com.example.app"},
+            {"device": android, "app_id": "com.example.other"},
+            {"device": ios, "app_id": "com.example.app"},
+            {"device": "device:test:0", "app_id": "com.example.app"},
+            {"app_id": "com.example.app"},
+        ]);
+        mark_installs(&mut events, &ours);
+        assert_eq!(events[0]["this_project"], json!(true), "{events}");
+        assert!(events[1].get("this_project").is_none(), "{events}");
+        assert!(events[2].get("this_project").is_none(), "{events}");
+        // A resource id of no known platform, or none at all, marks nothing.
+        assert!(events[3].get("this_project").is_none(), "{events}");
+        assert!(events[4].get("this_project").is_none(), "{events}");
+
+        let mut ios_events = json!([
+            {"device": ios, "app_id": "com.example.app"},
+            {"device": android, "app_id": "com.example.app"},
+        ]);
+        mark_installs(&mut ios_events, &ios_only);
+        assert_eq!(ios_events[0]["this_project"], json!(true), "{ios_events}");
+        assert!(ios_events[1].get("this_project").is_none(), "{ios_events}");
+    }
+
+    #[test]
+    fn installs_need_a_recognisable_platform() {
+        assert_eq!(
+            platform_of_device("device:android:SERIAL0001"),
+            Some(Platform::Android)
+        );
+        assert_eq!(
+            platform_of_device("device:android:avd:Pixel_9"),
+            Some(Platform::Android)
+        );
+        assert_eq!(
+            platform_of_device("device:ios:00000000-0000-4000-8000-000000000001"),
+            Some(Platform::Ios)
+        );
+        for none in [
+            "device:test:0",
+            "device:",
+            "device:android",
+            "device:android:",
+            "screen",
+            "account:x/qa-user",
+            "",
+        ] {
+            assert_eq!(platform_of_device(none), None, "{none:?}");
+        }
     }
 
     #[test]

@@ -17,7 +17,6 @@ use crate::contract::secrets::LockState;
 use crate::contract::wire::Request;
 use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::{Clock, SystemClock};
-use crate::paths::Paths;
 use crate::secrets::sanitize_for_terminal;
 use crate::service::manager::OsManager;
 
@@ -69,8 +68,10 @@ pub fn main(args: StatusArgs) -> ExitCode {
 }
 
 async fn collect() -> Result<Overview, HostlerError> {
-    let paths = Paths::resolve().map_err(|e| internal(format!("{e:#}")))?;
-    let mut client = Client::connect_or_start(&paths, &OsManager).await?;
+    // P4 R1-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths()?;
+    let mut client =
+        Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START).await?;
     let value = client.call(Request::StatusOverview).await?;
     serde_json::from_value(value)
         .map_err(|e| internal(format!("unreadable answer from the service: {e}")))
@@ -79,7 +80,8 @@ async fn collect() -> Result<Overview, HostlerError> {
 /// P3b Task 6: the devices for the resource lines. Never starts a service: `collect` already
 /// reached one, and a failed read only loses the device detail.
 async fn collect_devices() -> Result<DevicesSnapshot, HostlerError> {
-    let paths = Paths::resolve().map_err(|e| internal(format!("{e:#}")))?;
+    // P4 R1-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths()?;
     let mut client = Client::connect(&paths).await?;
     let value = client.call(Request::DevicesList { all: false }).await?;
     serde_json::from_value(value)

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use hostler::client::Client;
+use hostler::client::{Client, Replace};
 use hostler::contract::ErrorCode;
 use hostler::contract::heavy::{AcquireOutcome, HeavyAcquire, QueueSnapshot};
 use hostler::contract::wire::Request;
@@ -86,7 +86,7 @@ impl Home {
             "{}",
             String::from_utf8_lossy(&start.stderr)
         );
-        Client::connect_or_start_with(&self.paths(), &NoManager, BIN.as_ref())
+        Client::connect_or_start_with(&self.paths(), &NoManager, BIN.as_ref(), Replace::Never)
             .await
             .unwrap()
     }

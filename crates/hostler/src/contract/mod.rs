@@ -1,9 +1,12 @@
-//! The versioned contract shared by the CLI, the service, MCP and the app (spec §12, plan Task 4).
+//! The versioned contract shared by the CLI (and its `--json`), the service and a future app
+//! (spec §12, plan Task 4).
 
 pub mod accounts;
 pub mod claims;
 pub mod devices;
+pub mod doctor;
 pub mod heavy;
+pub mod init;
 pub mod secrets;
 pub mod wire;
 

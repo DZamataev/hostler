@@ -10,7 +10,6 @@ use crate::client::Client;
 use crate::contract::HostlerError;
 use crate::contract::claims::{WorkspaceInfo, WorkspaceOutcome, WorkspaceResolve};
 use crate::contract::wire::Request;
-use crate::paths::Paths;
 use crate::project::{Current, display_path};
 use crate::secrets::sanitize_for_terminal;
 use crate::service::manager::OsManager;
@@ -65,13 +64,15 @@ fn resolve_here() -> Result<WorkspaceInfo, HostlerError> {
     let cwd = std::env::current_dir()
         .map_err(|e| internal(format!("cannot read the current directory: {e}")))?;
     let current = crate::project::current(&cwd)?;
-    let paths = Paths::resolve().map_err(|e| internal(format!("{e:#}")))?;
+    // P4 R2-2: a denied state or socket directory is `sandbox_denied`.
+    let paths = crate::client::resolve_paths()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| internal(format!("cannot start the async runtime: {e}")))?;
     runtime.block_on(async {
-        let mut client = Client::connect_or_start(&paths, &OsManager).await?;
+        let mut client =
+            Client::connect_or_start(&paths, &OsManager, crate::cli::REPLACE_ON_START).await?;
         resolve(&mut client, &current).await
     })
 }
