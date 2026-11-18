@@ -3,17 +3,19 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::procs::ProcessIdentity;
-use crate::secrets::value::{RawCommand, SecretValue};
+use crate::contract::process::ProcessIdentity;
+use crate::contract::values::{RawCommand, SecretValue};
 
 /// A project as the CLI resolved it from the cwd.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ProjectRef {
     pub common_dir: String,
     pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ProjectInfo {
     pub id: String,
     pub name: String,
@@ -25,6 +27,7 @@ pub struct ProjectInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LockState {
     Missing,
@@ -33,6 +36,7 @@ pub enum LockState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretsStatus {
     pub state: LockState,
     pub database: String,
@@ -40,9 +44,13 @@ pub struct SecretsStatus {
     pub pending_requests: u32,
     /// `hostler.kdbx.prev-*` files kept after a conflict.
     pub preserved_files: Vec<String>,
+    /// P5 (spec §6.2): the last event `seq` assigned when this status was read; in a
+    /// `secrets.lock_changed` event, that event's own `seq`.
+    pub as_of_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Unlock {
     pub password: SecretValue,
     pub key_file: Option<String>,
@@ -50,7 +58,57 @@ pub struct Unlock {
     pub create: bool,
 }
 
+/// `secret.remove`'s and `account.remove`'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Removed {
+    pub removed: bool,
+}
+
+/// `secret.share`'s answer: the name and the two project ids.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct ShareOutcome {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// `secret.unshare`'s answer (always `true`: a missing share is refused).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Unshared {
+    pub unshared: bool,
+}
+
+/// `secrets.prove` (P5, spec §8.5): checks a master password against the database on disk,
+/// changing nothing; success grants this connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Prove {
+    pub password: SecretValue,
+    /// `None`: the remembered key file, if any.
+    pub key_file: Option<String>,
+}
+
+/// A live proof on one connection (spec §8.5): gated methods are admitted until it expires, the
+/// database is locked or unlocked, or the connection ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct ProofGrant {
+    pub expires_at_ms: i64,
+}
+
+/// `secrets.unlock`'s answer (contract 5): a successful unlock grants its connection too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct UnlockOutcome {
+    pub status: SecretsStatus,
+    pub grant: ProofGrant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DeclaredSecret {
     pub name: String,
     pub purpose: String,
@@ -58,6 +116,7 @@ pub struct DeclaredSecret {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SecretSource {
     Own,
@@ -65,6 +124,7 @@ pub enum SecretSource {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SecretState {
     Set,
@@ -72,6 +132,7 @@ pub enum SecretState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretInfo {
     pub name: String,
     pub purpose: Option<String>,
@@ -81,12 +142,14 @@ pub struct SecretInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretList {
     pub project: ProjectInfo,
     pub secrets: Vec<SecretInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretSet {
     pub project: ProjectRef,
     pub name: String,
@@ -94,18 +157,21 @@ pub struct SecretSet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SetOutcome {
     pub name: String,
     pub answered_requests: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ImportEntry {
     pub name: String,
     pub value: SecretValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretImport {
     pub project: ProjectRef,
     pub entries: Vec<ImportEntry>,
@@ -113,12 +179,14 @@ pub struct SecretImport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ImportOutcome {
     pub stored: Vec<String>,
     pub answered_requests: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestState {
     Pending,
@@ -129,6 +197,7 @@ pub enum RequestState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretRequest {
     /// A UUID v4 made by the client.
     pub id: String,
@@ -139,6 +208,7 @@ pub struct SecretRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SecretRequestInfo {
     pub id: String,
     pub project_id: String,
@@ -152,6 +222,7 @@ pub struct SecretRequestInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Decline {
     pub id: Option<String>,
     pub project: Option<ProjectRef>,
@@ -159,6 +230,7 @@ pub struct Decline {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Share {
     pub from: ProjectRef,
     pub name: String,
@@ -166,6 +238,7 @@ pub struct Share {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Materialize {
     pub run_id: String,
     pub project: ProjectRef,
@@ -177,6 +250,7 @@ pub struct Materialize {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct MaterializedSecret {
     pub name: String,
     pub value: SecretValue,
@@ -307,6 +381,46 @@ pub mod errors {
             "wrong master password or key file".into(),
             Some("hostler unlock".into()),
         )
+    }
+
+    /// P5 (spec §8.5): a gated method without a live proof on its connection.
+    pub fn proof_required() -> HostlerError {
+        error(
+            ErrorCode::ProofRequired,
+            "this needs the master password: a person proves it on this connection first".into(),
+            Some(
+                "type the master password in the hostler app, or rerun the command at a terminal"
+                    .into(),
+            ),
+        )
+    }
+
+    /// P5 (spec §8.5): the limit on password checks, after wrong passwords; `retry_after_ms`
+    /// is at least 1. The text names the next try and says that another process of the user may
+    /// be guessing (the accepted lockout risk, P5-L4).
+    pub fn proof_limited(retry_after_ms: u64) -> HostlerError {
+        limited("too many wrong master passwords", retry_after_ms)
+    }
+
+    /// P5 (spec §8.5): another master-password check is running in the service (at most one
+    /// at a time, service-wide); same code and details as `proof_limited`.
+    pub fn proof_busy(retry_after_ms: u64) -> HostlerError {
+        limited("another master-password check is running", retry_after_ms)
+    }
+
+    fn limited(what: &str, retry_after_ms: u64) -> HostlerError {
+        let retry_after_ms = retry_after_ms.max(1);
+        let secs = retry_after_ms.div_ceil(1000);
+        let mut e = error(
+            ErrorCode::ProofLimited,
+            format!(
+                "{what}; next try in {secs} s. Another process of your user may be guessing \
+                 (the service log names each wrong password's process)"
+            ),
+            Some(format!("wait {secs} s, then try again")),
+        );
+        e.details = json!({ "retry_after_ms": retry_after_ms });
+        e
     }
 
     pub fn service_stopping() -> HostlerError {

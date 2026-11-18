@@ -1,0 +1,56 @@
+{
+  "as_of_seq": 7,
+  "at_ms": 4000,
+  "projects": [
+    {
+      "declared": {
+        "accounts": [
+          {
+            "fields": [
+              "session",
+              "env"
+            ],
+            "name": "qa-user",
+            "purpose": "the main e2e test user"
+          }
+        ],
+        "apps": {
+          "android": [
+            "com.example.app"
+          ],
+          "ios": [
+            "com.example.App"
+          ]
+        },
+        "secrets": [
+          {
+            "env": "INDEXER_KEY",
+            "name": "API_KEY",
+            "purpose": "the indexer"
+          }
+        ]
+      },
+      "declared_at_ms": 3000,
+      "info": {
+        "approved": true,
+        "approved_at_ms": 2000,
+        "common_dir": "/work/app/.git",
+        "created_at_ms": 1000,
+        "group_uuid": null,
+        "id": "p1",
+        "name": "app"
+      },
+      "workspaces": [
+        {
+          "id": "ws-1",
+          "last_seen_ms": 3000,
+          "note": null,
+          "outcome": "known",
+          "path": "/work/app",
+          "project_id": "p1",
+          "project_repointed": false
+        }
+      ]
+    }
+  ]
+}

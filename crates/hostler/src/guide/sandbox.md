@@ -98,14 +98,19 @@ prefix_rule(
     decision = "allow",
     justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
 )
+prefix_rule(
+    pattern = ["hostler", "account", ["request", "requests"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)
 ```
 
 It allows hostler's agent-facing commands and nothing else. With the rule in place:
 
 - The agent calls plain `hostler` commands: `hostler status`, `hostler hold screen`,
   `hostler guide`, `hostler init`, `hostler doctor`, `hostler devices list`,
-  `hostler queue --json` and the rest of the list above. They run outside the sandbox and reach
-  the service with no prompt.
+  `hostler account request`, `hostler queue --json` and the rest of the list above. They run
+  outside the sandbox and reach the service with no prompt.
 - A command with an environment prefix (`HOSTLER_HOME=… hostler …`), a `cd … &&`, a pipe, a `;`,
   a redirection, a substitution or a glob is not matched: the whole command stays sandboxed and
   answers `sandbox_denied`. Put `HOSTLER_HOME` in the environment instead of on the command line.

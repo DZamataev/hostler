@@ -34,3 +34,8 @@ prefix_rule(
     decision = "allow",
     justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
 )
+prefix_rule(
+    pattern = ["hostler", "account", ["request", "requests"]],
+    decision = "allow",
+    justification = "hostler reaches its per-user service over a Unix socket the sandbox blocks",
+)

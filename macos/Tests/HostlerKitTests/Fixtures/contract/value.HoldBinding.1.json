@@ -1,0 +1,8 @@
+{
+  "holder": {
+    "boot_id": "boot-1",
+    "pid": 42,
+    "start_time": 500
+  },
+  "kind": "process"
+}

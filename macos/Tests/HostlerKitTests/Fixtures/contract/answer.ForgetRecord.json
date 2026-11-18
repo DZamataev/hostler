@@ -1,0 +1,11 @@
+{
+  "at_ms": 4800,
+  "by_pid": 42,
+  "by_workspace_path": "/work/app",
+  "id": "f1",
+  "reason": "the session was left over",
+  "resource": "device:android:SERIAL0001",
+  "sessions": [
+    "default"
+  ]
+}

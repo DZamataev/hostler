@@ -1,0 +1,7 @@
+{
+  "id": 33,
+  "method": "claims.attach",
+  "params": {
+    "request_id": "r1"
+  }
+}

@@ -340,7 +340,7 @@ fn state_of(job: &Handle) -> JobState {
 
 /// See `procs::group_state`. "Not found" proves the job gone only in its own session; from
 /// another it is `NotFound`, gone only once the launcher is dead too, which the caller decides
-/// (`claims::engine::seize`'s `gone`, `cli::takeover::stop_group`; P2-11).
+/// (`claims::engine::seize`'s `gone`, `procs::stop::stop_group`; P2-11).
 pub(super) fn job_state(name: &str, session: Option<u32>) -> JobState {
     job_state_from(name, session, current_session())
 }

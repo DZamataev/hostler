@@ -1,0 +1,8 @@
+{
+  "code": "device_not_ready",
+  "details": {
+    "device": "emu-1"
+  },
+  "message": "emu-1 is not booted",
+  "recovery": "rerun with --boot"
+}

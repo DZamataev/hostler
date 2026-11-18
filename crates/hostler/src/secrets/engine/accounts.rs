@@ -5,20 +5,20 @@
 //! (`holder_of`, `check_holder`) are the server's, made before these run, with the claims lock
 //! released.
 
-use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use super::{
-    HISTORY_COMMAND_BYTES, MAX_COMMAND_BYTES, SecretsEngine, answer_bound, bad_request,
+    Caller, HISTORY_COMMAND_BYTES, MAX_COMMAND_BYTES, SecretsEngine, answer_bound, bad_request,
     duplicate_entries, encode_answer, group_of, internal, invalid_value, keep_head, store_error,
 };
 use crate::contract::HostlerError;
 use crate::contract::accounts::{
-    AccountInfo, AccountMaterialize, AccountRemove, AccountSet, INVALID_ACCOUNT_NAME,
-    INVALID_FIELD_NAME, MaterializedAccount, valid_account_name, valid_field_name,
+    AccountFieldSet, AccountInfo, AccountMaterialize, AccountRemove, AccountSet,
+    INVALID_ACCOUNT_NAME, INVALID_FIELD_NAME, MaterializedAccount, valid_account_name,
+    valid_field_name,
 };
 use crate::contract::claims::errors as claims_errors;
-use crate::contract::secrets::{MaterializedSecret, ProjectInfo, ProjectRef};
+use crate::contract::secrets::{MaterializedSecret, ProjectInfo, ProjectRef, Removed};
 use crate::mask::MaskSet;
 use crate::secrets::check_value;
 use crate::secrets::layout::{self, AccountLookup};
@@ -57,11 +57,25 @@ impl SecretsEngine {
         project: &ProjectInfo,
         name: &str,
     ) -> Result<Vec<(String, SecretValue)>, HostlerError> {
+        self.read_account_as(project, name, None)
+    }
+
+    /// `read_account`; with a caller, the read is admitted with its grant in the same vault
+    /// section (spec §8.5).
+    fn read_account_as(
+        &self,
+        project: &ProjectInfo,
+        name: &str,
+        gated: Option<&Caller>,
+    ) -> Result<Vec<(String, SecretValue)>, HostlerError> {
         let missing = || claims_errors::account_missing(name, &project.name);
         let group = group_of(project).ok_or_else(missing)?;
-        let found = self
-            .with_vault(|v| v.read(|db| layout::account(db, group, name)))
-            .map_err(|e| e.to_hostler())?;
+        let read =
+            |v: &mut crate::secrets::vault::Vault| v.read(|db| layout::account(db, group, name));
+        let found = match gated {
+            Some(caller) => self.admitted_vault(caller.grant.as_ref(), read)?,
+            None => self.with_vault(read).map_err(|e| e.to_hostler())?,
+        };
         let fields = match found {
             AccountLookup::Found(fields) if !fields.is_empty() => fields,
             AccountLookup::Found(_) | AccountLookup::Missing => return Err(missing()),
@@ -114,7 +128,7 @@ impl SecretsEngine {
     }
 
     /// The first field creates the account; at most `MAX_ACCOUNT_FIELDS` fields.
-    pub(super) fn account_set(&self, a: AccountSet) -> Result<Value, HostlerError> {
+    pub(super) fn account_set(&self, a: AccountSet) -> Result<AccountFieldSet, HostlerError> {
         check_account_name(&a.name)?;
         check_field_name(&a.field)?;
         check_value(&a.value)?;
@@ -138,11 +152,17 @@ impl SecretsEngine {
             layout::put_account_field(db, group, &a.name, &a.field, &a.value);
             Ok(())
         })?;
-        Ok(json!({ "name": a.name, "field": a.field }))
+        // A set answers every pending request whose fields are now all set (spec §8.4); the
+        // `publish` guard above keeps that a single step with the write.
+        self.answer_account_requests_for(&project, &a.name)?;
+        Ok(AccountFieldSet {
+            name: a.name,
+            field: a.field,
+        })
     }
 
     /// The server refuses first while the account is claimed (`ResourceInUse`).
-    pub(super) fn account_remove(&self, r: &AccountRemove) -> Result<Value, HostlerError> {
+    pub(super) fn account_remove(&self, r: &AccountRemove) -> Result<Removed, HostlerError> {
         check_account_name(&r.name)?;
         if let Some(field) = &r.field {
             check_field_name(field)?;
@@ -151,7 +171,7 @@ impl SecretsEngine {
         self.require_unlocked()?;
         let _publishing = self.publishing();
         let Some(group) = group_of(&self.current(&project)?) else {
-            return Ok(json!({ "removed": false }));
+            return Ok(Removed { removed: false });
         };
         let field = r.field.as_deref();
         let present = self
@@ -163,12 +183,47 @@ impl SecretsEngine {
             })
             .map_err(|e| e.to_hostler())?;
         if !present {
-            return Ok(json!({ "removed": false }));
+            return Ok(Removed { removed: false });
         }
         let removed = self
             .with_vault(|v| v.write(|db| Ok(layout::remove_account(db, group, &r.name, field))))
             .map_err(|e| e.to_hostler())?;
-        Ok(json!({ "removed": removed }))
+        Ok(Removed { removed })
+    }
+
+    /// `account.reveal` (gated, spec §8.5): every field of the account for the person, read
+    /// under the vault mutex that admitted the grant. No claim is needed: nothing runs with it.
+    /// The log names the account, never a value.
+    pub(super) fn reveal_account(
+        &self,
+        project: &ProjectRef,
+        name: &str,
+        caller: &Caller,
+    ) -> Result<Zeroizing<String>, HostlerError> {
+        check_account_name(name)?;
+        let project = self.approved(project)?;
+        self.require_unlocked()?;
+        self.pause_at("reveal_admit");
+        let fields = self.read_account_as(&project, name, Some(caller))?;
+        let answer = MaterializedAccount {
+            name: name.to_owned(),
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| MaterializedSecret { name, value })
+                .collect(),
+        };
+        let mut encoded = encode_answer(
+            &answer,
+            answer_bound(&answer.fields) + answer.name.len() + 32,
+        )?;
+        let text = String::from_utf8(std::mem::take(&mut *encoded))
+            .map_err(|_| internal("cannot encode the revealed account"))?;
+        tracing::info!(
+            "revealed account {name} of project {} (peer pid {})",
+            project.name,
+            caller.pid_text()
+        );
+        Ok(Zeroizing::new(text))
     }
 
     /// A run's fields, after the server's `check_holder`. The recorded command (already masked
@@ -235,6 +290,7 @@ impl SecretsEngine {
 #[cfg(test)]
 mod tests {
     use keepass::db::fields;
+    use serde_json::json;
 
     use super::super::Reply;
     use super::super::tests::{World, outside_write, world};
@@ -280,7 +336,7 @@ mod tests {
     ) -> Result<MaterializedAccount, HostlerError> {
         let reply = w
             .engine
-            .dispatch(Request::AccountMaterialize(AccountMaterialize {
+            .reply(Request::AccountMaterialize(AccountMaterialize {
                 run_id: run_id.into(),
                 claim_id: "c1".into(),
                 requester: ProcessIdentity {
@@ -556,7 +612,7 @@ mod tests {
         .unwrap();
         let run_id = uuid::Uuid::new_v4().to_string();
         w.engine
-            .dispatch(Request::SecretMaterialize(
+            .reply(Request::SecretMaterialize(
                 crate::contract::secrets::Materialize {
                     run_id: run_id.clone(),
                     project: p.clone(),

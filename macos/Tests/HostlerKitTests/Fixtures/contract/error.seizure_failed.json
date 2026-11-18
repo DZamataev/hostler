@@ -1,0 +1,8 @@
+{
+  "code": "seizure_failed",
+  "details": {
+    "resource": "screen"
+  },
+  "message": "screen stays with its holder: the holder did not stop",
+  "recovery": "hostler status"
+}

@@ -1,0 +1,10 @@
+{
+  "bound_to": {
+    "boot_id": "boot-1",
+    "pid": 42,
+    "start_time": 500
+  },
+  "distinct": true,
+  "kind": "hold",
+  "ttl_ms": 1800000
+}

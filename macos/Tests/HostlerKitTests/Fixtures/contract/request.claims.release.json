@@ -1,0 +1,14 @@
+{
+  "id": 35,
+  "method": "claims.release",
+  "params": {
+    "claim_id": "c1",
+    "exit_code": 3,
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 42,
+      "start_time": 500
+    },
+    "workspace_id": "ws-1"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": 53,
+  "method": "account.materialize",
+  "params": {
+    "claim_id": "c1",
+    "command": "login ***",
+    "name": "qa-user",
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    },
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 42,
+      "start_time": 500
+    },
+    "run_id": "run-1",
+    "workspace": "/work/app"
+  }
+}

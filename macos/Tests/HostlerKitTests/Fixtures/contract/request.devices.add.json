@@ -1,0 +1,9 @@
+{
+  "id": 57,
+  "method": "devices.add",
+  "params": {
+    "alias": "pixel-9",
+    "device": "SERIAL0001",
+    "person": true
+  }
+}

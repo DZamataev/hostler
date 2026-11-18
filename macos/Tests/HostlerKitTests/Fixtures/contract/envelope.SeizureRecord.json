@@ -1,0 +1,17 @@
+{
+  "data": {
+    "at_ms": 3000,
+    "by_pid": 77,
+    "by_workspace_path": "/work/other",
+    "forced": true,
+    "from_kind": "lease",
+    "from_pid": 42,
+    "from_source": null,
+    "from_workspace_path": "/work/app",
+    "id": "s1",
+    "resource": "screen",
+    "stranded": false
+  },
+  "error": null,
+  "ok": true
+}

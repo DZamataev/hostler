@@ -1,0 +1,9 @@
+{
+  "id": 7,
+  "method": "heavy.release",
+  "params": {
+    "exit_code": 1,
+    "id": "6f1e6a9a",
+    "outcome": "failed"
+  }
+}

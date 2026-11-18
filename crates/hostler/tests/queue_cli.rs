@@ -164,7 +164,7 @@ async fn history_shows_outcomes() {
         .collect();
     for (id, outcome, exit_code) in [
         (&ok, "ok", Value::from(0)),
-        (&stopped, "stopped", Value::Null),
+        (&stopped, "force_released", Value::Null),
         (&withdrawn, "withdrawn", Value::Null),
         (&failed, "failed", Value::from(3)),
     ] {
@@ -177,7 +177,7 @@ async fn history_shows_outcomes() {
     assert_eq!(limited["data"].as_array().unwrap().len(), 2);
 
     let text = String::from_utf8_lossy(&home.run(&["queue", "history"]).stdout).into_owned();
-    for word in ["ok", "stopped", "withdrawn", "failed", "exit 3"] {
+    for word in ["ok", "force_released", "withdrawn", "failed", "exit 3"] {
         assert!(text.contains(word), "{word}: {text}");
     }
 }

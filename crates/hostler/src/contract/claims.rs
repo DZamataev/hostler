@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::accounts::valid_account_name;
 use super::heavy::QueueSnapshot;
 use super::secrets::{ProjectRef, SecretsStatus};
-use crate::procs::{ProcessIdentity, RunGroup};
+use crate::contract::process::{ProcessIdentity, RunGroup};
 
 /// Every `--help`, guide paragraph and refusal that mentions `--force` carries it (D9).
 pub const FORCE_SENTENCE: &str =
@@ -15,10 +15,12 @@ pub const FORCE_SENTENCE: &str =
 
 /// `screen`, `account:<project_id>/<name>`, or `device:<platform>:<hardware id>` (P3b).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct ResourceId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Screen,
@@ -88,6 +90,7 @@ impl ResourceId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ResourceInfo {
     pub id: ResourceId,
     pub kind: ResourceKind,
@@ -97,6 +100,7 @@ pub struct ResourceInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum Selector {
     Exact {
@@ -110,6 +114,7 @@ pub enum Selector {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimKind {
     Lease,
@@ -118,6 +123,7 @@ pub enum ClaimKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HoldBinding {
     Ttl {
@@ -131,6 +137,7 @@ pub enum HoldBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Purpose {
     /// A command-scoped lease; `command` is already masked.
@@ -143,12 +150,14 @@ pub enum Purpose {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorkspaceRef {
     pub id: String,
     pub path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Claim {
     pub id: String,
     pub resource: ResourceInfo,
@@ -166,6 +175,7 @@ pub struct Claim {
 
 /// A claim outside hostler's own (P3b: agent-device sessions).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ForeignClaim {
     pub resource: ResourceId,
     pub source: String,
@@ -183,6 +193,7 @@ pub struct ForeignClaim {
 /// How fresh a source's foreign claims are (P3b, L52, L54). A read counter, never a clock
 /// (P3-3): `Since(seq)` = the last good read started after `seq` claim ends had been counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
     /// The source does not track claim ends: nothing waits for it.
@@ -194,6 +205,7 @@ pub enum Freshness {
 
 /// One collection of a source: its claims and their freshness, from the same read (P3-2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ForeignView {
     pub claims: Vec<ForeignClaim>,
     pub freshness: Freshness,
@@ -204,6 +216,7 @@ pub struct ForeignView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimRequest {
     /// A UUID v4 made by the client.
     pub id: String,
@@ -216,6 +229,7 @@ pub struct ClaimRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "blocker", rename_all = "snake_case")]
 pub enum Blocker {
     Claim {
@@ -237,6 +251,7 @@ pub enum Blocker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimSummary {
     pub id: String,
     /// The resource's display.
@@ -252,6 +267,7 @@ pub struct ClaimSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClaimOutcome {
     Granted {
@@ -281,6 +297,7 @@ pub enum ClaimOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimStarted {
     pub claim_id: String,
     pub child: ProcessIdentity,
@@ -288,6 +305,7 @@ pub struct ClaimStarted {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     Released,
@@ -304,6 +322,7 @@ pub enum EndReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimRelease {
     pub claim_id: String,
     pub workspace_id: String,
@@ -314,6 +333,7 @@ pub struct ClaimRelease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ReleaseOutcome {
     /// The joined hold, if it still lives.
     pub parent: Option<Claim>,
@@ -324,9 +344,16 @@ pub struct ReleaseOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimHistoryItem {
     pub id: String,
+    /// The resource's display when the claim ended: a device's alias, `screen`, or
+    /// `account <name>`. Mutable, so nothing matches on it (P5-L16); see `resource_id`.
     pub resource: String,
+    /// The resource's stable id (`device:ios:<udid>`, `screen`, `account:<project>:<name>`).
+    /// `None` for a row recorded before P5-L16 and for a request that never got a resource.
+    #[serde(default)]
+    pub resource_id: Option<ResourceId>,
     pub kind: ClaimKind,
     pub workspace_path: String,
     pub command: Option<String>,
@@ -339,6 +366,7 @@ pub struct ClaimHistoryItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WaitingRequest {
     pub request_id: String,
     pub ticket: u64,
@@ -348,6 +376,7 @@ pub struct WaitingRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ResourceState {
     pub resource: ResourceInfo,
     pub claims: Vec<Claim>,
@@ -361,11 +390,16 @@ pub struct ResourceState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClaimsSnapshot {
     pub resources: Vec<ResourceState>,
+    /// P5 (spec §6.2): the last event `seq` assigned when this snapshot was taken; in a
+    /// `claims.changed` event, that event's own `seq`.
+    pub as_of_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizeBegin {
     pub resource: ResourceId,
     pub confirmation: String,
@@ -374,6 +408,7 @@ pub struct SeizeBegin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StopTarget {
     RunGroup {
@@ -395,6 +430,7 @@ pub enum StopTarget {
 
 /// `target` indexes `SeizePlan.stops`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StopEvidence {
     Gone {
@@ -408,6 +444,7 @@ pub enum StopEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizePlan {
     pub plan_id: String,
     pub claims: Vec<Claim>,
@@ -417,6 +454,7 @@ pub struct SeizePlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizeCommit {
     pub plan_id: String,
     pub requester: ProcessIdentity,
@@ -425,13 +463,22 @@ pub struct SeizeCommit {
 
 /// `claims.seize_progress` (L29): the taker extends its plan before each target it stops.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizeProgress {
     pub plan_id: String,
     pub requester: ProcessIdentity,
 }
 
+/// `claims.seize_progress`'s answer: the plan's new expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct SeizeProgressReply {
+    pub expires_at_ms: i64,
+}
+
 /// `claims.seize_commit`'s answer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizeOutcome {
     pub outcome: ClaimOutcome,
     /// A target passed only on the taker's `JobGone` evidence (L30): the seizure is recorded
@@ -442,6 +489,7 @@ pub struct SeizeOutcome {
 /// What a seizure took the resource from: one of hostler's claim kinds, or a foreign claim
 /// (P3b: an agent-device session). The claim kinds serialize as `ClaimKind` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SeizedFrom {
     Lease,
@@ -467,6 +515,7 @@ impl PartialEq<ClaimKind> for SeizedFrom {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SeizureRecord {
     pub id: String,
     pub resource: String,
@@ -486,14 +535,21 @@ pub struct SeizureRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorkspaceResolve {
     pub project: ProjectRef,
     /// The checkout's root as the CLI displays it (`project::display_path`: on Windows without
     /// the `\\?\` prefix). The service canonicalizes it before comparing it with anything.
     pub root: String,
+    /// P5: the checkout's `hostler.toml` declarations (names and purposes only), stored per
+    /// project when they differ from the stored ones. `None` (no `hostler.toml`) leaves the
+    /// stored declaration alone.
+    #[serde(default)]
+    pub declared: Option<crate::contract::projects::ProjectDecl>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceOutcome {
     Registered,
@@ -503,6 +559,7 @@ pub enum WorkspaceOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorkspaceInfo {
     pub id: String,
     pub project_id: String,
@@ -514,6 +571,7 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Overview {
     pub service_version: String,
     pub heavy: QueueSnapshot,
@@ -638,7 +696,7 @@ pub(crate) mod fixtures {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::procs::RunGroup;
+    use crate::contract::process::RunGroup;
 
     pub fn identity(pid: u32) -> ProcessIdentity {
         ProcessIdentity {
@@ -733,6 +791,7 @@ pub(crate) mod fixtures {
         ClaimHistoryItem {
             id: "c1".into(),
             resource: "screen".into(),
+            resource_id: Some(ResourceId("screen".into())),
             kind: ClaimKind::Lease,
             workspace_path: "/work/app".into(),
             command: Some("make test".into()),
@@ -746,6 +805,7 @@ pub(crate) mod fixtures {
 
     pub fn snapshot() -> ClaimsSnapshot {
         ClaimsSnapshot {
+            as_of_seq: 0,
             resources: vec![ResourceState {
                 resource: screen(),
                 claims: vec![claim()],
@@ -790,7 +850,7 @@ mod tests {
     use super::fixtures::*;
     use super::*;
     use crate::contract::ErrorCode;
-    use crate::procs::RunGroup;
+    use crate::contract::process::RunGroup;
 
     const UUID: &str = "0b7e7c55-7a3e-4b0e-9c2b-1f2d3e4f5a6b";
 

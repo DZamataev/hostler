@@ -1,0 +1,8 @@
+{
+  "code": "bad_request",
+  "details": {
+    "not_available_yet": "heavy.stop"
+  },
+  "message": "heavy.stop is not available in this hostler build yet",
+  "recovery": null
+}

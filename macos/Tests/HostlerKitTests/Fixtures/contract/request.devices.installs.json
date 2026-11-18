@@ -1,0 +1,11 @@
+{
+  "id": 61,
+  "method": "devices.installs",
+  "params": {
+    "device": null,
+    "query": {
+      "limit": 20,
+      "since_ms": 1000
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": 36,
+  "method": "claims.force_release",
+  "params": {
+    "claim_id": "c1",
+    "confirmation": "screen",
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 77,
+      "start_time": 500
+    },
+    "workspace_id": "ws-2"
+  }
+}

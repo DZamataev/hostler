@@ -1,0 +1,7 @@
+{
+  "id": 12,
+  "method": "queue.set_capacity",
+  "params": {
+    "capacity": 2
+  }
+}

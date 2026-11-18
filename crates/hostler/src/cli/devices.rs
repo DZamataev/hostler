@@ -1801,6 +1801,7 @@ mod tests {
             updated,
         };
         let detail = DeviceDetail {
+            sessions_unknown: None,
             info: fixtures::info(),
             apps: vec![
                 app(
@@ -2046,6 +2047,7 @@ mod tests {
         info.note = Some("x\u{1b}[2J".into());
         info.sessions[0].workspace_path = "/work/\u{1b}]0;X\u{7}".into();
         let mut claims = ClaimsSnapshot {
+            as_of_seq: 0,
             resources: Vec::new(),
         };
         let state = ResourceState {

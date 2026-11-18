@@ -1,0 +1,9 @@
+{
+  "id": 58,
+  "method": "devices.rename",
+  "params": {
+    "alias": "pixel-9-left",
+    "device": "pixel-9",
+    "person": false
+  }
+}

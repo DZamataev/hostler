@@ -1,0 +1,7 @@
+{
+  "id": 46,
+  "method": "claims.seize_abort",
+  "params": {
+    "plan_id": "p1"
+  }
+}

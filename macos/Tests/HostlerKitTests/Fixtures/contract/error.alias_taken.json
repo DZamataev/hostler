@@ -1,0 +1,9 @@
+{
+  "code": "alias_taken",
+  "details": {
+    "alias": "pixel-9",
+    "holder": "pixel-8"
+  },
+  "message": "the alias pixel-9 is taken by pixel-8",
+  "recovery": "choose another alias, or: hostler devices rename pixel-8 <other>"
+}

@@ -923,8 +923,8 @@ async fn request_steps_need_an_approved_unlocked_project() {
     );
 
     // Approved and unlocked: the declared secret is missing, so the agent asks for it.
-    approve(&home, repo.path(), 4).await;
-    unlock(&home, 4).await;
+    approve(&home, repo.path(), hostler::contract::CONTRACT_VERSION).await;
+    unlock(&home, hostler::contract::CONTRACT_VERSION).await;
     let out = init(&home, repo.path(), &["--json"]);
     let discovered = report(&out);
     let ids = step_ids(&discovered);
@@ -1456,7 +1456,7 @@ async fn never_installs_over_a_busy_unlocked_or_newer_service() {
     // Unlocked: the database is live work, so nothing stops it.
     let home = Arc::new(TestHome::new());
     let unlocked = Service::start(&home, &[]);
-    unlock(&home, 4).await;
+    unlock(&home, hostler::contract::CONTRACT_VERSION).await;
     assert_eq!(status_json(&home)["data"]["secrets_unlocked"], true);
     let repo = checkout(Some("kmp"));
     let registrar = FakeRegistrar::new(home.clone(), RegistrationState::Outdated);
@@ -1480,7 +1480,7 @@ async fn never_installs_over_a_busy_unlocked_or_newer_service() {
 
     // Newer: this client never stops a newer service.
     let home = Arc::new(TestHome::new());
-    let newer = Service::start(&home, &[("HOSTLER_TEST_CONTRACT_VERSION", "5")]);
+    let newer = Service::start(&home, &[("HOSTLER_TEST_CONTRACT_VERSION", "6")]);
     let repo = checkout(Some("kmp"));
     let registrar = FakeRegistrar::new(home.clone(), RegistrationState::Absent);
     let socket = front_socket(&home);
@@ -1501,7 +1501,7 @@ async fn never_installs_over_a_busy_unlocked_or_newer_service() {
         "{report}"
     );
     assert_eq!(pid(&home), Some(newer.pid()), "the service was stopped");
-    assert_eq!(status_json(&home)["data"]["contract_version"], 5);
+    assert_eq!(status_json(&home)["data"]["contract_version"], 6);
     assert_eq!(registrar.registers(), 0);
     // A newer service is decided before any stop: no shutdown reaches it.
     assert!(proxy.shutdowns().is_empty(), "{:?}", proxy.methods());
@@ -1551,7 +1551,7 @@ async fn current_registration_mismatch_rows() {
         },
         Row {
             name: "newer contract",
-            vars: &[("HOSTLER_TEST_CONTRACT_VERSION", "5")],
+            vars: &[("HOSTLER_TEST_CONTRACT_VERSION", "6")],
             unlocked: false,
             busy: false,
             preview: "mismatch_kept",
@@ -1684,7 +1684,7 @@ async fn current_registration_mismatch_rows() {
             assert_ne!(pid(&home), Some(old_pid), "{}: no replacement", row.name);
             assert_eq!(
                 status_json(&home)["data"]["contract_version"],
-                4,
+                hostler::contract::CONTRACT_VERSION,
                 "{}: the new service's contract",
                 row.name
             );

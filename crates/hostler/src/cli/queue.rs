@@ -1,5 +1,6 @@
 //! `hostler queue …` (plan Task 9): look at the heavy queue and its history, withdraw a waiting
-//! request, force-release a slot, set the capacity.
+//! request, force-release a slot, set the capacity; and (P5 Task 6) a person's stop of a running
+//! task, which the service itself performs (spec §11.1).
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use super::output::{call, print_error, report};
 use super::wait::duration_text;
 use crate::contract::heavy::{
     DEFAULT_HISTORY_LIMIT, EntrySource, HeavyEntry, HeavyHistoryItem, HistoryQuery, QueueSnapshot,
+    QueueStopOutcome,
 };
 use crate::contract::wire::Request;
 use crate::contract::{ErrorCode, HostlerError};
@@ -58,6 +60,27 @@ enum QueueCommand {
     /// The number of heavy tasks that may run at once.
     #[command(subcommand)]
     Capacity(CapacityCommand),
+    /// Stop a running heavy task and free its slot: the service stops its processes, checks
+    /// that they are gone, and records it as stopped (a person command: the master password is
+    /// asked).
+    #[command(after_help = crate::cli::secrets::PERSON_ONLY)]
+    Stop {
+        /// The task's id.
+        id: String,
+        // An explicit help: clap would drop the D9 sentence's final period from a doc comment.
+        #[arg(
+            long,
+            help = "Required: the task's processes are stopped. An agent uses --force only with \
+                    the operator's explicit permission."
+        )]
+        force: bool,
+        /// The task's id again, to confirm.
+        #[arg(long, value_name = "ID")]
+        confirmation: Option<String>,
+        /// Print the contract's JSON envelope.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,6 +109,16 @@ fn parse_since(s: &str) -> Result<Duration, String> {
 }
 
 pub fn main(args: QueueArgs) -> ExitCode {
+    // A person command: it prompts, so it runs outside the async runtime below.
+    if let Some(QueueCommand::Stop {
+        id,
+        force,
+        confirmation,
+        json,
+    }) = args.command
+    {
+        return stop::main(id, force, confirmation, json);
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -126,6 +159,7 @@ async fn run(args: QueueArgs) -> ExitCode {
             call::<()>(Request::HeavyForceRelease { id: id.clone() }).await,
             &format!("Released {id}; its processes were not stopped."),
         ),
+        Some(QueueCommand::Stop { .. }) => unreachable!("answered before the runtime starts"),
         Some(QueueCommand::Capacity(CapacityCommand::Set { capacity })) => done(
             call::<()>(Request::QueueSetCapacity { capacity }).await,
             &format!("Heavy-queue capacity set to {capacity}."),
@@ -142,6 +176,153 @@ fn force_required(id: &str) -> HostlerError {
         ),
         details: json!({ "id": id }),
         recovery: Some(format!("hostler queue release --id {id} --force")),
+    }
+}
+
+/// `hostler queue stop` (P5 Task 6, spec §11.1): the CLI's terminal check, the master password
+/// proven on one connection (the person gate, §8.5), then the service's `heavy.stop` on it.
+mod stop {
+    use super::*;
+    use crate::cli::tty::Tty;
+    use crate::client::Client;
+    use crate::contract::secrets::{ProofGrant, Prove};
+    use crate::secrets::value::SecretValue;
+
+    /// Typed passwords before giving up, as `hostler unlock`.
+    const TRIES: usize = 3;
+    /// The longest wait of the service's limit on password checks that this sits out.
+    const LIMIT_WAIT_MAX_MS: u64 = 30_000;
+
+    pub(super) fn main(
+        id: String,
+        force: bool,
+        confirmation: Option<String>,
+        json: bool,
+    ) -> ExitCode {
+        let result = run(&id, force, confirmation.as_deref());
+        let code = match &result {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+        report(result, json, print_stopped);
+        code
+    }
+
+    fn run(
+        id: &str,
+        force: bool,
+        confirmation: Option<&str>,
+    ) -> Result<QueueStopOutcome, HostlerError> {
+        if !force {
+            return Err(force_required(id));
+        }
+        if confirmation != Some(id) {
+            return Err(confirm_with_id(id));
+        }
+        crate::service::harden::harden_value_holder();
+        let mut tty = Tty::open("queue stop")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                crate::cli::secrets::internal(format!("cannot start the async runtime: {e}"))
+            })?;
+        let paths = crate::client::resolve_paths()?;
+        // One connection: the proof grants only the connection it was made on.
+        let mut client = runtime.block_on(Client::connect(&paths))?;
+        let mut last = None;
+        let mut proven = false;
+        for _ in 0..TRIES {
+            let password = tty.hidden(&format!("Master password, to stop heavy task {id}:"))?;
+            match runtime.block_on(prove(&mut client, password)) {
+                Ok(()) => {
+                    proven = true;
+                    break;
+                }
+                Err(e) if e.code == ErrorCode::UnlockFailed => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        if !proven {
+            return Err(last.unwrap_or_else(crate::contract::secrets::errors::unlock_failed));
+        }
+        let answer = runtime.block_on(client.call(Request::HeavyStop {
+            id: id.to_owned(),
+            confirmation: id.to_owned(),
+        }))?;
+        serde_json::from_value(answer).map_err(|e| {
+            crate::cli::secrets::internal(format!("unreadable answer from the service: {e}"))
+        })
+    }
+
+    /// `secrets.prove` of one typed password. A short `proof_limited` (the next check after a
+    /// mistyped password waits 1, 2, 4 … s) is waited out and the same password sent again; a
+    /// longer one is the error.
+    async fn prove(client: &mut Client, password: SecretValue) -> Result<(), HostlerError> {
+        loop {
+            let request = Request::SecretsProve(Prove {
+                password: password.clone(),
+                key_file: None,
+            });
+            match client.call(request).await {
+                Ok(answer) => {
+                    return serde_json::from_value::<ProofGrant>(answer)
+                        .map(drop)
+                        .map_err(|e| {
+                            crate::cli::secrets::internal(format!(
+                                "unreadable answer from the service: {e}"
+                            ))
+                        });
+                }
+                Err(e) if e.code == ErrorCode::ProofLimited => {
+                    let wait = e.details["retry_after_ms"].as_u64().unwrap_or(1_000);
+                    if wait > LIMIT_WAIT_MAX_MS {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "[hostler] the service checks the next password in {} s; waiting",
+                        wait.div_ceil(1000)
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub(super) fn force_required(id: &str) -> HostlerError {
+        HostlerError {
+            code: ErrorCode::ForceRequired,
+            message: format!(
+                "stopping {id} ends its processes; {}",
+                crate::contract::claims::FORCE_SENTENCE
+            ),
+            details: json!({ "id": id }),
+            recovery: Some(format!(
+                "hostler queue stop {id} --force --confirmation {id}"
+            )),
+        }
+    }
+
+    /// The service's own text for a confirmation that is not the id (it checks too).
+    pub(super) fn confirm_with_id(id: &str) -> HostlerError {
+        HostlerError {
+            code: ErrorCode::BadRequest,
+            message: "type the task's id to confirm".into(),
+            details: json!({ "id": id }),
+            recovery: Some(format!(
+                "hostler queue stop {id} --force --confirmation {id}"
+            )),
+        }
+    }
+
+    fn print_stopped(o: &QueueStopOutcome) {
+        let id = crate::secrets::sanitize_for_terminal(&o.id);
+        if o.stopped {
+            println!("Stopped heavy task {id}; its slot is free.");
+        } else {
+            println!("Heavy task {id} had already ended; nothing was stopped, its slot is free.");
+        }
     }
 }
 
@@ -236,6 +417,69 @@ fn history_line(i: &HeavyHistoryItem, now_ms: i64) -> String {
 mod tests {
     use super::*;
     use crate::contract::heavy::{HeavyOutcome, HeavyState};
+
+    /// P5 Task 6: `queue stop` is listed, takes the id and its confirmation, and its `--force`
+    /// help carries the D9 sentence.
+    #[test]
+    fn queue_stop_is_listed_with_the_sentence() {
+        use clap::{CommandFactory, Parser};
+
+        let root = crate::cli::Cli::command();
+        let stop = root
+            .find_subcommand("queue")
+            .and_then(|q| q.find_subcommand("stop"))
+            .unwrap();
+        assert!(!stop.is_hide_set());
+        let force = stop
+            .get_arguments()
+            .find(|a| a.get_id() == "force")
+            .and_then(|a| a.get_help())
+            .map(|h| h.to_string())
+            .unwrap();
+        assert!(
+            force.contains(crate::contract::claims::FORCE_SENTENCE),
+            "{force}"
+        );
+        let cli = crate::cli::Cli::try_parse_from([
+            "hostler",
+            "queue",
+            "stop",
+            "e1",
+            "--force",
+            "--confirmation",
+            "e1",
+            "--json",
+        ])
+        .unwrap();
+        let crate::cli::Command::Queue(args) = cli.command else {
+            panic!("not a queue command");
+        };
+        assert!(matches!(
+            args.command,
+            Some(QueueCommand::Stop { ref id, force: true, confirmation: Some(ref c), json: true })
+                if id == "e1" && c == "e1"
+        ));
+    }
+
+    #[test]
+    fn queue_stop_refusals_name_the_full_command() {
+        let e = stop::force_required("e1");
+        assert_eq!(e.code, ErrorCode::ForceRequired);
+        assert_eq!(
+            e.message,
+            "stopping e1 ends its processes; An agent uses --force only with the operator's \
+             explicit permission."
+        );
+        assert_eq!(
+            e.recovery.as_deref(),
+            Some("hostler queue stop e1 --force --confirmation e1")
+        );
+        let e = stop::confirm_with_id("e1");
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            (ErrorCode::BadRequest, "type the task's id to confirm")
+        );
+    }
 
     #[test]
     fn since_accepts_units_and_rejects_the_rest() {

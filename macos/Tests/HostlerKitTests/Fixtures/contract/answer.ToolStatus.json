@@ -1,0 +1,14 @@
+{
+  "adb": null,
+  "adb_state": "missing",
+  "agent_device": null,
+  "agent_device_in_use": false,
+  "emulator": "/sdk/emulator/emulator",
+  "ideviceinfo": "/opt/homebrew/bin/ideviceinfo",
+  "node": null,
+  "problems": [],
+  "sessions_known": false,
+  "sessions_last_good_ms": null,
+  "sessions_reason": "agent-device is not installed",
+  "xcrun": true
+}

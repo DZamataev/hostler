@@ -1,0 +1,6 @@
+{
+  "code": "queue_busy",
+  "details": {},
+  "message": "the heavy queue is full",
+  "recovery": "hostler queue"
+}

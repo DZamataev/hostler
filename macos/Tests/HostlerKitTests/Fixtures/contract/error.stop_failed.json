@@ -1,0 +1,12 @@
+{
+  "code": "stop_failed",
+  "details": {
+    "id": "h1",
+    "pids": [
+      42,
+      43
+    ]
+  },
+  "message": "hostler could not stop heavy task h1; it keeps its slot",
+  "recovery": "the task still runs; stop it from its terminal, or: hostler queue release --id h1 --force"
+}

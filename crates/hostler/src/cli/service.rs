@@ -635,6 +635,8 @@ mod tests {
     #[test]
     fn older_service_note_names_the_ways_to_restart() {
         let status = |contract, version: &str| ServiceStatus {
+            exe: None,
+            instance: None,
             service_version: version.into(),
             contract_version: contract,
             pid: 1,
@@ -688,6 +690,8 @@ mod tests {
 
     fn running() -> ServiceStatus {
         ServiceStatus {
+            exe: None,
+            instance: None,
             service_version: "0.0.1".into(),
             contract_version: CONTRACT_VERSION,
             pid: 42,

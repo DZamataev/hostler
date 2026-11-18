@@ -28,19 +28,22 @@ use crate::service::server::{MAX_FRAME_BYTES, socket_name};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CALL_TIMEOUT: Duration = Duration::from_millis(crate::contract::methods::CALL_MS);
 /// `secrets.unlock`: the KDF of opening (or creating) the database, maybe calibrated to seconds.
-pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(120);
+pub const UNLOCK_TIMEOUT: Duration = Duration::from_millis(crate::contract::methods::UNLOCK_MS);
 /// Methods that may open, re-read or save the KDBX (one KDF each).
-pub const VAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub const VAULT_CALL_TIMEOUT: Duration = Duration::from_millis(crate::contract::methods::VAULT_MS);
 /// `devices.boot`: the emulator's start plus `bootstatus` (180 s), with room (P3b).
-pub const DEVICE_BOOT_TIMEOUT: Duration = Duration::from_secs(200);
+pub const DEVICE_BOOT_TIMEOUT: Duration =
+    Duration::from_millis(crate::contract::methods::DEVICE_BOOT_MS);
 /// `claims.seize_commit`: the service first reads agent-device's status once more, up to its
 /// 5 s bound plus a lane wait (P-2, P2-9).
-pub const SEIZE_COMMIT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const SEIZE_COMMIT_TIMEOUT: Duration =
+    Duration::from_millis(crate::contract::methods::SEIZE_COMMIT_MS);
 /// `devices.show` with `fresh_sessions`: up to 6 s for a sessions read that started after the
 /// call (L49, P2-15).
-pub const FRESH_SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const FRESH_SESSIONS_TIMEOUT: Duration =
+    Duration::from_millis(crate::contract::methods::DEVICES_SHOW_MS);
 /// The whole start-and-retry window of `connect_or_start`, every attempt included.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const START_RETRY_EVERY: Duration = Duration::from_millis(100);
@@ -63,41 +66,12 @@ type SensitiveIds = Arc<Mutex<HashSet<u64>>>;
 
 /// `sensitive_answer` for a typed request: these answers carry values.
 fn answer_is_sensitive(req: &Request) -> bool {
-    matches!(
-        req,
-        Request::SecretMaterialize(_) | Request::AccountMaterialize(_)
-    )
+    crate::contract::wire::sensitive_answer(crate::contract::methods::method_name(req))
 }
 
-/// How long a call may wait for its answer.
+/// How long a call may wait for its answer: the method table's bound (contract 5).
 pub fn call_bound(req: &Request) -> Duration {
-    match req {
-        Request::SecretsUnlock(_) => UNLOCK_TIMEOUT,
-        Request::SecretList { .. }
-        | Request::SecretSet(_)
-        | Request::SecretRemove { .. }
-        | Request::SecretImport(_)
-        | Request::SecretRequest(_)
-        | Request::SecretShare(_)
-        | Request::SecretMaterialize(_)
-        | Request::AccountList { .. }
-        | Request::AccountSet(_)
-        | Request::AccountRemove(_)
-        | Request::AccountCheck { .. }
-        | Request::AccountMaterialize(_) => VAULT_CALL_TIMEOUT,
-        // The registry calls wait for the claims lock and a store write; as long as a vault call.
-        Request::DevicesAdd { .. }
-        | Request::DevicesRename { .. }
-        | Request::DevicesRemove { .. }
-        | Request::DevicesForgetSessions { .. } => VAULT_CALL_TIMEOUT,
-        Request::DevicesBoot { .. } => DEVICE_BOOT_TIMEOUT,
-        Request::ClaimsSeizeCommit(_) => SEIZE_COMMIT_TIMEOUT,
-        Request::DevicesShow {
-            fresh_sessions: true,
-            ..
-        } => FRESH_SESSIONS_TIMEOUT,
-        _ => CALL_TIMEOUT,
-    }
+    Duration::from_millis(crate::contract::methods::spec_of(req).timeout_ms)
 }
 
 pub struct Client {
@@ -674,7 +648,7 @@ impl Client {
                     return Err(error);
                 }
                 Incoming::Sensitive(got, line) if got == id => return Ok(Answer::Raw(line)),
-                Incoming::Frame(ServerFrame::Event { event }) => self.event = Some(event),
+                Incoming::Frame(ServerFrame::Event { event, .. }) => self.event = Some(event),
                 // A late answer to a call that timed out earlier (a sensitive one is erased).
                 _ => {}
             }
@@ -706,7 +680,7 @@ impl Client {
         }
         loop {
             match self.read_frame().await {
-                Ok(Incoming::Frame(ServerFrame::Event { event })) => return Some(event),
+                Ok(Incoming::Frame(ServerFrame::Event { event, .. })) => return Some(event),
                 Ok(_) => {}
                 Err(_) => return None,
             }
@@ -1672,7 +1646,8 @@ mod tests {
             fresh_sessions,
         };
         assert_eq!(call_bound(&show(true)), Duration::from_secs(10));
-        assert_eq!(call_bound(&show(false)), CALL_TIMEOUT);
+        // Contract 5: one bound per method in the table; a plain show gets the same 10 s.
+        assert_eq!(call_bound(&show(false)), Duration::from_secs(10));
         for registry in [
             Request::DevicesAdd {
                 device: "SERIAL0001".into(),
@@ -2024,7 +1999,7 @@ mod tests {
 
         let (mut client, service, _dir) = connected(vec![
             // A pushed event between the request and its answer.
-            now(&(r#"{"event":{"type":"secrets.lock_changed","data":{"state":"locked","database":"d","key_file":null,"pending_requests":0,"preserved_files":[]}}}"#.to_owned()
+            now(&(r#"{"event":{"type":"secrets.lock_changed","data":{"state":"locked","database":"d","key_file":null,"pending_requests":0,"preserved_files":[],"as_of_seq":1}},"seq":1}"#.to_owned()
                 + "\n"
                 + GOOD)),
             now(r#"{"id":3,"result":[{"name":"API_KEY","value":12,"x":"hunter2-canary"}]}"#),

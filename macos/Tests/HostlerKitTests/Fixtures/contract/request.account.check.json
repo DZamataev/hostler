@@ -1,0 +1,11 @@
+{
+  "id": 52,
+  "method": "account.check",
+  "params": {
+    "name": "qa-user",
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    }
+  }
+}

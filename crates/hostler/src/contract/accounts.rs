@@ -4,12 +4,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::claims::ClaimSummary;
-use super::secrets::{MaterializedSecret, ProjectRef};
-use crate::procs::ProcessIdentity;
-use crate::secrets::value::{RawCommand, SecretValue};
+use super::secrets::{ImportEntry, MaterializedSecret, ProjectRef, RequestState};
+use crate::contract::process::ProcessIdentity;
+use crate::contract::values::{RawCommand, SecretValue};
 
 /// An account's names, never its values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AccountInfo {
     pub name: String,
     pub fields: Vec<String>,
@@ -17,6 +18,7 @@ pub struct AccountInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AccountSet {
     pub project: ProjectRef,
     pub name: String,
@@ -25,6 +27,7 @@ pub struct AccountSet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AccountRemove {
     pub project: ProjectRef,
     pub name: String,
@@ -33,6 +36,7 @@ pub struct AccountRemove {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AccountMaterialize {
     pub run_id: String,
     pub claim_id: String,
@@ -45,9 +49,64 @@ pub struct AccountMaterialize {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct MaterializedAccount {
     pub name: String,
     pub fields: Vec<MaterializedSecret>,
+}
+
+/// `account.set`'s answer: the names, never the value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AccountFieldSet {
+    pub name: String,
+    pub field: String,
+}
+
+/// `account.request` (P5, spec §8.4): an agent asks a person for an account's fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AccountRequestNew {
+    /// A UUID v4 made by the client; a re-sent id answers the recorded request.
+    pub id: String,
+    pub project: ProjectRef,
+    pub name: String,
+    pub fields: Vec<String>,
+    pub reason: String,
+    pub requester: ProcessIdentity,
+}
+
+/// An account request as recorded; names only, never a value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AccountRequestInfo {
+    pub id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub name: String,
+    pub fields: Vec<String>,
+    pub reason: String,
+    pub state: RequestState,
+    pub requester_pid: u32,
+    pub created_at_ms: i64,
+    pub answered_at_ms: Option<i64>,
+}
+
+/// `account.answer` (gated, spec §8.5): every field of one request, stored in one save.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AccountAnswer {
+    pub request_id: String,
+    /// Each entry's `name` is a field name.
+    pub fields: Vec<ImportEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AccountAnswerOutcome {
+    pub name: String,
+    pub stored_fields: Vec<String>,
+    pub answered_requests: Vec<String>,
 }
 
 /// The fixed refusals of a bad name; never the name itself (it may be a pasted value).
@@ -145,7 +204,7 @@ mod tests {
         let request = AccountMaterialize {
             run_id: "run-1".into(),
             claim_id: "c1".into(),
-            requester: crate::procs::ProcessIdentity {
+            requester: crate::contract::process::ProcessIdentity {
                 pid: 42,
                 boot_id: "b1".into(),
                 start_time: 420,

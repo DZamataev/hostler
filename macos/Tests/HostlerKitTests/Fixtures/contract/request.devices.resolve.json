@@ -1,0 +1,7 @@
+{
+  "id": 56,
+  "method": "devices.resolve",
+  "params": {
+    "device": "emulator-5554"
+  }
+}

@@ -8,21 +8,26 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::HostlerError;
-use super::accounts::{AccountMaterialize, AccountRemove, AccountSet};
+use super::accounts::{
+    AccountAnswer, AccountMaterialize, AccountRemove, AccountRequestInfo, AccountRequestNew,
+    AccountSet,
+};
 use super::claims::{
     ClaimRelease, ClaimRequest, ClaimStarted, ClaimsSnapshot, ResourceId, SeizeBegin, SeizeCommit,
     SeizeProgress, SeizureRecord, WorkspaceResolve,
 };
 use super::devices::{DevicesSnapshot, InstallEvent, ToolPathsSet};
 use super::heavy::{HeavyAcquire, HeavyRelease, HeavyStarted, HistoryQuery, QueueSnapshot};
+use super::projects::ProjectsSnapshot;
 use super::secrets::{
-    DeclaredSecret, Decline, Materialize, ProjectRef, SecretImport, SecretRequest,
+    DeclaredSecret, Decline, Materialize, ProjectRef, Prove, SecretImport, SecretRequest,
     SecretRequestInfo, SecretSet, SecretsStatus, Share, Unlock,
 };
-use crate::procs::ProcessIdentity;
+use crate::contract::process::ProcessIdentity;
 
 /// Lifecycle methods are frozen forever; the rest require a matching `hello` first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
     #[serde(rename = "hello")]
@@ -229,6 +234,54 @@ pub enum Request {
         #[serde(default)]
         by_pid: Option<u32>,
     },
+    // ---- contract 5 (P5, spec §6.3) ----
+    /// Answers `ProofGrant`. Checks the master password against the database on disk and
+    /// grants this connection (spec §8.5).
+    #[serde(rename = "secrets.prove")]
+    SecretsProve(Prove),
+    /// Gated. Answers `MaterializedSecret` (a sensitive answer).
+    #[serde(rename = "secret.reveal")]
+    SecretReveal { project: ProjectRef, name: String },
+    /// Gated. Answers `MaterializedAccount` (a sensitive answer), every field.
+    #[serde(rename = "account.reveal")]
+    AccountReveal { project: ProjectRef, name: String },
+    /// Gated. Deletes one listed `hostler.kdbx.prev-*` file; answers `SecretsStatus`.
+    #[serde(rename = "secrets.remove_preserved")]
+    SecretsRemovePreserved { path: String },
+    /// Answers `AccountRequestInfo`.
+    #[serde(rename = "account.request")]
+    AccountRequest(AccountRequestNew),
+    /// Answers `AccountRequestInfo`.
+    #[serde(rename = "account.request_withdraw")]
+    AccountRequestWithdraw { id: String, timed_out: bool },
+    /// Answers `Vec<AccountRequestInfo>`, the pending ones.
+    #[serde(rename = "account.requests")]
+    AccountRequests,
+    /// Gated. Answers `AccountRequestInfo`.
+    #[serde(rename = "account.decline")]
+    AccountDecline { id: String },
+    /// Gated. Answers `AccountAnswerOutcome`; every field in one save.
+    #[serde(rename = "account.answer")]
+    AccountAnswer(AccountAnswer),
+    /// Gated. Answers `QueueStopOutcome`. No requester: the service records the socket peer's
+    /// pid, and stops and verifies itself (spec §11.1).
+    #[serde(rename = "heavy.stop")]
+    HeavyStop { id: String, confirmation: String },
+    /// Answers `ProjectsSnapshot`.
+    #[serde(rename = "projects.snapshot")]
+    ProjectsSnapshot,
+    /// Answers `RequestsSnapshot`.
+    #[serde(rename = "requests.snapshot")]
+    RequestsSnapshot,
+}
+
+/// `requests.snapshot`'s answer: every pending secret and account request (spec §6.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct RequestsSnapshot {
+    pub secrets: Vec<SecretRequestInfo>,
+    pub accounts: Vec<AccountRequestInfo>,
+    pub as_of_seq: u64,
 }
 
 /// Methods whose params may carry a value (or a command that may hold one, L12): a frame that
@@ -242,15 +295,21 @@ pub fn sensitive_request(method: &str) -> bool {
             | "secret.materialize"
             | "account.set"
             | "account.materialize"
+            | "secrets.prove"
+            | "account.answer"
     )
 }
 
 /// Methods whose answer carries values: never parsed into a `serde_json::Value`.
 pub fn sensitive_answer(method: &str) -> bool {
-    matches!(method, "secret.materialize" | "account.materialize")
+    matches!(
+        method,
+        "secret.materialize" | "account.materialize" | "secret.reveal" | "account.reveal"
+    )
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ClientFrame {
     pub id: u64,
     #[serde(flatten)]
@@ -258,14 +317,26 @@ pub struct ClientFrame {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum ServerFrame {
-    Response { id: u64, result: Value },
-    Error { id: u64, error: HostlerError },
-    Event { event: Event },
+    Response {
+        id: u64,
+        result: Value,
+    },
+    Error {
+        id: u64,
+        error: HostlerError,
+    },
+    /// `seq` (contract 5, spec §6.2): increases by one per event within one service run.
+    Event {
+        event: Event,
+        seq: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "data")]
 pub enum Event {
     #[serde(rename = "queue.changed")]
@@ -283,6 +354,62 @@ pub enum Event {
     DevicesChanged(Box<DevicesSnapshot>),
     #[serde(rename = "devices.installed")]
     DevicesInstalled(Box<InstallEvent>),
+    // ---- contract 5 (P5) ----
+    #[serde(rename = "projects.changed")]
+    ProjectsChanged(Box<ProjectsSnapshot>),
+    #[serde(rename = "accounts.request_changed")]
+    AccountRequestChanged(AccountRequestInfo),
+    /// Something could not be delivered to this connection (spec §6.2): its backlog was
+    /// cleared; the client reads every snapshot again. Events after it follow as usual.
+    #[serde(rename = "resync")]
+    Resync { reason: ResyncReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ResyncReason {
+    /// The service-wide channel overflowed for this connection.
+    Lagged,
+    /// The connection's backlog would pass its bound (256 events or 32 MiB).
+    Overflow,
+    /// An event could not be encoded within the frame limit.
+    Oversized,
+}
+
+impl Event {
+    /// The wire `type` (`queue.changed`, …), an exhaustive match.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Event::QueueChanged(_) => "queue.changed",
+            Event::SecretRequestChanged(_) => "secrets.request_changed",
+            Event::SecretsLockChanged(_) => "secrets.lock_changed",
+            Event::ClaimsChanged(_) => "claims.changed",
+            Event::ClaimsSeized(_) => "claims.seized",
+            Event::DevicesChanged(_) => "devices.changed",
+            Event::DevicesInstalled(_) => "devices.installed",
+            Event::ProjectsChanged(_) => "projects.changed",
+            Event::AccountRequestChanged(_) => "accounts.request_changed",
+            Event::Resync { .. } => "resync",
+        }
+    }
+
+    /// A snapshot event's `as_of_seq` (its own `seq` once published, spec §6.2); `None` for
+    /// request, record and resync events.
+    pub fn as_of_seq(&self) -> Option<u64> {
+        match self {
+            Event::QueueChanged(s) => Some(s.as_of_seq),
+            Event::SecretsLockChanged(s) => Some(s.as_of_seq),
+            Event::ClaimsChanged(s) => Some(s.as_of_seq),
+            Event::DevicesChanged(s) => Some(s.as_of_seq),
+            Event::ProjectsChanged(s) => Some(s.as_of_seq),
+            Event::SecretRequestChanged(_)
+            | Event::ClaimsSeized(_)
+            | Event::DevicesInstalled(_)
+            | Event::AccountRequestChanged(_)
+            | Event::Resync { .. } => None,
+        }
+    }
 }
 
 /// The tag of an adjacently tagged value (`{"<tag>":"…","<content>":…}`) and the byte length
@@ -346,9 +473,10 @@ impl fmt::Debug for ServerFrame {
                 .field("id", id)
                 .field("code", &error.code)
                 .finish(),
-            ServerFrame::Event { event } => {
+            ServerFrame::Event { event, seq } => {
                 let (kind, len) = tag_and_content_len(event, "type", "data");
                 f.debug_struct("Event")
+                    .field("seq", seq)
                     .field("type", &kind)
                     .field("data", &Bytes(len))
                     .finish()
@@ -358,7 +486,7 @@ impl fmt::Debug for ServerFrame {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
@@ -367,9 +495,9 @@ mod tests {
         AcquireOutcome, EntrySource, HeavyEntry, HeavyHistoryItem, HeavyOutcome, HeavyState,
         ServiceStatus,
     };
+    use crate::contract::process::{ProcessIdentity, RunGroup};
     use crate::contract::secrets::*;
-    use crate::procs::{ProcessIdentity, RunGroup};
-    use crate::secrets::value::{RawCommand, SecretValue};
+    use crate::contract::values::{RawCommand, SecretValue};
 
     fn identity(pid: u32) -> ProcessIdentity {
         ProcessIdentity {
@@ -420,7 +548,18 @@ mod tests {
         }
     }
 
-    fn all_requests() -> Vec<Request> {
+    /// One sample of every `Request` variant, in `Request`'s order (plan P5 Task 1; Task 3's
+    /// fixtures reuse it).
+    pub(crate) fn all_requests() -> Vec<Request> {
+        let mut all = heavy_requests();
+        all.extend(secret_requests());
+        all.extend(claims_requests());
+        all.extend(device_requests());
+        all.extend(p5_requests());
+        all
+    }
+
+    fn heavy_requests() -> Vec<Request> {
         vec![
             Request::Hello {
                 contract_version: CONTRACT_VERSION,
@@ -669,8 +808,11 @@ mod tests {
                 running: vec![entry("running")],
                 waiting: vec![entry("waiting")],
                 foreign_running: Vec::new(),
+                as_of_seq: 3,
             }),
+            seq: 3,
         };
+        assert_eq!(serde_json::to_value(&event).unwrap()["seq"], 3);
         assert_eq!(
             serde_json::from_value::<ServerFrame>(serde_json::to_value(&event).unwrap()).unwrap(),
             event
@@ -694,6 +836,8 @@ mod tests {
             waiting_heavy: 1,
             secrets_unlocked: None,
             boot_id: None,
+            instance: None,
+            exe: None,
         };
         assert_eq!(
             serde_json::to_value(status).unwrap()["contract_version"],
@@ -835,11 +979,13 @@ mod tests {
                 key_file: None,
                 pending_requests: 1,
                 preserved_files: vec!["hostler.kdbx.prev-1".into()],
+                as_of_seq: 4,
             }),
         ];
         let types = ["secrets.request_changed", "secrets.lock_changed"];
         for (event, kind) in events.into_iter().zip(types) {
-            let frame = ServerFrame::Event { event };
+            assert_eq!(event.kind(), kind);
+            let frame = ServerFrame::Event { event, seq: 4 };
             let value = serde_json::to_value(&frame).unwrap();
             assert_eq!(value["event"]["type"], kind);
             assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
@@ -869,11 +1015,9 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_requests_are_exactly_six() {
-        let sensitive: Vec<String> = secret_requests()
+    fn sensitive_requests_are_exactly_eight() {
+        let sensitive: Vec<String> = all_requests()
             .iter()
-            .chain(&all_requests())
-            .chain(&claims_requests())
             .map(|r| {
                 serde_json::to_value(r).unwrap()["method"]
                     .as_str()
@@ -890,7 +1034,9 @@ mod tests {
                 "secret.import",
                 "secret.materialize",
                 "account.set",
-                "account.materialize"
+                "account.materialize",
+                "secrets.prove",
+                "account.answer",
             ]
         );
         assert!(!sensitive_request("secret.setx"));
@@ -898,19 +1044,21 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_answer_only_materialize() {
-        for request in secret_requests()
-            .iter()
-            .chain(&all_requests())
-            .chain(&claims_requests())
-        {
-            let method = serde_json::to_value(request).unwrap()["method"]
+    fn sensitive_answer_only_materialize_and_reveal() {
+        for request in all_requests() {
+            let method = serde_json::to_value(&request).unwrap()["method"]
                 .as_str()
                 .unwrap()
                 .to_owned();
             assert_eq!(
                 sensitive_answer(&method),
-                method == "secret.materialize" || method == "account.materialize",
+                matches!(
+                    method.as_str(),
+                    "secret.materialize"
+                        | "account.materialize"
+                        | "secret.reveal"
+                        | "account.reveal"
+                ),
                 "{method}"
             );
         }
@@ -932,6 +1080,247 @@ mod tests {
         }
     }
 
+    fn p5_requests() -> Vec<Request> {
+        use crate::contract::accounts::{AccountAnswer, AccountRequestNew};
+
+        vec![
+            Request::SecretsProve(Prove {
+                password: SecretValue::new("master-pass".into()),
+                key_file: None,
+            }),
+            Request::SecretReveal {
+                project: project(),
+                name: "API_KEY".into(),
+            },
+            Request::AccountReveal {
+                project: project(),
+                name: "qa-user".into(),
+            },
+            Request::SecretsRemovePreserved {
+                path: "/state/hostler.kdbx.prev-1".into(),
+            },
+            Request::AccountRequest(AccountRequestNew {
+                id: "6f1e6a9a-2d0f-4b7c-9a41-6f0f2f7c1a11".into(),
+                project: project(),
+                name: "qa-user".into(),
+                fields: vec!["session".into(), "env".into()],
+                reason: "log in for the e2e tests".into(),
+                requester: identity(42),
+            }),
+            Request::AccountRequestWithdraw {
+                id: "6f1e6a9a".into(),
+                timed_out: false,
+            },
+            Request::AccountRequests,
+            Request::AccountDecline {
+                id: "6f1e6a9a".into(),
+            },
+            Request::AccountAnswer(AccountAnswer {
+                request_id: "6f1e6a9a".into(),
+                fields: vec![ImportEntry {
+                    name: "session".into(),
+                    value: SecretValue::new("session-value-1".into()),
+                }],
+            }),
+            Request::HeavyStop {
+                id: "6f1e6a9a".into(),
+                confirmation: "6f1e6a9a".into(),
+            },
+            Request::ProjectsSnapshot,
+            Request::RequestsSnapshot,
+        ]
+    }
+
+    #[test]
+    fn p5_requests_round_trip() {
+        let methods = [
+            "secrets.prove",
+            "secret.reveal",
+            "account.reveal",
+            "secrets.remove_preserved",
+            "account.request",
+            "account.request_withdraw",
+            "account.requests",
+            "account.decline",
+            "account.answer",
+            "heavy.stop",
+            "projects.snapshot",
+            "requests.snapshot",
+        ];
+        let requests = p5_requests();
+        assert_eq!(requests.len(), methods.len());
+        for (request, method) in requests.into_iter().zip(methods) {
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["method"], method);
+            let back: Request = serde_json::from_value(value).unwrap();
+            assert_eq!(back, request, "{method}");
+        }
+        // Unit variants have no `params`.
+        assert_eq!(
+            serde_json::to_value(Request::ProjectsSnapshot).unwrap(),
+            json!({"method": "projects.snapshot"})
+        );
+        // A 0.0.4 `workspace.resolve` (no `declared`) still reads, as `None`.
+        let old = json!({"method": "workspace.resolve",
+                         "params": {"project": {"common_dir": "/w/.git", "name": "w"},
+                                    "root": "/w"}});
+        let Request::WorkspaceResolve(r) = serde_json::from_value(old).unwrap() else {
+            panic!("not a resolve");
+        };
+        assert_eq!(r.declared, None);
+    }
+
+    /// One sample of every `Event` variant (Task 3's fixtures reuse it).
+    pub(crate) fn all_events() -> Vec<Event> {
+        use crate::contract::accounts::AccountRequestInfo;
+        use crate::contract::{claims, devices, projects};
+
+        vec![
+            Event::QueueChanged(QueueSnapshot {
+                capacity: 1,
+                running: vec![entry("running")],
+                waiting: Vec::new(),
+                foreign_running: Vec::new(),
+                as_of_seq: 1,
+            }),
+            Event::SecretRequestChanged(SecretRequestInfo {
+                id: "6f1e6a9a".into(),
+                project_id: "p1".into(),
+                project_name: "app".into(),
+                name: "API_KEY".into(),
+                reason: "tests".into(),
+                state: RequestState::Pending,
+                requester_pid: 42,
+                created_at_ms: 1_000,
+                answered_at_ms: None,
+            }),
+            Event::SecretsLockChanged(SecretsStatus {
+                state: LockState::Locked,
+                database: "/state/hostler.kdbx".into(),
+                key_file: None,
+                pending_requests: 0,
+                preserved_files: Vec::new(),
+                as_of_seq: 3,
+            }),
+            Event::ClaimsChanged(claims::fixtures::snapshot()),
+            Event::ClaimsSeized(claims::fixtures::seizure()),
+            Event::DevicesChanged(Box::new(devices::fixtures::snapshot())),
+            Event::DevicesInstalled(Box::new(devices::fixtures::install_event())),
+            Event::ProjectsChanged(Box::new(projects::fixtures::snapshot())),
+            Event::AccountRequestChanged(AccountRequestInfo {
+                id: "6f1e6a9b".into(),
+                project_id: "p1".into(),
+                project_name: "app".into(),
+                name: "qa-user".into(),
+                fields: vec!["session".into()],
+                reason: "e2e".into(),
+                state: RequestState::Stored,
+                requester_pid: 42,
+                created_at_ms: 1_000,
+                answered_at_ms: Some(2_000),
+            }),
+            Event::Resync {
+                reason: ResyncReason::Overflow,
+            },
+        ]
+    }
+
+    #[test]
+    fn events_round_trip() {
+        let kinds = [
+            "queue.changed",
+            "secrets.request_changed",
+            "secrets.lock_changed",
+            "claims.changed",
+            "claims.seized",
+            "devices.changed",
+            "devices.installed",
+            "projects.changed",
+            "accounts.request_changed",
+            "resync",
+        ];
+        let events = all_events();
+        assert_eq!(events.len(), kinds.len());
+        for (n, (event, kind)) in events.into_iter().zip(kinds).enumerate() {
+            assert_eq!(event.kind(), kind);
+            let frame = ServerFrame::Event {
+                event,
+                seq: n as u64 + 1,
+            };
+            let value = serde_json::to_value(&frame).unwrap();
+            assert_eq!(value["event"]["type"], kind);
+            assert_eq!(value["seq"], n as u64 + 1);
+            assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
+        }
+        assert_eq!(
+            serde_json::to_value(Event::Resync {
+                reason: ResyncReason::Lagged
+            })
+            .unwrap(),
+            json!({"type": "resync", "data": {"reason": "lagged"}})
+        );
+    }
+
+    /// `as_of_seq()` reads a snapshot event's point (on the wire, `data.as_of_seq`) and is
+    /// `None` exactly for request, record and resync events.
+    #[test]
+    fn as_of_seq_only_on_snapshots() {
+        for event in all_events() {
+            let value = serde_json::to_value(&event).unwrap();
+            match event.kind() {
+                "queue.changed"
+                | "secrets.lock_changed"
+                | "claims.changed"
+                | "devices.changed"
+                | "projects.changed" => {
+                    assert_eq!(event.as_of_seq(), value["data"]["as_of_seq"].as_u64())
+                }
+                _ => assert_eq!(event.as_of_seq(), None, "{}", event.kind()),
+            }
+        }
+    }
+
+    /// The frozen lifecycle (P5): a 0.0.4 `service.status` answer, without `instance` and
+    /// `exe`, still parses, and a P5 answer still reads in 0.0.4's shape.
+    #[test]
+    fn status_without_new_fields_parses() {
+        let old = json!({
+            "service_version": "0.0.4",
+            "contract_version": 4,
+            "pid": 42,
+            "running_heavy": 0,
+            "waiting_heavy": 0,
+            "secrets_unlocked": false,
+            "boot_id": "b1",
+        });
+        let status: ServiceStatus = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            (status.instance.as_deref(), status.exe.as_deref()),
+            (None, None)
+        );
+        assert_eq!(serde_json::to_value(&status).unwrap(), old);
+        let new = ServiceStatus {
+            instance: Some("8f0c".into()),
+            exe: Some("/usr/local/bin/hostler".into()),
+            ..status
+        };
+        let value = serde_json::to_value(&new).unwrap();
+        assert_eq!(value["instance"], "8f0c");
+        assert_eq!(value["exe"], "/usr/local/bin/hostler");
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldStatus {
+            service_version: String,
+            contract_version: u32,
+            pid: u32,
+            running_heavy: u32,
+            waiting_heavy: u32,
+            secrets_unlocked: Option<bool>,
+            boot_id: Option<String>,
+        }
+        assert!(serde_json::from_value::<OldStatus>(value).is_ok());
+    }
+
     fn claims_requests() -> Vec<Request> {
         use crate::contract::accounts::{AccountMaterialize, AccountRemove, AccountSet};
         use crate::contract::claims::fixtures;
@@ -942,6 +1331,7 @@ mod tests {
             Request::WorkspaceResolve(WorkspaceResolve {
                 project: project(),
                 root: "/work/app".into(),
+                declared: Some(crate::contract::projects::fixtures::decl()),
             }),
             Request::WorkspaceList,
             Request::ClaimsAcquire(fixtures::request()),
@@ -1010,6 +1400,10 @@ mod tests {
             Request::ClaimsSeizeAbort {
                 plan_id: "p1".into(),
             },
+            Request::ClaimsSeizeProgress(SeizeProgress {
+                plan_id: "p1".into(),
+                requester: identity(77),
+            }),
             Request::StatusOverview,
             Request::AccountList { project: project() },
             Request::AccountSet(AccountSet {
@@ -1059,6 +1453,7 @@ mod tests {
             "claims.seize_begin",
             "claims.seize_commit",
             "claims.seize_abort",
+            "claims.seize_progress",
             "status.overview",
             "account.list",
             "account.set",
@@ -1085,7 +1480,8 @@ mod tests {
             Event::ClaimsSeized(fixtures::seizure()),
         ];
         for (event, kind) in events.into_iter().zip(["claims.changed", "claims.seized"]) {
-            let frame = ServerFrame::Event { event };
+            assert_eq!(event.kind(), kind);
+            let frame = ServerFrame::Event { event, seq: 9 };
             let value = serde_json::to_value(&frame).unwrap();
             assert_eq!(value["event"]["type"], kind);
             assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
@@ -1185,7 +1581,8 @@ mod tests {
             .into_iter()
             .zip(["devices.changed", "devices.installed"])
         {
-            let frame = ServerFrame::Event { event };
+            assert_eq!(event.kind(), kind);
+            let frame = ServerFrame::Event { event, seq: 10 };
             let value = serde_json::to_value(&frame).unwrap();
             assert_eq!(value["event"]["type"], kind);
             assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
@@ -1310,9 +1707,12 @@ mod tests {
                 key_file: None,
                 pending_requests: 0,
                 preserved_files: Vec::new(),
+                as_of_seq: 0,
             }),
+            seq: 12,
         };
         let printed = format!("{event:?}");
+        assert!(printed.contains("seq: 12"), "{printed}");
         assert!(printed.contains("secrets.lock_changed"), "{printed}");
         assert!(!printed.contains("hunter2"), "{printed}");
     }

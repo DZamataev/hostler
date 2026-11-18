@@ -1,0 +1,12 @@
+{
+  "id": 51,
+  "method": "account.remove",
+  "params": {
+    "field": "env",
+    "name": "qa-user",
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    }
+  }
+}

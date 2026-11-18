@@ -1,0 +1,7 @@
+{
+  "id": 54,
+  "method": "devices.list",
+  "params": {
+    "all": true
+  }
+}

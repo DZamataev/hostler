@@ -1,0 +1,15 @@
+[
+  {
+    "command": "xcodebuild test",
+    "cwd": "/work/app/ios",
+    "enqueued_at_ms": 500,
+    "exit_code": 65,
+    "finished_at_ms": 900,
+    "granted_at_ms": 600,
+    "id": "h0",
+    "kind": "xcodebuild",
+    "outcome": "failed",
+    "ticket": 2,
+    "workspace_root": null
+  }
+]

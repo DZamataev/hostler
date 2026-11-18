@@ -1,0 +1,13 @@
+{
+  "id": 50,
+  "method": "account.set",
+  "params": {
+    "field": "session",
+    "name": "qa-user",
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    },
+    "value": "session-value-1"
+  }
+}

@@ -243,16 +243,17 @@ fn record(
     setting: Option<(&str, &str)>,
     events: Vec<InstallEvent>,
 ) {
-    let stored = svc
-        .store()
-        .put_device_snapshot(r, apps, at_ms, setting, &events);
+    let store = svc.store();
+    let stored = store.put_device_snapshot(r, apps, at_ms, setting, &events);
     if let Err(e) = stored {
         tracing::warn!("cannot record an app snapshot and its installs: {e:#}");
         return;
     }
+    // Published under the store guard that committed them (spec §6.2).
     for event in events {
         svc.emit(Event::DevicesInstalled(Box::new(event)));
     }
+    drop(store);
 }
 
 /// One good snapshot's bookkeeping and the source of each of its `changes`, against the windows
@@ -1268,7 +1269,7 @@ pub(crate) mod tests {
             }
         }
         let clock = Arc::new(Moving(AtomicI64::new(1_000_000)));
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let (tx, _) = crate::service::events::EventBus::channel(16);
         // No xcrun: a read that runs fails at once.
         let (svc, _) = DevicesService::with_clock(
             crate::store::Store::open_in_memory().unwrap(),
@@ -1316,7 +1317,7 @@ pub(crate) mod tests {
                 self.0
             }
         }
-        let (tx, mut events) = tokio::sync::broadcast::channel(16);
+        let (tx, mut events) = crate::service::events::EventBus::channel(16);
         let (svc, _) = DevicesService::with_clock(
             crate::store::Store::open_in_memory().unwrap(),
             tools::ToolPaths::default(),
@@ -1416,7 +1417,7 @@ pub(crate) mod tests {
         store
             .upsert_workspace("w", &project.id, "/work/app", "/work/app/.git", 1)
             .unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let (tx, _) = crate::service::events::EventBus::channel(16);
         // No xcrun: every simulator read fails at once.
         let (svc, _) =
             DevicesService::with_clock(store, tools::ToolPaths::default(), tx, clock.clone());
@@ -1466,6 +1467,7 @@ pub(crate) mod tests {
         super::super::windows::on_claims(
             &svc,
             &crate::contract::claims::ClaimsSnapshot {
+                as_of_seq: 0,
                 resources: Vec::new(),
             },
             now(),

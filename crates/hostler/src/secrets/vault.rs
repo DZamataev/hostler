@@ -230,6 +230,11 @@ struct Open {
 pub struct Vault {
     path: PathBuf,
     open: Option<Open>,
+    /// The unlock generation (P5, spec §8.5): increased on every real transition: open to
+    /// locked (explicit, a conflict, a removed file, shutdown) and locked to open (a successful
+    /// unlock or create). A lock of a locked vault changes nothing. A proof grant records it; a
+    /// gated method is admitted only under the same generation.
+    generation: u64,
     #[cfg(debug_assertions)]
     test: TestHooks,
 }
@@ -258,6 +263,7 @@ impl Vault {
         Vault {
             path,
             open: None,
+            generation: 0,
             #[cfg(debug_assertions)]
             test: TestHooks {
                 pause: std::env::var("HOSTLER_TEST_VAULT_PAUSE")
@@ -275,6 +281,20 @@ impl Vault {
                 ..TestHooks::default()
             },
         }
+    }
+
+    /// The unlock generation (see the field).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn next_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The database file at this path, read now (for `secrets.prove`).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn state(&self) -> LockState {
@@ -321,6 +341,7 @@ impl Vault {
             key,
             fingerprint: sha256(&bytes),
         });
+        self.next_generation();
         if durable {
             Ok(())
         } else {
@@ -342,12 +363,16 @@ impl Vault {
             key,
             fingerprint: sha256(&bytes),
         });
+        self.next_generation();
         Ok(())
     }
 
-    /// Drops the database and the key (both erase themselves on drop).
+    /// Drops the database and the key (both erase themselves on drop). Locking an open vault is
+    /// a new generation; locking a locked one changes nothing.
     pub fn lock(&mut self) {
-        self.open = None;
+        if self.open.take().is_some() {
+            self.next_generation();
+        }
     }
 
     pub fn read<T>(&mut self, f: impl FnOnce(&Database) -> T) -> Result<T, VaultError> {
@@ -755,6 +780,12 @@ pub fn recover_at_start(kdbx: &Path) -> Recovery {
     }
 }
 
+/// Whether `key` opens the database `bytes` (`secrets.prove`): the KDF runs, nothing is kept.
+/// The errors are `open_db`'s.
+pub fn check_key(bytes: &[u8], key: &VaultKey) -> Result<(), VaultError> {
+    open_db(bytes, key).map(drop)
+}
+
 fn open_db(bytes: &[u8], key: &VaultKey) -> Result<Database, VaultError> {
     match DatabaseVersion::parse(bytes) {
         Ok(DatabaseVersion::KDB(_) | DatabaseVersion::KDB2(_)) => {
@@ -1109,6 +1140,60 @@ mod tests {
             let mode = fs::metadata(kdbx(&dir)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// P5 (spec §8.5): every real transition (open to locked, locked to open) is a new
+    /// generation; a lock of a locked vault, a failed unlock, reads and writes are not.
+    #[test]
+    fn generation_moves_on_every_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::new(kdbx(&dir));
+        assert_eq!(v.generation(), 0);
+        assert_eq!(v.unlock(key()), Err(VaultError::Missing));
+        assert_eq!(v.generation(), 0);
+        v.create(key(), KdfChoice::Fast).unwrap();
+        assert_eq!(v.generation(), 1);
+        v.read(|_| ()).unwrap();
+        set(&mut v, "API_KEY", "v1-value");
+        assert_eq!(v.generation(), 1, "reads and writes keep it");
+        v.lock();
+        assert_eq!(v.generation(), 2);
+        v.lock();
+        assert_eq!(
+            v.generation(),
+            2,
+            "a lock of a locked vault changes nothing"
+        );
+        assert_eq!(
+            v.unlock(key_with("wrong-pass", None)),
+            Err(VaultError::IncorrectKey)
+        );
+        assert_eq!(v.generation(), 2, "a failed unlock keeps it");
+        v.unlock(key()).unwrap();
+        assert_eq!(v.generation(), 3);
+        // A file removed outside locks the vault: a new generation.
+        fs::remove_file(kdbx(&dir)).unwrap();
+        assert_eq!(
+            v.read(|_| ()).unwrap_err(),
+            VaultError::Conflict(ConflictReason::Removed)
+        );
+        assert_eq!(v.generation(), 4);
+        // Already locked by the conflict: a later lock (shutdown) changes nothing.
+        v.lock();
+        assert_eq!(v.generation(), 4);
+    }
+
+    #[test]
+    fn check_key_opens_without_keeping() {
+        let dir = tempfile::tempdir().unwrap();
+        created(&dir).lock();
+        let bytes = fs::read(kdbx(&dir)).unwrap();
+        assert_eq!(check_key(&bytes, &key()), Ok(()));
+        assert_eq!(
+            check_key(&bytes, &key_with("wrong-pass", None)),
+            Err(VaultError::IncorrectKey)
+        );
+        assert_eq!(check_key(b"not a kdbx", &key()), Err(VaultError::Corrupt));
     }
 
     #[test]

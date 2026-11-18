@@ -1,0 +1,8 @@
+{
+  "id": 38,
+  "method": "claims.renew",
+  "params": {
+    "claim_id": "h1",
+    "workspace_id": "ws-1"
+  }
+}

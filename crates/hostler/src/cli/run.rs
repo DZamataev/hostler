@@ -877,6 +877,8 @@ pub(crate) async fn wait_for_slot(
                         None => true,
                     }
                 }
+                // Something was not delivered (spec §6.2): read the entry again.
+                Some(Event::Resync { .. }) => true,
                 Some(_) => false,
                 None => true,
             },

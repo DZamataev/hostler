@@ -1,0 +1,22 @@
+{
+  "id": 69,
+  "method": "account.request",
+  "params": {
+    "fields": [
+      "session",
+      "env"
+    ],
+    "id": "6f1e6a9a-2d0f-4b7c-9a41-6f0f2f7c1a11",
+    "name": "qa-user",
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    },
+    "reason": "log in for the e2e tests",
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 42,
+      "start_time": 500
+    }
+  }
+}

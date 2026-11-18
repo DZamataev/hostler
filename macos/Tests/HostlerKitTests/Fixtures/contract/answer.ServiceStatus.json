@@ -1,0 +1,11 @@
+{
+  "boot_id": "boot-1",
+  "contract_version": 5,
+  "exe": "/Users/someone/.cargo/bin/hostler",
+  "instance": "1b4e28ba-2fa1-41d2-883f-0016d3cca427",
+  "pid": 4242,
+  "running_heavy": 1,
+  "secrets_unlocked": true,
+  "service_version": "0.0.4",
+  "waiting_heavy": 0
+}

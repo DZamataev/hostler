@@ -1,0 +1,26 @@
+[
+  {
+    "alias": "pixel-9",
+    "app_id": "com.example.app",
+    "change": "updated",
+    "device": "device:android:SERIAL0001",
+    "id": "i1",
+    "recorded_at_ms": 4300,
+    "source": {
+      "branch": "main",
+      "claim_ids": [
+        "c1"
+      ],
+      "command": "make e2e",
+      "commit": "abc123",
+      "kind": "claim",
+      "workspace_path": "/work/app"
+    },
+    "version_code": "120",
+    "version_name": "1.2.0",
+    "when": {
+      "at_ms": 4200,
+      "kind": "device"
+    }
+  }
+]

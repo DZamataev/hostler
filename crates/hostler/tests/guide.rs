@@ -293,6 +293,14 @@ fn guide_secrets_has_threat_model_and_person_rule() {
         "The outer secret run still masks the nested command's stdout and stderr",
         "private file named `secret-NAME`",
         "login session and lock the database again",
+        "A person sees a value in two places only",
+        "An agent never asks a person to reveal a value and paste it back",
+        "### The master-password gate",
+        "proof of **intent**",
+        "without any password",
+        "### The screen",
+        "best effort",
+        "treat any screenshot of the revealed window as a value",
     ] {
         assert!(text.contains(needed), "the secrets guide lacks {needed:?}");
     }
@@ -916,6 +924,8 @@ fn sandbox_ships_the_narrow_codex_rule() {
         "secret request",
         "secret requests",
         "account list",
+        "account request",
+        "account requests",
         "project list",
     ]
     .iter()
@@ -1388,6 +1398,8 @@ fn codex_rule_matches_like_the_documented_policy() {
         "hostler queue history",
         "hostler secret list --json",
         "hostler account list",
+        "hostler account request qa-user --field session --reason test",
+        "hostler account requests --json",
         "hostler project list",
         "hostler service start",
         // A prefix rule cannot exclude a flag (P4-L11): the force rule is the agent's to keep.

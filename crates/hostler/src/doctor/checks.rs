@@ -1706,6 +1706,7 @@ mod tests {
         let hour = 3_600_000;
         let now = 10 * hour;
         let snapshot = ClaimsSnapshot {
+            as_of_seq: 0,
             resources: vec![ResourceState {
                 resource: claim("x", ClaimKind::Hold, ("w", "/a"), 0, true).resource,
                 claims: vec![

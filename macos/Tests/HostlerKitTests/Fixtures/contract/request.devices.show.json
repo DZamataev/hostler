@@ -1,0 +1,8 @@
+{
+  "id": 55,
+  "method": "devices.show",
+  "params": {
+    "device": "pixel-9",
+    "fresh_sessions": true
+  }
+}

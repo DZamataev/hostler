@@ -1,0 +1,8 @@
+{
+  "code": "service_busy",
+  "details": {
+    "secrets": "unlocked"
+  },
+  "message": "the service has live work",
+  "recovery": null
+}

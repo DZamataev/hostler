@@ -2,6 +2,7 @@
 
 pub mod dotenv;
 pub mod engine;
+pub mod gate;
 pub mod layout;
 pub mod rundir;
 pub mod value;

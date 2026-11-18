@@ -4,6 +4,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::Store;
+use crate::contract::projects::ProjectDecl;
 use crate::contract::secrets::ProjectInfo;
 
 /// A checkout as the store records it; claims belong to workspaces.
@@ -102,6 +103,65 @@ impl Store {
             workspaces.push(workspace_from_row(row)?);
         }
         Ok(workspaces)
+    }
+
+    /// P5: stores `decl` as the project's declaration when it differs from the stored one, in
+    /// one immediate transaction; `true` when it changed. Compared as values, not as text.
+    pub fn set_declared(
+        &self,
+        project_id: &str,
+        decl: &ProjectDecl,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let json = serde_json::to_string(decl).context("cannot encode the declaration")?;
+        let tx = self.immediate_tx()?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT json FROM project_declared WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ProjectDecl>(s).ok())
+            .as_ref()
+            == Some(decl)
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO project_declared (project_id, json, updated_at_ms) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(project_id) DO UPDATE SET json = excluded.json, \
+             updated_at_ms = excluded.updated_at_ms",
+            params![project_id, json, now_ms],
+        )
+        .context("cannot store the declaration")?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Every stored declaration with its time, by project id. A row that no longer decodes is
+    /// skipped (logged): the next resolve from a valid `hostler.toml` writes it again.
+    pub fn declarations(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, (ProjectDecl, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project_id, json, updated_at_ms FROM project_declared")?;
+        let mut rows = stmt.query([])?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let json: String = row.get(1)?;
+            match serde_json::from_str::<ProjectDecl>(&json) {
+                Ok(decl) => {
+                    out.insert(id, (decl, row.get(2)?));
+                }
+                Err(e) => tracing::warn!("skipping the unreadable declaration of {id}: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     /// Moves a project to `new_common_dir` in one transaction; false and no change when the
@@ -619,5 +679,24 @@ mod tests {
         assert_eq!(row.path, "/work/moved");
         assert_eq!(store.workspaces().unwrap().len(), 1);
         assert_eq!(store.workspace("missing").unwrap(), None);
+    }
+
+    /// P5: a declaration is stored once per change, compared as a value, and read back.
+    #[test]
+    fn declared_is_stored_when_it_changes() {
+        let store = Store::open_in_memory().unwrap();
+        let project = store.upsert_project("/work/x/.git", "app", 1).unwrap();
+        let decl = crate::contract::projects::fixtures::decl();
+        assert!(store.declarations().unwrap().is_empty());
+        assert!(store.set_declared(&project.id, &decl, 10).unwrap());
+        assert!(!store.set_declared(&project.id, &decl, 20).unwrap());
+        assert_eq!(
+            store.declarations().unwrap()[&project.id],
+            (decl.clone(), 10)
+        );
+        let mut changed = decl;
+        changed.apps.ios.clear();
+        assert!(store.set_declared(&project.id, &changed, 30).unwrap());
+        assert_eq!(store.declarations().unwrap()[&project.id], (changed, 30));
     }
 }

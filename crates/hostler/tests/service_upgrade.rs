@@ -19,7 +19,7 @@ use hostler::service::{NoManager, ServiceManager};
 use serde_json::{Value, json};
 
 const OLDER: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "3")];
-const NEWER: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "5")];
+const NEWER: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "6")];
 
 /// A `hostler service run` started with test variables of its own (the client never has them).
 /// Dropped: stopped if it still runs, then reaped.
@@ -209,12 +209,16 @@ fn older_idle_service_is_replaced() {
     let out = run(&home, &["service", "start"]);
     assert!(out.status.success(), "service start: {}", stderr(&out));
     assert!(
-        stderr(&out).contains("replaced an older hostler service (contract 3 → 4)"),
+        stderr(&out).contains("replaced an older hostler service (contract 3 → 5)"),
         "{}",
         stderr(&out)
     );
     let after = status(&home);
-    assert_eq!(after["data"]["contract_version"], 4, "{after}");
+    assert_eq!(
+        after["data"]["contract_version"],
+        hostler::contract::CONTRACT_VERSION,
+        "{after}"
+    );
     assert_ne!(after["data"]["pid"].as_u64(), Some(old.pid()));
     assert!(
         old.exits_within(Duration::from_secs(10)),
@@ -460,7 +464,7 @@ async fn newer_service_is_never_stopped() {
         "{error}"
     );
     assert_eq!(pid(&home), Some(newer.pid()));
-    assert_eq!(status(&home)["data"]["contract_version"], 5);
+    assert_eq!(status(&home)["data"]["contract_version"], 6);
 }
 
 /// Holds never block a stop; a TTL hold survives the replacement in the store.

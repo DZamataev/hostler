@@ -2,27 +2,45 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::procs::{ProcessIdentity, RunGroup};
+use crate::contract::process::{ProcessIdentity, RunGroup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HeavyState {
     Waiting,
     Running,
+    /// P5 (spec §11.1): `heavy.stop` is stopping it. It still occupies its slot, is listed
+    /// under the snapshot's `running`, and is never granted, reaped, withdrawn or
+    /// force-released meanwhile. Only Task 6's stop sets it.
+    Stopping,
+}
+
+impl HeavyState {
+    /// Running or stopping: the entry holds a slot.
+    pub fn occupies_slot(self) -> bool {
+        matches!(self, HeavyState::Running | HeavyState::Stopping)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HeavyOutcome {
     Ok,
     Failed,
     Withdrawn,
     TimedOut,
+    /// Only a verified `heavy.stop` that signalled the task (spec §11.1, P5-L10).
     Stopped,
     Reaped,
+    /// `heavy.force_release` (`hostler queue release --force`): the slot was freed and nothing
+    /// was stopped (spec §11.1, P5-L10).
+    ForceReleased,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EntrySource {
     Hostler,
@@ -30,6 +48,7 @@ pub enum EntrySource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeavyEntry {
     pub id: String,
     pub ticket: u64,
@@ -47,6 +66,7 @@ pub struct HeavyEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeavyAcquire {
     /// Client-generated UUID v4; makes acquire idempotent.
     pub id: String,
@@ -60,6 +80,7 @@ pub struct HeavyAcquire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AcquireOutcome {
     Granted {
@@ -81,6 +102,7 @@ pub enum AcquireOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeavyStarted {
     pub id: String,
     pub child: ProcessIdentity,
@@ -88,6 +110,7 @@ pub struct HeavyStarted {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeavyRelease {
     pub id: String,
     pub exit_code: Option<i32>,
@@ -95,14 +118,19 @@ pub struct HeavyRelease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct QueueSnapshot {
     pub capacity: u8,
     pub running: Vec<HeavyEntry>,
     pub waiting: Vec<HeavyEntry>,
     pub foreign_running: Vec<HeavyEntry>,
+    /// P5 (spec §6.2): the last event `seq` assigned when this snapshot was taken; in a
+    /// `queue.changed` event, that event's own `seq`.
+    pub as_of_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeavyHistoryItem {
     pub id: String,
     pub ticket: u64,
@@ -118,6 +146,7 @@ pub struct HeavyHistoryItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct HistoryQuery {
     pub since_ms: Option<i64>,
@@ -137,6 +166,7 @@ pub const DEFAULT_HISTORY_LIMIT: u32 = 100;
 pub const MAX_HISTORY_LIMIT: u32 = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ServiceStatus {
     pub service_version: String,
     pub contract_version: u32,
@@ -151,6 +181,53 @@ pub struct ServiceStatus {
     /// own (`procs::learn_boot_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// P5 (additive, spec §6.2): this service run's id, a UUID made at start; the same as the
+    /// `hello` reply's. A client that sees it change reads every snapshot again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// P5 (additive, spec §9.7): the service's own binary, canonicalized
+    /// (`std::env::current_exe()`); the app runs the CLI from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+}
+
+/// An accepted `service.shutdown`'s answer (`{"stopping": true}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct ShutdownAccepted {
+    pub stopping: bool,
+}
+
+/// `heavy.stop`'s answer (P5, spec §11.1): `stopped` only when the service verified that the
+/// holder, its child and their group are gone; `pids` are the processes it signalled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct QueueStopOutcome {
+    pub id: String,
+    pub stopped: bool,
+    pub pids: Vec<u32>,
+}
+
+/// The heavy-queue errors of contract 5 with their exact texts.
+pub mod errors {
+    use serde_json::json;
+
+    use crate::contract::{ErrorCode, HostlerError};
+
+    /// `heavy.stop` could not verify that the task is gone; it keeps its slot (spec §11.1). The
+    /// recovery names the CLI's real form, `queue release --id <id> --force` (the plan's text
+    /// has a positional id, which that command does not take).
+    pub fn stop_failed(id: &str, pids: &[u32]) -> HostlerError {
+        HostlerError {
+            code: ErrorCode::StopFailed,
+            message: format!("hostler could not stop heavy task {id}; it keeps its slot"),
+            details: json!({ "id": id, "pids": pids }),
+            recovery: Some(format!(
+                "the task still runs; stop it from its terminal, or: hostler queue release --id \
+                 {id} --force"
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

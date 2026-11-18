@@ -151,6 +151,13 @@ fn unlock_retries_wrong_password_three_times() {
         "{}",
         stderr(&out)
     );
+    // P5 (spec §8.5): a retyped password waits out the service's short backoff (1 s, then
+    // 2 s) and is checked, so all three count. At least the 2 s wait is met: a loaded machine
+    // may take over 1 s between the first two tries.
+    let waits = stderr(&out)
+        .matches("the service checks the next password in")
+        .count();
+    assert!((1..=2).contains(&waits), "{}", stderr(&out));
     assert_eq!(status(&home).state, LockState::Locked);
 }
 

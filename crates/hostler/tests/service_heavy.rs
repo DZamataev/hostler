@@ -156,59 +156,61 @@ async fn lost_acquire_reply_is_recovered_without_duplicate() {
 #[cfg(unix)]
 #[tokio::test]
 async fn group_survivor_keeps_slot_across_service_restart() {
-    use std::os::unix::process::CommandExt;
+    use std::io::BufRead;
 
-    use hostler::contract::heavy::{HeavyHistoryItem, HeavyOutcome, HeavyStarted, HistoryQuery};
-    use hostler::procs::{ProcessTable, RunGroup, identity_of};
+    use hostler::contract::heavy::{HeavyHistoryItem, HeavyOutcome, HistoryQuery};
+    use hostler::procs::{Liveness, ProcessIdentity, identity_of, liveness};
 
-    fn gated(group: bool) -> Child {
-        let mut c = Command::new("cat");
-        c.stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if group {
-            c.process_group(0);
+    /// SIGKILL to a process this test started (directly or through its `hostler run`), while
+    /// it is still the recorded one.
+    fn kill(p: &ProcessIdentity) {
+        if liveness(p, &SysProcessTable::new().unwrap()) == Liveness::Alive {
+            // SAFETY: kill has no memory preconditions; its identity was checked just now.
+            unsafe { libc::kill(p.pid as libc::pid_t, libc::SIGKILL) };
         }
-        c.spawn().unwrap()
-    }
-
-    fn finish(mut child: Child) {
-        drop(child.stdin.take());
-        child.wait().unwrap();
     }
 
     let home = Home::new();
     let table = SysProcessTable::new().unwrap();
     let mut client = home.client().await;
 
-    // The wrapper (holder) is granted the slot and starts a child in its own group, which
-    // starts a grandchild in the same group.
-    let wrapper = gated(false);
-    let a = request(identity_of(&table, wrapper.id()).unwrap());
-    assert!(matches!(
-        acquire(&mut client, &a).await,
-        AcquireOutcome::Granted { .. }
-    ));
-    let child = gated(true);
-    let pgid = child.id();
-    let mut grandchild = Command::new("sleep")
-        .arg("30")
-        .process_group(pgid as i32)
+    // A real wrapper (holder) is granted the slot and starts its command in its own group,
+    // which starts a grandchild in the same group (P5 T6-R1-1: the service accepts a run's
+    // report only from its own wrapper).
+    let mut wrapper = home
+        .hostler()
+        .args([
+            "run",
+            "--heavy",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30 & echo $!; wait",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let started = HeavyStarted {
-        id: a.id.clone(),
-        child: identity_of(&table, child.id()).unwrap(),
-        group: RunGroup::UnixGroup {
-            pgid,
-            boot_id: table.boot_id(),
-        },
+    let mut line = String::new();
+    std::io::BufReader::new(wrapper.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let grandchild = identity_of(&table, line.trim().parse().unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let a = loop {
+        let queue = snapshot(&mut client).await;
+        if let Some(entry) = queue.running.into_iter().find(|e| e.child.is_some()) {
+            break entry;
+        }
+        assert!(Instant::now() < deadline, "the run never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    client.call(Request::HeavyStarted(started)).await.unwrap();
+    let child = a.child.clone().unwrap();
 
-    // Wrapper and child die; then the service restarts.
-    finish(wrapper);
-    finish(child);
+    // Wrapper and child die without a release; then the service restarts.
+    kill(&a.holder);
+    wrapper.wait().unwrap();
+    kill(&child);
     drop(client);
     assert!(home.run(&["service", "stop", "--force"]).status.success());
     let mut client = home.client().await;
@@ -224,8 +226,7 @@ async fn group_survivor_keeps_slot_across_service_restart() {
     assert!(matches!(still, AcquireOutcome::Granted { .. }), "{still:?}");
 
     // The survivor ends: the slot goes to the next request.
-    grandchild.kill().unwrap();
-    grandchild.wait().unwrap();
+    kill(&grandchild);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let attach_b = Request::HeavyAttach { id: b.id.clone() };

@@ -1,0 +1,7 @@
+{
+  "id": 3,
+  "method": "service.shutdown",
+  "params": {
+    "if_idle": true
+  }
+}

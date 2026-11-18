@@ -1,0 +1,6 @@
+{
+  "code": "proof_required",
+  "details": {},
+  "message": "this needs the master password: a person proves it on this connection first",
+  "recovery": "type the master password in the hostler app, or rerun the command at a terminal"
+}

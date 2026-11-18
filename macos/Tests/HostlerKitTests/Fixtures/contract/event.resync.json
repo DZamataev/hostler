@@ -1,0 +1,9 @@
+{
+  "event": {
+    "data": {
+      "reason": "overflow"
+    },
+    "type": "resync"
+  },
+  "seq": 10
+}

@@ -1,0 +1,9 @@
+{
+  "code": "account_missing",
+  "details": {
+    "name": "qa-user",
+    "project": "app"
+  },
+  "message": "account qa-user does not exist in project app",
+  "recovery": "hostler account set qa-user --field <field>"
+}

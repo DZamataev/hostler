@@ -1,0 +1,8 @@
+{
+  "id": 18,
+  "method": "project.approve",
+  "params": {
+    "common_dir": "/work/app/.git",
+    "name": "app"
+  }
+}

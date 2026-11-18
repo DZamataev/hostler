@@ -1,0 +1,45 @@
+{
+  "blockers": [
+    {
+      "blocker": "claim",
+      "summary": {
+        "command": null,
+        "expires_at_ms": 9000,
+        "id": "c1",
+        "kind": "hold",
+        "linked": 2,
+        "pid": 42,
+        "resource": "screen",
+        "since_ms": 1000,
+        "workspace_path": "/work/app"
+      }
+    },
+    {
+      "blocker": "foreign",
+      "claim": {
+        "description": "agent-device session",
+        "resource": "device:test:0",
+        "since_ms": 500,
+        "source": "fake",
+        "stop": {
+          "session": "s1"
+        },
+        "workspace_id": null,
+        "workspace_path": "/work/other"
+      }
+    },
+    {
+      "blocker": "seizing",
+      "by_workspace": "/work/taker"
+    },
+    {
+      "blocker": "checking",
+      "resource": "device:android:SERIAL0001",
+      "text": "checking agent-device sessions"
+    }
+  ],
+  "of": 2,
+  "outcome": "queued",
+  "position": 2,
+  "request_id": "r1"
+}

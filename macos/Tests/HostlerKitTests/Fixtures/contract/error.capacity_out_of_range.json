@@ -1,0 +1,6 @@
+{
+  "code": "capacity_out_of_range",
+  "details": {},
+  "message": "capacity must be 1 to 16",
+  "recovery": null
+}

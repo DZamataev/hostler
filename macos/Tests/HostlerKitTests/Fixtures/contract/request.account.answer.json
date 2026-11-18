@@ -1,0 +1,13 @@
+{
+  "id": 73,
+  "method": "account.answer",
+  "params": {
+    "fields": [
+      {
+        "name": "session",
+        "value": "session-value-1"
+      }
+    ],
+    "request_id": "6f1e6a9a"
+  }
+}

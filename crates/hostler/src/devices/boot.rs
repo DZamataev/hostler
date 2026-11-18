@@ -1754,6 +1754,7 @@ mod tests {
         claim.resource.id = avd();
         claim.resource.kind = ResourceKind::Device;
         let snapshot = ClaimsSnapshot {
+            as_of_seq: 0,
             resources: vec![ResourceState {
                 resource: claim.resource.clone(),
                 claims: vec![claim.clone()],

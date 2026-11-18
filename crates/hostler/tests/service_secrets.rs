@@ -35,7 +35,8 @@ fn unlock(home: &Home, create: bool) -> SecretsStatus {
             create,
         }))
         .unwrap();
-    serde_json::from_value(status).unwrap()
+    // Contract 5: `UnlockOutcome { status, grant }`.
+    serde_json::from_value(status["status"].clone()).unwrap()
 }
 
 fn status(home: &Home) -> SecretsStatus {
@@ -385,7 +386,7 @@ fn stop_during_a_paused_unlock_waits_for_it() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert!(started.elapsed() >= Duration::from_millis(2900));
     let answer = unlocking.join().unwrap().unwrap();
-    assert_eq!(answer["state"], "unlocked");
+    assert_eq!(answer["status"]["state"], "unlocked");
     assert!(child.wait().unwrap().success());
 }
 

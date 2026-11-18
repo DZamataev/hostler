@@ -1,6 +1,7 @@
 //! The per-user hostler service (plan Task 6): one process per home, found through a local
 //! socket, owning the store, the heavy-queue engine and the secrets engine (P2 Task 6).
 
+pub mod events;
 pub mod harden;
 pub mod lifecycle;
 pub mod lock;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::json;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
 use crate::bridge::looky::{LookyHeavy, RefreshedLooky};
 use crate::claims::engine::ClaimsEngine;
@@ -144,7 +145,7 @@ async fn serve_locked(paths: &Paths) -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     spawn_owner_watchdog(table.clone(), shutdown.clone());
     let store = Store::open(&paths.db)?;
-    let (events, _) = broadcast::channel(64);
+    let events = events::EventBus::new(events::EventBus::service_capacity());
     // P3b: the device service, on its own (4th) connection. Its catalog and sessions source
     // answer the claims engine from its cache, without I/O (T5-4).
     let devices_store = Store::open(&paths.db)?;

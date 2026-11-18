@@ -1017,12 +1017,20 @@ fn nothing_new_starts_under_a_run_being_taken_over() {
         )))
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::TakenOver, "{e:?}");
-    // Once the plan is gone, all of it works again.
+    // Once the plan is gone, none of it is refused as taken over any more. (The synthetic
+    // report then meets `heavy.started`'s own checks, P5 T6-R1-1: it does not come from the
+    // entry's holder, so it is refused there, past the takeover rule.)
     home.call(Request::ClaimsSeizeAbort {
         plan_id: plan.plan_id,
     })
     .unwrap();
-    home.call(start).unwrap();
+    let e = home.call(start).unwrap_err();
+    assert_eq!(e.code, ErrorCode::BadRequest, "{e:?}");
+    assert!(
+        e.message.contains("not from the entry's holder"),
+        "{}",
+        e.message
+    );
 }
 
 /// T6-7: an idle stop is refused while a takeover is in progress.

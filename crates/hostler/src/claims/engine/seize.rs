@@ -794,7 +794,7 @@ impl ClaimsEngine {
                 forced: attested,
             };
             self.store.record_seizure(&record).map_err(internal)?;
-            let _ = self.events.send(Event::ClaimsSeized(SeizureRecord {
+            self.events.publish(Event::ClaimsSeized(SeizureRecord {
                 resource: plan.detail.display.clone(),
                 ..record
             }));
@@ -818,7 +818,7 @@ impl ClaimsEngine {
                 forced: attested,
             };
             self.store.record_seizure(&record).map_err(internal)?;
-            let _ = self.events.send(Event::ClaimsSeized(SeizureRecord {
+            self.events.publish(Event::ClaimsSeized(SeizureRecord {
                 resource: plan.detail.display.clone(),
                 ..record
             }));
@@ -879,8 +879,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, Mutex};
-
-    use tokio::sync::broadcast;
 
     use super::super::no_heavy;
     use super::*;
@@ -946,13 +944,13 @@ mod tests {
         clock: Arc<TestClock>,
         foreign: Foreign,
         dir: tempfile::TempDir,
-        events: broadcast::Receiver<Event>,
+        events: crate::service::events::TestEvents,
     }
 
     fn world() -> World {
         let table = Arc::new(FakeTable::new(BOOT));
         let clock = Arc::new(TestClock(AtomicI64::new(100 * 60_000)));
-        let (tx, events) = broadcast::channel(4096);
+        let (tx, events) = crate::service::events::EventBus::channel(4096);
         let foreign = Foreign::default();
         let engine = ClaimsEngine::new(
             Store::open_in_memory().unwrap(),

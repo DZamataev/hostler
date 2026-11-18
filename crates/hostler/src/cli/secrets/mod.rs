@@ -197,10 +197,7 @@ pub(crate) fn project_at(path: &Path) -> Result<ProjectRef, HostlerError> {
 /// `project::current`, after `workspace.resolve` (as `project_at`).
 pub(crate) fn current_at(path: &Path) -> Result<crate::project::Current, HostlerError> {
     let current = crate::project::current(path)?;
-    let resolve = Request::WorkspaceResolve(crate::contract::claims::WorkspaceResolve {
-        project: current.project.clone(),
-        root: crate::project::display_path(&current.checkout.workspace_root),
-    });
+    let resolve = crate::cli::workspace::resolve_request(&current);
     // Its own thread: some callers (`secret request`) already run inside an async runtime.
     let resolved = std::thread::scope(|scope| {
         scope

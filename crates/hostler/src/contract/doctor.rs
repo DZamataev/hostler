@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// What `hostler doctor` found, and what `--fix` did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DoctorReport {
     /// In the fixed check order.
     pub checks: Vec<Check>,
@@ -15,6 +16,7 @@ pub struct DoctorReport {
 
 /// One check's result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Check {
     /// Stable and dotted, e.g. `service.registered` or `secrets.required.JACKETT_API_KEY`.
     pub id: String,
@@ -28,6 +30,7 @@ pub struct Check {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Ok,
@@ -38,6 +41,7 @@ pub enum CheckStatus {
 
 /// How a check's problem is resolved, and by whom.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Fix {
     /// A runnable command when there is one (R1-13); `None` when only `text` applies.
     pub command: Option<String>,
@@ -50,6 +54,7 @@ pub struct Fix {
 
 /// Who acts on a step or a fix. Shared by `doctor` and `init` (`contract::init::Step`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Who {
     Agent,
@@ -58,6 +63,7 @@ pub enum Who {
 
 /// What one `--fix` did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FixOutcome {
     /// The check id the fix belongs to.
     pub check: String,
@@ -67,6 +73,7 @@ pub struct FixOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FixResult {
     /// The re-check passed.

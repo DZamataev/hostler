@@ -1,0 +1,11 @@
+[
+  {
+    "id": "ws-1",
+    "last_seen_ms": 3000,
+    "note": "moved from /work/old",
+    "outcome": "moved",
+    "path": "/work/app",
+    "project_id": "p1",
+    "project_repointed": false
+  }
+]

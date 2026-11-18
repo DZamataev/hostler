@@ -1,0 +1,14 @@
+{
+  "id": 63,
+  "method": "devices.tools",
+  "params": {
+    "adb": "/sdk/platform-tools/adb",
+    "agent_device": "/usr/local/bin/agent-device",
+    "android_env": {
+      "ANDROID_HOME": "/sdk"
+    },
+    "detected_script": "/usr/local/lib/node_modules/agent-device/bin/agent-device.mjs",
+    "explicit_agent_device": false,
+    "node": "/usr/local/bin/node"
+  }
+}

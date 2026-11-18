@@ -1,0 +1,9 @@
+{
+  "code": "boot_failed",
+  "details": {
+    "device": "emu-1",
+    "log": "/state/logs/emu-1.log"
+  },
+  "message": "emu-1 did not boot: the emulator exited",
+  "recovery": "hostler devices show emu-1; emulator output: /state/logs/emu-1.log"
+}

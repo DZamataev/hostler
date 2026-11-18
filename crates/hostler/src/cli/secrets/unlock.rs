@@ -75,7 +75,7 @@ fn run(args: UnlockArgs) -> Result<ExitCode, HostlerError> {
                 return Ok(ExitCode::FAILURE);
             }
             let password = new_password(&mut tty)?;
-            call::<SecretsStatus>(Request::SecretsUnlock(Unlock {
+            call::<crate::contract::secrets::UnlockOutcome>(Request::SecretsUnlock(Unlock {
                 password,
                 key_file,
                 forget_key_file,
@@ -87,13 +87,16 @@ fn run(args: UnlockArgs) -> Result<ExitCode, HostlerError> {
             let mut unlocked = false;
             for _ in 0..3 {
                 let password = tty.hidden(&format!("Master password for {database}:"))?;
-                match call::<SecretsStatus>(Request::SecretsUnlock(Unlock {
-                    password,
-                    key_file: key_file.clone(),
-                    forget_key_file,
-                    create: false,
-                })) {
-                    Ok(_) => {
+                let unlock = || {
+                    Request::SecretsUnlock(Unlock {
+                        password: password.clone(),
+                        key_file: key_file.clone(),
+                        forget_key_file,
+                        create: false,
+                    })
+                };
+                match unlock_waiting(unlock) {
+                    Ok(()) => {
                         unlocked = true;
                         break;
                     }
@@ -112,6 +115,34 @@ fn run(args: UnlockArgs) -> Result<ExitCode, HostlerError> {
         eprintln!("{warning}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The longest wait of the service's limit on password checks (spec §8.5) that the prompt
+/// sits out by itself; a longer one is reported.
+const LIMIT_WAIT_MAX_MS: u64 = 30_000;
+
+/// One unlock of the typed password. A short `proof_limited` (after a mistyped password, the
+/// next check waits 1, 2, 4 … s) is waited out and the same password sent again, so only
+/// checks the service ran count as tries; a longer one is the error, whose text names the wait
+/// and that another process may be guessing.
+fn unlock_waiting(request: impl Fn() -> Request) -> Result<(), HostlerError> {
+    loop {
+        match call::<crate::contract::secrets::UnlockOutcome>(request()) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.code == ErrorCode::ProofLimited => {
+                let wait = e.details["retry_after_ms"].as_u64().unwrap_or(1_000);
+                if wait > LIMIT_WAIT_MAX_MS {
+                    return Err(e);
+                }
+                eprintln!(
+                    "[hostler] the service checks the next password in {} s; waiting",
+                    wait.div_ceil(1000)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// W-6: a service the OS manager does not run lives in this login session (Linux logind with

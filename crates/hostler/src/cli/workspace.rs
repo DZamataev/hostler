@@ -51,13 +51,20 @@ pub async fn resolve(
     client: &mut Client,
     current: &Current,
 ) -> Result<WorkspaceInfo, HostlerError> {
-    let request = Request::WorkspaceResolve(WorkspaceResolve {
-        project: current.project.clone(),
-        root: display_path(&current.checkout.workspace_root),
-    });
-    let value = client.call(request).await?;
+    let value = client.call(resolve_request(current)).await?;
     serde_json::from_value(value)
         .map_err(|e| internal(format!("unreadable answer from the service: {e}")))
+}
+
+/// The one `workspace.resolve` frame of a checkout (P5): with the declarations of its
+/// `hostler.toml` (names and purposes only), or `None` without one. A config with problems
+/// never gets here: `project::current` refuses it first.
+pub fn resolve_request(current: &Current) -> Request {
+    Request::WorkspaceResolve(WorkspaceResolve {
+        project: current.project.clone(),
+        root: display_path(&current.checkout.workspace_root),
+        declared: current.config.as_ref().map(|c| c.declaration()),
+    })
 }
 
 fn resolve_here() -> Result<WorkspaceInfo, HostlerError> {

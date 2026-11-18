@@ -23,7 +23,7 @@ use hostler::service::manager::{Registrar, RegistrationState};
 use serde_json::{Value, json};
 
 const OLDER_CONTRACT: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "3")];
-const NEWER_CONTRACT: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "5")];
+const NEWER_CONTRACT: [(&str, &str); 1] = [("HOSTLER_TEST_CONTRACT_VERSION", "6")];
 const OLDER_BINARY: [(&str, &str); 1] = [("HOSTLER_TEST_SERVICE_VERSION", "0.0.1")];
 const NEWER_BINARY: [(&str, &str); 1] = [("HOSTLER_TEST_SERVICE_VERSION", "99.0.0")];
 
@@ -764,7 +764,10 @@ async fn older_idle_locked_service_is_replaced() {
     assert_eq!(report.fixed[0].result, FixResult::Fixed, "{report:#?}");
     assert_eq!(code, Some(0), "{report:#?}");
     assert_ne!(service_pid(&home), Some(old.pid()));
-    assert_eq!(status(&home)["data"]["contract_version"], 4);
+    assert_eq!(
+        status(&home)["data"]["contract_version"],
+        hostler::contract::CONTRACT_VERSION
+    );
 }
 
 /// R1-2: an older client never stops a newer service, by contract or by binary version; no
@@ -1439,7 +1442,7 @@ async fn linux_session_states() {
 // ---------------------------------------------------------------------------------------------
 // Fix round 1 (review t6-r1)
 
-/// A lifecycle server that speaks contract 4 as hostler 0.0.1 (older than this binary), locked
+/// A lifecycle server that speaks this contract as hostler 0.0.1 (older than this binary), locked
 /// and idle, under this test process's pid: it accepts `service.shutdown` and never goes away.
 /// Every other method gets an error. It records the methods it is sent.
 fn stubborn_service(
@@ -1463,11 +1466,11 @@ fn stubborn_service(
                     let id = frame["id"].clone();
                     let answer = match method.as_str() {
                         "hello" => json!({ "id": id, "result": {
-                            "contract_version": 4, "service_version": "0.0.1",
+                            "contract_version": hostler::contract::CONTRACT_VERSION, "service_version": "0.0.1",
                         }}),
                         "service.status" => json!({ "id": id, "result": {
                             "service_version": "0.0.1",
-                            "contract_version": 4,
+                            "contract_version": hostler::contract::CONTRACT_VERSION,
                             "pid": std::process::id(),
                             "running_heavy": 0,
                             "waiting_heavy": 0,

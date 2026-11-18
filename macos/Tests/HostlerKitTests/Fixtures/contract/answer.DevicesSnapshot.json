@@ -1,0 +1,101 @@
+{
+  "as_of_seq": 0,
+  "at_ms": 5000,
+  "devices": [
+    {
+      "alias": "pixel-9",
+      "alias_by_person": true,
+      "booted_by_hostler": false,
+      "checking_sessions": true,
+      "connected": true,
+      "coredevice_id": null,
+      "first_seen_ms": 1000,
+      "hardware_id": "SERIAL0001",
+      "kind": "physical",
+      "last_seen_ms": 5000,
+      "model": "Pixel 9",
+      "name": null,
+      "note": "on the left",
+      "os_version": "15",
+      "platform": "android",
+      "ready": true,
+      "registered": true,
+      "removing": false,
+      "resource": "device:android:SERIAL0001",
+      "sessions": [
+        {
+          "agent_device_id": "SERIAL0001",
+          "kept": false,
+          "platform": "android",
+          "seen_since_ms": 4000,
+          "session": "default",
+          "workspace_id": "ws-1",
+          "workspace_path": "/work/app"
+        }
+      ],
+      "shutting_down": false,
+      "telemetry": {
+        "at_ms": 5000,
+        "battery_percent": {
+          "known": 86
+        },
+        "cellular_data": "unknown",
+        "charging": {
+          "known": true
+        },
+        "vpn": "emulated",
+        "wifi": {
+          "known": true
+        },
+        "wifi_name": "lab"
+      },
+      "transports": [
+        {
+          "address": "SERIAL0001",
+          "kind": "usb",
+          "state": "device"
+        },
+        {
+          "address": "192.0.2.10:5555",
+          "kind": "wifi",
+          "state": "device"
+        }
+      ]
+    }
+  ],
+  "tools": {
+    "adb": "/sdk/platform-tools/adb",
+    "adb_state": {
+      "foreign": {
+        "version": 41
+      }
+    },
+    "agent_device": "0.21.36",
+    "agent_device_in_use": true,
+    "emulator": null,
+    "ideviceinfo": null,
+    "node": "/usr/local/bin/node",
+    "problems": [
+      "another adb (version 41) owns the adb server"
+    ],
+    "sessions_known": true,
+    "sessions_last_good_ms": 4500,
+    "sessions_reason": null,
+    "xcrun": false
+  },
+  "unidentified": [
+    {
+      "hint": "accept the prompt on the phone",
+      "model": null,
+      "platform": "android",
+      "transport": {
+        "address": "SERIAL0002",
+        "kind": "usb",
+        "state": "unauthorized"
+      }
+    }
+  ],
+  "unmapped_sessions": [
+    "agent-device session s2 on an unknown device"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": 41,
+  "method": "claims.unreserve",
+  "params": {
+    "resource": "screen",
+    "workspace_id": "ws-1"
+  }
+}

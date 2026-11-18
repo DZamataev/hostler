@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "fallback": false,
+      "home": "/Users/someone/Library/Application Support/io.github.dzamataev.hostler",
+      "socket": "/Users/someone/Library/Application Support/io.github.dzamataev.hostler/hostler.sock"
+    },
+    {
+      "fallback": false,
+      "home": "/tmp/hostler-home",
+      "socket": "/tmp/hostler-home/hostler.sock"
+    },
+    {
+      "fallback": false,
+      "home": "/h/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "socket": "/h/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/hostler.sock"
+    },
+    {
+      "fallback": true,
+      "home": "/h/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+      "socket": "/tmp/hostler-501-c331581a15492913/hostler.sock"
+    },
+    {
+      "fallback": true,
+      "home": "/var/folders/7x/k2m4n6p8q0r2s4t6v8w0y2z40000gn/T/hostler-swift-integration-0123456789abcdef/home",
+      "socket": "/tmp/hostler-501-460f5639bfd37bb5/hostler.sock"
+    },
+    {
+      "fallback": true,
+      "home": "/Users/someone/Проекты/hostler-домашний-каталог-с-длинным-именем/home",
+      "socket": "/tmp/hostler-501-f3b1f959e12fa248/hostler.sock"
+    }
+  ],
+  "max_socket_file_len": 100,
+  "uid": 501
+}

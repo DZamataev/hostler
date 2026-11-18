@@ -466,7 +466,7 @@ async fn wait_queued(
             stopped = stop.wait() => return Err(give_up(io, req, stopped).await),
             _ = ticker.tick() => last_attach.elapsed() >= ATTACH_EVERY,
             event = io.next_event() => match event {
-                Some(Event::ClaimsChanged(_)) => true,
+                Some(Event::ClaimsChanged(_) | Event::Resync { .. }) => true,
                 Some(_) => false,
                 None => match stop.race(io.reconnect(RECONNECT_BUDGET)).await {
                     Raced::Stopped(stopped) => return Err(give_up(io, req, stopped).await),
@@ -895,6 +895,7 @@ mod tests {
             item: crate::contract::claims::ClaimHistoryItem {
                 id: "r1".into(),
                 resource: "fake-0".into(),
+                resource_id: None,
                 kind: ClaimKind::Hold,
                 workspace_path: "/work/app".into(),
                 command: None,

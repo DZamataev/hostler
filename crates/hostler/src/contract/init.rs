@@ -13,6 +13,7 @@ use crate::contract::doctor::Who;
 
 /// What `hostler init` found, proposes and (with `--write`) did.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct InitReport {
     /// The checkout root init ran for.
     pub root: String,
@@ -29,6 +30,7 @@ pub struct InitReport {
 
 /// The state of the checkout's `hostler.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigState {
     Absent,
@@ -38,6 +40,7 @@ pub enum ConfigState {
 
 /// One problem of a file, by line; the message never quotes a value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LineProblem {
     pub line: usize,
     pub message: String,
@@ -45,6 +48,7 @@ pub struct LineProblem {
 
 /// What init does (or would do) to one agent-docs file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DocsChange {
     /// Relative to the checkout root.
     pub path: String,
@@ -52,6 +56,7 @@ pub struct DocsChange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DocsAction {
     /// The file is absent and is created holding only the block.
@@ -68,6 +73,7 @@ pub enum DocsAction {
 
 /// One step for the agent or the person.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Step {
     /// Stable, e.g. `init.device_rules`, `init.secrets.JACKETT_API_KEY`.
     pub id: String,
@@ -81,6 +87,7 @@ pub struct Step {
 
 /// What init did, or would do, about the service (R1-11, R2-1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServiceAction {
     /// Reachable with a matching contract; nothing to do.
@@ -123,6 +130,7 @@ pub enum ServiceAction {
 
 /// What init detected in the checkout.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Detected {
     pub toolchains: Vec<Toolchain>,
     pub apps: Vec<DetectedApp>,
@@ -132,6 +140,7 @@ pub struct Detected {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Toolchain {
     pub kind: ToolchainKind,
     /// The file that shows it, relative to the root.
@@ -139,6 +148,7 @@ pub struct Toolchain {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolchainKind {
     Gradle,
@@ -153,6 +163,7 @@ pub enum ToolchainKind {
 
 /// An app id found in the build files.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DetectedApp {
     pub platform: Platform,
     pub id: String,
@@ -162,6 +173,7 @@ pub struct DetectedApp {
 
 /// An env file and the names it defines; never a value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct EnvFile {
     /// Relative to the root.
     pub path: String,
@@ -173,6 +185,7 @@ pub struct EnvFile {
 /// "symlink_to", "target": "AGENTS.md"}`, `{"path": "CLAUDE.md", "kind": "imports", "target":
 /// "AGENTS.md"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AgentDoc {
     /// Relative to the root.
     pub path: String,
@@ -183,6 +196,7 @@ pub struct AgentDoc {
 /// The `kind` of an `AgentDoc`. The other file is `target` (not `path`, which is the doc's
 /// own path once flattened), relative to the root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDocKind {
     File,

@@ -918,7 +918,10 @@ mod changes {
         assert!(exits_within(&mut old, Duration::from_secs(10)).is_some());
         let client = Client::connect(&paths).await;
         assert!(client.is_ok(), "{:?}", client.err());
-        assert_eq!(home.status_json()["data"]["contract_version"], 4);
+        assert_eq!(
+            home.status_json()["data"]["contract_version"],
+            hostler::contract::CONTRACT_VERSION
+        );
     }
 
     /// R2-2: an automatic install probes first; a newer service is never stopped and nothing
@@ -928,7 +931,7 @@ mod changes {
         use hostler::service::lifecycle::{AutoPurpose, StopRefusal};
 
         let home = Arc::new(Home::new());
-        let mut newer = service_speaking(&home, "5");
+        let mut newer = service_speaking(&home, "6");
         let fake = Arc::new(FakeRegistrar::new(home.clone()));
         let paths = home.default_paths();
         for state in [
@@ -998,7 +1001,10 @@ mod changes {
         );
         assert!(exits_within(&mut newer, Duration::from_secs(10)).is_some());
         assert_eq!(*fake.changes.lock().unwrap(), ["register"]);
-        assert_eq!(home.status_json()["data"]["contract_version"], 4);
+        assert_eq!(
+            home.status_json()["data"]["contract_version"],
+            hostler::contract::CONTRACT_VERSION
+        );
     }
 
     /// R2-2: the registration-maintenance exception. A same-version, idle, locked service with

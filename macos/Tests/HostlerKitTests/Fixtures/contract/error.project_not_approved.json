@@ -1,0 +1,9 @@
+{
+  "code": "project_not_approved",
+  "details": {
+    "common_dir": "/work/app/.git",
+    "project": "app"
+  },
+  "message": "project app (/work/app/.git) is not approved for secrets; a person approves it once",
+  "recovery": "hostler project approve"
+}

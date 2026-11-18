@@ -1,0 +1,8 @@
+{
+  "code": "unknown_resource",
+  "details": {
+    "resource": "device:x:1"
+  },
+  "message": "device:x:1 is not a resource this hostler knows",
+  "recovery": null
+}

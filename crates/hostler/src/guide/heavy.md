@@ -96,7 +96,8 @@ capacity but hostler does not own or stop them.
 ### `--force` is the operator's decision
 
 `hostler queue release --id <id> --force` frees a slot while the task may still be running (the
-processes are **not** stopped). Without the flag, hostler refuses with a recovery command. An
+processes are **not** stopped; history records it as `force_released`). Without the flag,
+hostler refuses with a recovery command. An
 agent uses --force only with the operator's explicit permission.
 
 Never infer it. Ask, name the task, and wait for a yes — on `queue release`, `service stop`,

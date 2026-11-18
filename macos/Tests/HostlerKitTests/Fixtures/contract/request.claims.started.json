@@ -1,0 +1,17 @@
+{
+  "id": 34,
+  "method": "claims.started",
+  "params": {
+    "child": {
+      "boot_id": "boot-1",
+      "pid": 43,
+      "start_time": 500
+    },
+    "claim_id": "c1",
+    "group": {
+      "boot_id": "boot-1",
+      "kind": "unix_group",
+      "pgid": 42
+    }
+  }
+}

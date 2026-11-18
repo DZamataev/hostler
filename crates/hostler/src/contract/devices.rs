@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::claims::ResourceId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     Android,
@@ -17,6 +18,7 @@ pub enum Platform {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
     Physical,
@@ -25,6 +27,7 @@ pub enum DeviceKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TransportKind {
     Usb,
@@ -36,6 +39,7 @@ pub enum TransportKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Transport {
     pub kind: TransportKind,
     /// The adb serial, `ip:port`, `emulator-N`, or the CoreDevice id.
@@ -46,7 +50,9 @@ pub struct Transport {
 
 /// One telemetry reading: `{"known": v}`, `"emulated"` or `"unknown"`; never guessed (D11).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, schemars(rename = "Reading_{T}"))]
 pub enum Reading<T> {
     Known(T),
     Emulated,
@@ -54,6 +60,7 @@ pub enum Reading<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Telemetry {
     pub battery_percent: Reading<u8>,
     pub charging: Reading<bool>,
@@ -66,6 +73,7 @@ pub struct Telemetry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AgentDeviceSession {
     pub session: String,
     pub workspace_path: String,
@@ -79,6 +87,7 @@ pub struct AgentDeviceSession {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DeviceInfo {
     pub resource: ResourceId,
     pub hardware_id: String,
@@ -108,6 +117,7 @@ pub struct DeviceInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UnidentifiedTransport {
     pub platform: Platform,
     pub transport: Transport,
@@ -116,6 +126,7 @@ pub struct UnidentifiedTransport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AdbState {
     Ours,
@@ -124,6 +135,7 @@ pub enum AdbState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ToolStatus {
     pub adb: Option<String>,
     pub adb_state: AdbState,
@@ -143,6 +155,7 @@ pub struct ToolStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DevicesSnapshot {
     pub devices: Vec<DeviceInfo>,
     pub unidentified: Vec<UnidentifiedTransport>,
@@ -150,9 +163,13 @@ pub struct DevicesSnapshot {
     pub unmapped_sessions: Vec<String>,
     pub tools: ToolStatus,
     pub at_ms: i64,
+    /// P5 (spec §6.2): the last event `seq` assigned when this snapshot was taken; in a
+    /// `devices.changed` event, that event's own `seq`.
+    pub as_of_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InstallTime {
     Device { at_ms: i64 },
@@ -161,6 +178,7 @@ pub enum InstallTime {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AppState {
     pub app_id: String,
     pub version_name: Option<String>,
@@ -170,6 +188,7 @@ pub struct AppState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChange {
     Installed,
@@ -178,6 +197,7 @@ pub enum InstallChange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InstallSource {
     Claim {
@@ -195,6 +215,7 @@ pub enum InstallSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct InstallEvent {
     pub id: String,
     pub device: ResourceId,
@@ -215,6 +236,7 @@ pub struct InstallEvent {
 pub const SESSIONS_UNKNOWN_KEY: &str = "sessions_unknown";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DeviceDetail {
     pub info: DeviceInfo,
     pub apps: Vec<AppState>,
@@ -222,9 +244,21 @@ pub struct DeviceDetail {
     /// L54: the person's `forget-sessions` records, newest first.
     #[serde(default)]
     pub forgets: Vec<ForgetRecord>,
+    /// `devices.show { fresh_sessions }` only: why the fresh agent-device read failed or came
+    /// late (CRB-4); the key is `SESSIONS_UNKNOWN_KEY`. Absent when the read was fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_unknown: Option<String>,
+}
+
+/// `devices.remove`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct DeviceRemoved {
+    pub removed: ResourceId,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ToolPathsSet {
     pub adb: Option<String>,
     pub agent_device: Option<String>,
@@ -240,6 +274,7 @@ pub struct ToolPathsSet {
 /// kept sessions it dropped, sanitized; `reason`: why the device was closed (the status's
 /// unreadable reason, or `checking`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ForgetRecord {
     pub id: String,
     pub resource: ResourceId,
@@ -463,6 +498,7 @@ pub(crate) mod fixtures {
 
     pub fn snapshot() -> DevicesSnapshot {
         DevicesSnapshot {
+            as_of_seq: 0,
             devices: vec![info()],
             unidentified: vec![UnidentifiedTransport {
                 platform: Platform::Android,
@@ -618,6 +654,7 @@ mod tests {
         round_trip(install_event());
         round_trip(tool_paths());
         round_trip(DeviceDetail {
+            sessions_unknown: None,
             info: info(),
             apps: vec![AppState {
                 app_id: "com.example.app".into(),

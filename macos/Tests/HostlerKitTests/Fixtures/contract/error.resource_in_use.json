@@ -1,0 +1,9 @@
+{
+  "code": "resource_in_use",
+  "details": {
+    "holder_path": "/work/app",
+    "resource": "screen"
+  },
+  "message": "screen is claimed by /work/app",
+  "recovery": "hostler status"
+}

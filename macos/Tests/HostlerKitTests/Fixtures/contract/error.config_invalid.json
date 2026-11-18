@@ -1,0 +1,6 @@
+{
+  "code": "config_invalid",
+  "details": {},
+  "message": "hostler.toml line 3: unknown key",
+  "recovery": "hostler doctor"
+}

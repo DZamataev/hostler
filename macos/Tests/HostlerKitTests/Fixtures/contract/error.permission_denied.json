@@ -1,0 +1,8 @@
+{
+  "code": "permission_denied",
+  "details": {
+    "command": "add"
+  },
+  "message": "`hostler devices add` needs a person at a terminal. A person runs this; an agent asks the operator.",
+  "recovery": "hostler devices add"
+}

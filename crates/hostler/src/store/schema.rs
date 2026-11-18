@@ -3,7 +3,7 @@
 use anyhow::Context;
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 pub(crate) const MIGRATION_V1: &str = "
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -93,6 +93,42 @@ CREATE TABLE device_session_forgets (id TEXT PRIMARY KEY, resource TEXT NOT NULL
   at_ms INTEGER NOT NULL);
 ";
 
+/// P5: each project's declarations (names and purposes, from `workspace.resolve`), the
+/// service-wide limit on password checks (spec §8.5; one row, Task 4), account requests (spec
+/// §8.4; the fields are names only), and `heavy_entries` rebuilt so its CHECK admits `stopping`
+/// (spec §11.1). SQLite cannot alter a CHECK: the table is created anew, copied, dropped and
+/// renamed in this migration's transaction (its only index is `ticket`'s UNIQUE one, made with
+/// the table).
+const MIGRATION_V5: &str = "
+CREATE TABLE project_declared (project_id TEXT PRIMARY KEY, json TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL);
+CREATE TABLE password_limit (id INTEGER PRIMARY KEY CHECK (id = 1), failures INTEGER NOT NULL,
+  last_failure_at_ms INTEGER);
+CREATE TABLE account_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+  name TEXT NOT NULL, fields_json TEXT NOT NULL, reason TEXT NOT NULL,
+  requester_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','stored','declined','withdrawn','timed_out')),
+  created_at_ms INTEGER NOT NULL, answered_at_ms INTEGER);
+CREATE INDEX account_requests_pending ON account_requests (state, project_id, name);
+CREATE TABLE heavy_entries_v5 (id TEXT PRIMARY KEY, ticket INTEGER NOT NULL UNIQUE,
+  kind TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, workspace_root TEXT,
+  holder_json TEXT NOT NULL, child_json TEXT, group_json TEXT,
+  state TEXT NOT NULL CHECK (state IN ('waiting','running','stopping')),
+  enqueued_at_ms INTEGER NOT NULL, granted_at_ms INTEGER, nested_in TEXT);
+INSERT INTO heavy_entries_v5 (id, ticket, kind, command, cwd, workspace_root, holder_json,
+  child_json, group_json, state, enqueued_at_ms, granted_at_ms, nested_in)
+  SELECT id, ticket, kind, command, cwd, workspace_root, holder_json, child_json, group_json,
+  state, enqueued_at_ms, granted_at_ms, nested_in FROM heavy_entries;
+DROP TABLE heavy_entries;
+ALTER TABLE heavy_entries_v5 RENAME TO heavy_entries;
+";
+
+/// P5-L16: a claim history row carries its resource's stable id, so the app matches history by
+/// id rather than by a display name a rename changes. Rows recorded before it read as `NULL`.
+const MIGRATION_V6: &str = "
+ALTER TABLE claim_history ADD COLUMN resource_id TEXT;
+";
+
 pub(crate) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let mut version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -118,6 +154,15 @@ pub(crate) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     // A released 0.0.2 database (v2) runs v3 above, commits, then v4 (P3b).
     if version < 4 {
         migrate_to(conn, 4, MIGRATION_V4)?;
+        version = 4;
+    }
+    // L73: no compatibility before 1.0.0, but the framework still runs every step in order.
+    if version < 5 {
+        migrate_to(conn, 5, MIGRATION_V5)?;
+        version = 5;
+    }
+    if version < 6 {
+        migrate_to(conn, 6, MIGRATION_V6)?;
     }
     Ok(())
 }
@@ -186,7 +231,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let projects = store.projects().unwrap();
         assert_eq!(projects.len(), 1);
@@ -285,7 +330,7 @@ mod tests {
         }
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store.conn), 4);
+        assert_eq!(user_version(&store.conn), SCHEMA_VERSION);
         let workspaces = store.workspaces().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].root_dev, Some(7));
@@ -308,7 +353,7 @@ mod tests {
         // Reopening a v4 database migrates nothing.
         drop(store);
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store.conn), 4);
+        assert_eq!(user_version(&store.conn), SCHEMA_VERSION);
         assert_eq!(store.claims().unwrap().len(), 1);
     }
 
@@ -333,7 +378,7 @@ mod tests {
         assert_eq!(user_version(&Connection::open(&path).unwrap()), 2);
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(&store.conn), 4);
+        assert_eq!(user_version(&store.conn), SCHEMA_VERSION);
         let projects = store.projects().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "app");
@@ -395,28 +440,153 @@ mod tests {
         );
     }
 
+    /// P5-L16: a v5 database gains `claim_history.resource_id`; a row recorded before it reads
+    /// as `None` (its display name is not an id).
+    #[test]
+    fn v5_database_migrates_to_v6_keeping_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hostler.db");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            for (v, sql) in [
+                (1, MIGRATION_V1),
+                (2, MIGRATION_V2),
+                (3, MIGRATION_V3),
+                (4, MIGRATION_V4),
+                (5, MIGRATION_V5),
+            ] {
+                migrate_to(&mut conn, v, sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO claim_history (id, resource, kind, workspace_path, command, \
+                 granted_at_ms, ended_at_ms, reason, exit_code, detail) VALUES ('c0', 'screen', \
+                 'lease', '/work/app', 'make test', 1, 2, 'released', 0, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store.conn), SCHEMA_VERSION);
+        let history = store.claim_history(&HistoryQuery::default()).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "c0");
+        assert_eq!(history[0].resource, "screen");
+        assert_eq!(history[0].resource_id, None, "an old row has no stable id");
+    }
+
     #[test]
     fn newer_user_version_refused() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hostler.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
         }
         let err = match Store::open(&path) {
             Ok(_) => panic!("opening a newer database must fail"),
             Err(err) => format!("{err:#}"),
         };
         assert!(
-            err.contains("version 5") && err.contains("schema version 4"),
+            err.contains("version 7") && err.contains("schema version 6"),
             "{err}"
         );
-        // Never rewritten: still 5, still not WAL.
+        // Never rewritten: still 7, still not WAL.
         let conn = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&conn), 5);
+        assert_eq!(user_version(&conn), 7);
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_ne!(mode, "wal");
+    }
+
+    /// P5: a v4 database with a live heavy entry migrates to v5: the entry is kept, the new
+    /// tables exist and are empty, and `heavy_entries` admits `stopping` (and nothing else new).
+    #[test]
+    fn v4_database_migrates_to_v5_keeping_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hostler.db");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            for (v, sql) in [
+                (1, MIGRATION_V1),
+                (2, MIGRATION_V2),
+                (3, MIGRATION_V3),
+                (4, MIGRATION_V4),
+            ] {
+                migrate_to(&mut conn, v, sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO heavy_entries (id, ticket, kind, command, cwd, workspace_root, \
+                 holder_json, state, enqueued_at_ms, nested_in) VALUES ('e1', 7, 'gradle', \
+                 'make', '/w', NULL, '{\"pid\":1,\"boot_id\":\"b\",\"start_time\":2}', \
+                 'running', 10, 'c0')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store.conn), SCHEMA_VERSION);
+        let entries = store.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "e1");
+        assert_eq!(entries[0].ticket, 7);
+        assert_eq!(
+            entries[0].state,
+            crate::contract::heavy::HeavyState::Running
+        );
+        for table in ["project_declared", "password_limit", "account_requests"] {
+            let n: i64 = store
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
+        let nested: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT nested_in FROM heavy_entries WHERE id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nested.as_deref(), Some("c0"));
+        store
+            .conn
+            .execute(
+                "UPDATE heavy_entries SET state = 'stopping' WHERE id = 'e1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE heavy_entries SET state = 'paused' WHERE id = 'e1'",
+                    []
+                )
+                .is_err(),
+            "the CHECK still refuses unknown states"
+        );
+        // `ticket` stays unique.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO heavy_entries (id, ticket, kind, command, cwd, holder_json, \
+                     state, enqueued_at_ms) VALUES ('e2', 7, 'k', 'c', '/w', '{}', 'waiting', 1)",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO password_limit (id, failures) VALUES (2, 0)",
+                    [],
+                )
+                .is_err(),
+            "password_limit has one row at most"
+        );
     }
 }

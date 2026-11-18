@@ -1,0 +1,7 @@
+{
+  "id": 9,
+  "method": "heavy.force_release",
+  "params": {
+    "id": "6f1e6a9a"
+  }
+}

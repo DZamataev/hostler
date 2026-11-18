@@ -1,0 +1,8 @@
+{
+  "id": 60,
+  "method": "devices.remove",
+  "params": {
+    "device": "pixel-9",
+    "person": true
+  }
+}

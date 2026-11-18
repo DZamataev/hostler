@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use tokio::sync::broadcast;
-
 use super::*;
 use crate::claims::ResourceCatalog;
 use crate::claims::engine::ClaimsEngine;
@@ -37,7 +35,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn service_on(store: Store) -> Arc<DevicesService> {
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = crate::service::events::EventBus::channel(256);
     let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
     DevicesService::with_clock(store, ToolPaths::default(), tx, clock).0
 }
@@ -673,7 +671,7 @@ fn both() -> Both {
     let path = dir.path().join("hostler.db");
     let svc = service_on(Store::open(&path).unwrap());
     let table = Arc::new(FakeTable::new("b1"));
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = crate::service::events::EventBus::channel(256);
     let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
     let engine = ClaimsEngine::new(
         Store::open(&path).unwrap(),
@@ -1288,7 +1286,7 @@ fn canonical_workspace_never_spawns_twice_for_a_pending_path() {
 // ---- P3bT9b-8 ----
 
 fn service_at(clock: Arc<TestClock>) -> Arc<DevicesService> {
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = crate::service::events::EventBus::channel(256);
     DevicesService::with_clock(
         Store::open_in_memory().unwrap(),
         ToolPaths::default(),

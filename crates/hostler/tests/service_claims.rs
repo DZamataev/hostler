@@ -201,7 +201,10 @@ fn v2_client_gets_contract_mismatch() {
         });
     let frame: Value = serde_json::from_str(&answer).unwrap();
     assert_eq!(frame["error"]["code"], "contract_mismatch", "{frame}");
-    assert_eq!(frame["error"]["details"]["service_contract"], 4);
+    assert_eq!(
+        frame["error"]["details"]["service_contract"],
+        hostler::contract::CONTRACT_VERSION
+    );
 }
 
 #[test]

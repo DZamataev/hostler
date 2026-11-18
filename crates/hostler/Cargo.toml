@@ -1,6 +1,6 @@
 [package]
 name = "hostler"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -44,6 +44,7 @@ zeroize = "1.9.1"
 assert_cmd = "2.2.2"
 escargot = "1.0.1"
 predicates = "3.1.4"
+schemars = "1.2.3"
 tempfile = "3.27.0"
 
 [target."cfg(unix)".dependencies]

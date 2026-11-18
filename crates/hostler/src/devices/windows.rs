@@ -499,7 +499,7 @@ mod tests {
             .unwrap();
         store.set_setting(keys::ALIVE_MS, Some("1000")).unwrap();
         ended_lease(&store, "hidden1", 2_000, 3_000);
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let (tx, _) = crate::service::events::EventBus::channel(16);
         let (svc, _) = DevicesService::with_clock(
             store,
             super::super::tools::ToolPaths::default(),
@@ -507,6 +507,7 @@ mod tests {
             Arc::new(Fixed(10_000)),
         );
         let empty = ClaimsSnapshot {
+            as_of_seq: 0,
             resources: Vec::new(),
         };
         on_claims(&svc, &empty, 10_000);
@@ -556,7 +557,7 @@ mod tests {
             store
                 .upsert_workspace("w2", &other.id, "/work/other", "/work/other/.git", 1)
                 .unwrap();
-            let (tx, _) = tokio::sync::broadcast::channel(16);
+            let (tx, _) = crate::service::events::EventBus::channel(16);
             let (svc, _) = DevicesService::with_clock(
                 store,
                 super::super::tools::ToolPaths::default(),
@@ -638,6 +639,7 @@ mod tests {
 
         fn late_pass(&self, now: i64) {
             let empty = ClaimsSnapshot {
+                as_of_seq: 0,
                 resources: Vec::new(),
             };
             on_claims(&self.svc, &empty, now);

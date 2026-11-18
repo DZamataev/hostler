@@ -1,0 +1,92 @@
+# The source of truth for the Xcode project (the reference app's invariant 10). The generated
+# Hostler.xcodeproj is not committed (plan deviation 1): run `scripts/macos.sh gen`.
+name: Hostler
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.2"
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "14.2"
+    SDKROOT: macosx
+    SWIFT_VERSION: "6.0"
+    # Ad-hoc signed, no team (P5 is unsigned; P6 adds the Developer ID). An ad-hoc signature
+    # binds the Info.plist, which notifications need (Task 0 facts §3).
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+
+packages:
+  HostlerKit:
+    path: .
+
+targets:
+  Hostler:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.2"
+    productName: Hostler
+    sources:
+      - path: Sources/Hostler
+        excludes:
+          - "Resources/StatusItem"
+      # A resource directory is declared as a folder (the reference app's invariant 17). The app
+      # target is not in Package.swift, so this is its only declaration.
+      - path: Sources/Hostler/Resources/StatusItem
+        type: folder
+        buildPhase: resources
+      - path: AppBundle/AppIcon.icns
+        buildPhase: resources
+    dependencies:
+      - package: HostlerKit
+        product: HostlerKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.dzamataev.hostler.app
+        PRODUCT_NAME: Hostler
+        PRODUCT_MODULE_NAME: Hostler
+        EXECUTABLE_NAME: Hostler
+        INFOPLIST_FILE: AppBundle/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: AppBundle/Hostler.entitlements
+        # The crate's version (crates/hostler/Cargo.toml); scripts/macos.sh checks they agree.
+        MARKETING_VERSION: "0.0.5"
+        CURRENT_PROJECT_VERSION: "2"
+        COMBINE_HIDPI_IMAGES: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        SWIFT_STRICT_CONCURRENCY: complete
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../Frameworks"
+      configs:
+        Debug:
+          ONLY_ACTIVE_ARCH: YES
+        Release:
+          ONLY_ACTIVE_ARCH: NO
+          # Release only: the Debug app is the host of the hosted tests (R2-10).
+          ENABLE_HARDENED_RUNTIME: YES
+    scheme:
+      testTargets:
+        - HostlerTests
+
+  HostlerTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.2"
+    sources:
+      - path: Tests/HostlerTests
+    dependencies:
+      - target: Hostler
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.dzamataev.hostler.app.tests
+        PRODUCT_NAME: HostlerTests
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: $(TEST_HOST)
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Hostler.app/Contents/MacOS/Hostler
+        SWIFT_STRICT_CONCURRENCY: complete

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::Notify;
 
 use super::android::{self, AdbLine, Identity, Merged};
 use super::catalog;
@@ -413,6 +413,8 @@ impl DeviceCache {
             unmapped_sessions: state.sessions.unmapped.clone(),
             tools: state.tools.clone().unwrap_or_else(|| tool_status(&state)),
             at_ms: state.at_ms,
+            // `DevicesService::list` and `publish` fill it (spec §6.2).
+            as_of_seq: 0,
         }
     }
 
@@ -1005,7 +1007,7 @@ pub struct DevicesService {
     settings: RwLock<ToolSettings>,
     guard: RwLock<Arc<AdbGuard>>,
     gate: ToolGate,
-    events: broadcast::Sender<Event>,
+    events: crate::service::events::EventBus,
     clock: Arc<dyn Clock>,
     claims_view: RwLock<ClaimsView>,
     /// The server's tick loop selects on it (P3-15).
@@ -1046,7 +1048,7 @@ impl DevicesService {
     pub fn new(
         store: Store,
         tools: ToolPaths,
-        events: broadcast::Sender<Event>,
+        events: crate::service::events::EventBus,
     ) -> (Arc<Self>, Arc<DeviceCache>) {
         DevicesService::with_clock(store, tools, events, Arc::new(SystemClock))
     }
@@ -1054,7 +1056,7 @@ impl DevicesService {
     pub fn with_clock(
         store: Store,
         tools: ToolPaths,
-        events: broadcast::Sender<Event>,
+        events: crate::service::events::EventBus,
         clock: Arc<dyn Clock>,
     ) -> (Arc<Self>, Arc<DeviceCache>) {
         let settings = read_settings(&store);
@@ -1151,7 +1153,7 @@ impl DevicesService {
 
     /// Task 8: `devices.installed`.
     pub(crate) fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        self.events.publish(event);
     }
 
     /// A fresh path in this service's own directory for a tool's JSON output.
@@ -1236,7 +1238,12 @@ impl DevicesService {
     /// virtual devices and unidentified transports.
     pub fn list(&self, all: bool) -> DevicesSnapshot {
         self.recheck_foreign();
+        // Captured under `publish`'s lock, where every `devices.changed` is committed; its
+        // point is read there after the capture (spec §6.2, R-1).
+        let last = self.last_event.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.cache.snapshot();
+        snapshot.as_of_seq = self.events.current_seq();
+        drop(last);
         if !all {
             snapshot
                 .devices
@@ -1289,6 +1296,7 @@ impl DevicesService {
         let info = self.found(device)?;
         let store = self.store();
         Ok(DeviceDetail {
+            sessions_unknown: None,
             apps: store.device_apps(&info.resource).unwrap_or_default(),
             snapshot_at_ms: store.device_snapshot_at(&info.resource).ok().flatten(),
             forgets: store.session_forgets(&info.resource).unwrap_or_default(),
@@ -2885,34 +2893,39 @@ impl DevicesService {
             }
         }
         let now = self.now();
-        let mut snapshot = self.cache.snapshot();
-        snapshot.at_ms = 0;
+        // Under `last_event` (two publishes never send their snapshots out of order): the cache
+        // is cloned (its lock released), then the finished snapshot committed (R-1).
         let mut last = self.last_event.lock().unwrap_or_else(|e| e.into_inner());
-        // What changes on its own every few seconds is not a change (P3bT5-8): it goes out
-        // with the next real one, or at most once per 10 s.
-        let structural = |s: &DevicesSnapshot| {
-            let mut s = s.clone();
-            s.tools.sessions_last_good_ms = None;
-            for d in &mut s.devices {
-                d.telemetry = None;
-                d.last_seen_ms = 0;
-                for session in &mut d.sessions {
-                    session.seen_since_ms = 0;
+        {
+            let mut snapshot = self.cache.snapshot();
+            snapshot.at_ms = 0;
+            // What changes on its own every few seconds is not a change (P3bT5-8): it goes out
+            // with the next real one, or at most once per 10 s.
+            let structural = |s: &DevicesSnapshot| {
+                let mut s = s.clone();
+                s.tools.sessions_last_good_ms = None;
+                for d in &mut s.devices {
+                    d.telemetry = None;
+                    d.last_seen_ms = 0;
+                    for session in &mut d.sessions {
+                        session.seen_since_ms = 0;
+                    }
                 }
+                s
+            };
+            let send = match &last.0 {
+                None => true,
+                Some(prev) if structural(prev) != structural(&snapshot) => true,
+                Some(prev) if *prev != snapshot => now - last.1 >= TELEMETRY_EVENT_MS,
+                Some(_) => false,
+            };
+            if !send {
+                return;
             }
-            s
-        };
-        let send = match &last.0 {
-            None => true,
-            Some(prev) if structural(prev) != structural(&snapshot) => true,
-            Some(prev) if *prev != snapshot => now - last.1 >= TELEMETRY_EVENT_MS,
-            Some(_) => false,
-        };
-        if send {
             last.0 = Some(snapshot.clone());
             last.1 = now;
             snapshot.at_ms = now;
-            let _ = self.events.send(Event::DevicesChanged(Box::new(snapshot)));
+            self.events.publish_snapshot(snapshot);
         }
     }
 
@@ -3447,12 +3460,12 @@ mod tests {
         svc: Arc<DevicesService>,
         cache: Arc<DeviceCache>,
         clock: Arc<TestClock>,
-        events: broadcast::Receiver<Event>,
+        events: crate::service::events::TestEvents,
     }
 
     fn world_with(store: Store, tools: ToolPaths) -> World {
         let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
-        let (tx, events) = broadcast::channel(256);
+        let (tx, events) = crate::service::events::EventBus::channel(256);
         let (svc, cache) = DevicesService::with_clock(store, tools, tx, clock.clone());
         World {
             svc,

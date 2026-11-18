@@ -1,0 +1,8 @@
+{
+  "id": 43,
+  "method": "claims.history",
+  "params": {
+    "limit": 50,
+    "since_ms": 1000
+  }
+}

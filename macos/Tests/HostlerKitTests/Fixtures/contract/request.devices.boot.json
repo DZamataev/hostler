@@ -1,0 +1,9 @@
+{
+  "id": 62,
+  "method": "devices.boot",
+  "params": {
+    "claim_id": "c1",
+    "resource": "device:android:avd:pixel_9",
+    "workspace_id": "ws-1"
+  }
+}

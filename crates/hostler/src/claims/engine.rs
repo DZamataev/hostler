@@ -12,7 +12,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::broadcast;
 
 use super::rules::{self, Admission, DeviceEnd, HeavyRunning, HeavyView, Pending, Seizing, State};
 use super::{ForeignClaimSource, ResourceCatalog};
@@ -23,7 +22,7 @@ use crate::contract::claims::{
     Selector, WaitingRequest, WorkspaceInfo, WorkspaceOutcome, WorkspaceRef, WorkspaceResolve,
     errors,
 };
-use crate::contract::heavy::{EntrySource, HeavyState, HistoryQuery, QueueSnapshot};
+use crate::contract::heavy::{EntrySource, HistoryQuery, QueueSnapshot};
 use crate::contract::secrets::errors::{bad_request, service_stopping};
 use crate::contract::wire::Event;
 use crate::contract::{ErrorCode, HostlerError};
@@ -68,10 +67,12 @@ pub struct ClaimsEngine {
     clock: Arc<dyn Clock>,
     catalogs: Vec<Box<dyn ResourceCatalog>>,
     foreign: Vec<Box<dyn ForeignClaimSource>>,
-    events: broadcast::Sender<Event>,
+    events: crate::service::events::EventBus,
     plans: Vec<Plan>,
     stopping: bool,
     last_snapshot: Option<ClaimsSnapshot>,
+    /// The projects as `projects.changed` last published them (P5), compared without times.
+    last_projects: Option<Vec<crate::contract::projects::ProjectView>>,
     last_prune_ms: Option<i64>,
     /// What the catalogs and foreign sources said last (T5-4).
     sources: std::cell::RefCell<Option<Sources>>,
@@ -561,7 +562,7 @@ pub fn heavy_view(snapshot: &QueueSnapshot) -> HeavyView {
         .running
         .iter()
         .filter(own)
-        .filter(|e| e.state == HeavyState::Running)
+        .filter(|e| e.state.occupies_slot())
         .map(|e| HeavyRunning {
             id: e.id.clone(),
             holder: e.holder.clone(),
@@ -814,8 +815,17 @@ fn prepare(r: WorkspaceResolve) -> Result<Prep, HostlerError> {
 /// resolve, never the claims engine.
 pub async fn resolve_workspace(
     claims: &tokio::sync::Mutex<ClaimsEngine>,
-    r: WorkspaceResolve,
+    mut r: WorkspaceResolve,
 ) -> Result<WorkspaceInfo, HostlerError> {
+    // P5: the declaration is checked first (never echoed) and stored once the workspace is.
+    let declared = r.declared.take();
+    if let Some(decl) = &declared
+        && let Err(why) = decl.check()
+    {
+        return Err(bad_request(format!(
+            "invalid hostler.toml declaration: {why}"
+        )));
+    }
     let chars = r.project.name.chars().count();
     if !(1..=64).contains(&chars) || r.project.name.chars().any(char::is_control) {
         return Err(bad_request(
@@ -920,6 +930,10 @@ pub async fn resolve_workspace(
             recovery: None,
         });
     }
+    // `None` (no hostler.toml) leaves the stored declaration alone.
+    if let Some(decl) = &declared {
+        claims.lock().await.store_declared(&info.project_id, decl)?;
+    }
     Ok(info)
 }
 
@@ -930,7 +944,7 @@ impl ClaimsEngine {
         clock: Arc<dyn Clock>,
         catalogs: Vec<Box<dyn ResourceCatalog>>,
         foreign: Vec<Box<dyn ForeignClaimSource>>,
-        events: broadcast::Sender<Event>,
+        events: crate::service::events::EventBus,
     ) -> ClaimsEngine {
         ClaimsEngine {
             store,
@@ -942,6 +956,7 @@ impl ClaimsEngine {
             plans: Vec::new(),
             stopping: false,
             last_snapshot: None,
+            last_projects: None,
             last_prune_ms: None,
             sources: std::cell::RefCell::new(None),
             paths_probe: PathProbe::default(),
@@ -1192,6 +1207,9 @@ impl ClaimsEngine {
                 now,
             )
             .map_err(internal)?;
+        if resolution != ProjectResolution::Existing {
+            self.events.mark_projects_dirty();
+        }
         let row = match file {
             Some(f) => self.store.workspace(&f.id).map_err(internal)?,
             None => None,
@@ -1231,6 +1249,7 @@ impl ClaimsEngine {
 
     /// Removes a workspace row `record_step` just created when its id file could not be written.
     fn forget_new_workspace(&self, id: &str) {
+        self.events.mark_projects_dirty();
         if let Err(e) = self.store.remove_unused_workspace(id) {
             tracing::warn!("cannot remove workspace {id} without its id file: {e:#}");
         }
@@ -1284,6 +1303,9 @@ impl ClaimsEngine {
             }
         }
         let path = display_path(&prep.root);
+        if outcome != WorkspaceOutcome::Known || repointed {
+            self.events.mark_projects_dirty();
+        }
         self.store
             .upsert_workspace(&id, &project_id, &path, &display_path(&prep.git_dir), now)
             .map_err(internal)?;
@@ -1299,6 +1321,110 @@ impl ClaimsEngine {
             note,
             last_seen_ms: now,
         }))
+    }
+
+    /// P5: stores a checkout's declaration for its project when it differs from the stored
+    /// one; a change is owed a `projects.changed`.
+    fn store_declared(
+        &self,
+        project_id: &str,
+        decl: &crate::contract::projects::ProjectDecl,
+    ) -> Result<(), HostlerError> {
+        if self
+            .store
+            .set_declared(project_id, decl, self.now())
+            .map_err(internal)?
+        {
+            self.events.mark_projects_dirty();
+        }
+        Ok(())
+    }
+
+    /// Every project with its workspaces and stored declaration, by name then id.
+    fn projects_view(&self) -> Result<Vec<crate::contract::projects::ProjectView>, HostlerError> {
+        let mut declared = self.store.declarations().map_err(internal)?;
+        let workspaces = self.workspaces()?;
+        Ok(self
+            .store
+            .projects()
+            .map_err(internal)?
+            .into_iter()
+            .map(|info| {
+                let (declared, declared_at_ms) = match declared.remove(&info.id) {
+                    Some((decl, at)) => (Some(decl), Some(at)),
+                    None => (None, None),
+                };
+                crate::contract::projects::ProjectView {
+                    workspaces: workspaces
+                        .iter()
+                        .filter(|w| w.project_id == info.id)
+                        .cloned()
+                        .collect(),
+                    info,
+                    declared,
+                    declared_at_ms,
+                }
+            })
+            .collect())
+    }
+
+    /// `projects.snapshot`'s answer, under the claims lock (`&self`), read at one point of the
+    /// event order (C-A1, spec §6.2).
+    pub fn projects_snapshot(
+        &self,
+    ) -> Result<crate::contract::projects::ProjectsSnapshot, HostlerError> {
+        let projects = self.projects_view()?;
+        Ok(crate::contract::projects::ProjectsSnapshot {
+            projects,
+            at_ms: self.now(),
+            // Read after the capture, under the claims lock where `projects.changed` is
+            // committed (R-1).
+            as_of_seq: self.events.current_seq(),
+        })
+    }
+
+    /// The projects without the times that change on every resolve.
+    fn projects_key(
+        projects: &[crate::contract::projects::ProjectView],
+    ) -> Vec<crate::contract::projects::ProjectView> {
+        let mut key = projects.to_vec();
+        for p in &mut key {
+            for w in &mut p.workspaces {
+                w.last_seen_ms = 0;
+            }
+        }
+        key
+    }
+
+    /// The projects as they are now become the baseline of `publish_projects` (at start).
+    pub fn remember_projects(&mut self) {
+        match self.projects_view() {
+            Ok(view) => self.last_projects = Some(Self::projects_key(&view)),
+            Err(e) => tracing::warn!("cannot read the projects: {}", e.message),
+        }
+    }
+
+    /// Publishes `projects.changed` when the projects differ from the last published ones;
+    /// read and numbered in one step (C-A1) under the claims lock (spec §6.2).
+    pub fn publish_projects(&mut self) {
+        let view = match self.projects_view() {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::warn!("cannot read the projects: {}", e.message);
+                return;
+            }
+        };
+        let key = Self::projects_key(&view);
+        if self.last_projects.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_projects = Some(key);
+        self.events
+            .publish_snapshot(crate::contract::projects::ProjectsSnapshot {
+                projects: view,
+                at_ms: self.now(),
+                as_of_seq: 0,
+            });
     }
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, HostlerError> {
@@ -1731,7 +1857,7 @@ impl ClaimsEngine {
             resource: claim.resource.display.clone(),
             ..record
         };
-        let _ = self.events.send(Event::ClaimsSeized(shown.clone()));
+        self.events.publish(Event::ClaimsSeized(shown.clone()));
         self.settle(&no_heavy());
         Ok(shown)
     }
@@ -2038,8 +2164,13 @@ impl ClaimsEngine {
         Ok(ForgetOutcome::Forgotten { seq })
     }
 
+    /// Under the claims lock (`&self`), read at one point of the event order (C-A1), which
+    /// `as_of_seq` names (spec §6.2).
     pub fn snapshot(&self) -> Result<ClaimsSnapshot, HostlerError> {
-        Ok(snapshot_of(&self.load()?))
+        let mut snapshot = snapshot_of(&self.load()?);
+        // Read after the capture, under the claims lock where `claims.changed` is committed.
+        snapshot.as_of_seq = self.events.current_seq();
+        Ok(snapshot)
     }
 
     pub fn history(&self, q: HistoryQuery) -> Result<Vec<ClaimHistoryItem>, HostlerError> {
@@ -2342,13 +2473,15 @@ impl ClaimsEngine {
     }
 
     /// Broadcasts `claims.changed` when the snapshot differs from the last one sent.
+    /// Read and numbered in one step (C-A1).
     fn publish(&mut self) {
-        let Ok(snapshot) = self.snapshot() else {
+        let Ok(data) = self.load() else {
             return;
         };
+        let snapshot = snapshot_of(&data);
         if self.last_snapshot.as_ref() != Some(&snapshot) {
-            let _ = self.events.send(Event::ClaimsChanged(snapshot.clone()));
-            self.last_snapshot = Some(snapshot);
+            self.last_snapshot = Some(snapshot.clone());
+            self.events.publish_snapshot(snapshot);
         }
     }
 }
@@ -2566,7 +2699,11 @@ fn snapshot_of(data: &Data) -> ClaimsSnapshot {
             }
         })
         .collect();
-    ClaimsSnapshot { resources }
+    // The engine's own comparisons see 0; answers and events fill it (spec §6.2).
+    ClaimsSnapshot {
+        resources,
+        as_of_seq: 0,
+    }
 }
 
 #[cfg(test)]
@@ -2631,7 +2768,7 @@ mod tests {
         table: Arc<FakeTable>,
         clock: Arc<TestClock>,
         dir: tempfile::TempDir,
-        events: broadcast::Receiver<Event>,
+        events: crate::service::events::TestEvents,
     }
 
     fn world(devices: u32) -> World {
@@ -2641,7 +2778,7 @@ mod tests {
     fn world_with(devices: u32, sources: Vec<Box<dyn ForeignClaimSource>>) -> World {
         let table = Arc::new(FakeTable::new(BOOT));
         let clock = Arc::new(TestClock(AtomicI64::new(100 * MIN)));
-        let (tx, events) = broadcast::channel(4096);
+        let (tx, events) = crate::service::events::EventBus::channel(4096);
         let engine = ClaimsEngine::new(
             Store::open_in_memory().unwrap(),
             table.clone(),
@@ -3790,7 +3927,7 @@ mod tests {
     fn device_in_use_fails_closed_when_the_store_cannot_be_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hostler.db");
-        let (tx, _events) = broadcast::channel(16);
+        let (tx, _events) = crate::service::events::EventBus::channel(16);
         let engine = ClaimsEngine::new(
             Store::open(&path).unwrap(),
             Arc::new(FakeTable::new(BOOT)),

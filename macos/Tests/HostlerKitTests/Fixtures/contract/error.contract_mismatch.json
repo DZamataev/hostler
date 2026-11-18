@@ -1,0 +1,10 @@
+{
+  "code": "contract_mismatch",
+  "details": {
+    "client_contract": 5,
+    "service_contract": 4,
+    "service_version": "0.0.4"
+  },
+  "message": "this hostler speaks contract 5, the service contract 4",
+  "recovery": "hostler service start --replace"
+}

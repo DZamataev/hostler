@@ -1,0 +1,17 @@
+{
+  "id": 6,
+  "method": "heavy.started",
+  "params": {
+    "child": {
+      "boot_id": "boot-1",
+      "pid": 43,
+      "start_time": 500
+    },
+    "group": {
+      "boot_id": "boot-1",
+      "kind": "unix_group",
+      "pgid": 42
+    },
+    "id": "6f1e6a9a"
+  }
+}

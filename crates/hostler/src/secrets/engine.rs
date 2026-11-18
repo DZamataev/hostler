@@ -7,38 +7,45 @@
 //! Methods that need an unlocked vault check the cached flag first and answer `SecretsLocked`
 //! at once. A poisoned vault mutex counts as locked, a poisoned store mutex as `Internal`.
 
+mod account_requests;
 mod accounts;
+#[cfg(test)]
+mod gate_tests;
 pub(crate) use accounts::MAX_ACCOUNT_FIELDS;
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use keepass::Database;
 use keepass::db::GroupId;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
 use zeroize::Zeroizing;
 
 use super::layout::{self, Lookup};
 use super::value::SecretValue;
-use super::vault::{KdfChoice, Vault, VaultError, VaultKey};
+use super::vault::{self, KdfChoice, Vault, VaultError, VaultKey};
 use super::{check_value, valid_secret_name};
 use crate::contract::secrets::{
     DeclaredSecret, Decline, ImportOutcome, LockState, Materialize, MaterializedSecret,
-    ProjectInfo, ProjectRef, RequestState, SecretImport, SecretInfo, SecretList, SecretRequest,
-    SecretRequestInfo, SecretSet, SecretSource, SecretState, SecretsStatus, SetOutcome, Share,
-    Unlock, errors,
+    ProjectInfo, ProjectRef, Removed, RequestState, SecretImport, SecretInfo, SecretList,
+    SecretRequest, SecretRequestInfo, SecretSet, SecretSource, SecretState, SecretsStatus,
+    SetOutcome, Share, ShareOutcome, Unlock, UnlockOutcome, Unshared, errors,
 };
+use crate::contract::secrets::{ProofGrant, Prove};
+use crate::contract::wire::RequestsSnapshot;
 use crate::contract::wire::{Event, Request};
 use crate::contract::{ErrorCode, HostlerError};
 use crate::heavy::engine::Clock;
 use crate::mask::MaskSet;
 use crate::procs::{self, Liveness, ProcessTable};
 use crate::project::display_path;
+use crate::secrets::gate::{
+    self, CheckKind, GrantMeta, LimitRow, Outcome, PasswordLimiter, SystemMonotonic, WallClock,
+};
 use crate::store::Store;
 
 /// The store setting that remembers the key file's path (D1).
@@ -61,6 +68,43 @@ const HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub enum Reply {
     Value(Value),
     Sensitive(Zeroizing<String>),
+}
+
+/// `dispatch`'s answer (R2-3): the reply, and the grant a successful prove or unlock hands the
+/// server for its connection (internal, never on the wire).
+pub struct SecretsAnswer {
+    pub reply: Reply,
+    pub grant: Option<GrantMeta>,
+}
+
+impl From<Reply> for SecretsAnswer {
+    fn from(reply: Reply) -> SecretsAnswer {
+        SecretsAnswer { reply, grant: None }
+    }
+}
+
+/// Who sent a request, as the server knows it (P5 Task 4): the socket peer's pid where the OS
+/// gives one (log lines only) and the connection's proof grant (spec §8.5).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Caller {
+    pub peer_pid: Option<u32>,
+    pub grant: Option<GrantMeta>,
+}
+
+impl Caller {
+    fn pid_text(&self) -> String {
+        self.peer_pid
+            .map_or_else(|| "unknown".to_owned(), |p| p.to_string())
+    }
+}
+
+/// The engine's wall clock, for the password limiter.
+struct EngineWall(Arc<dyn Clock>);
+
+impl WallClock for EngineWall {
+    fn now_ms(&self) -> i64 {
+        self.0.now_ms()
+    }
 }
 
 /// What `SecretsEngine::gate` guards.
@@ -90,6 +134,9 @@ pub struct SecretsEngine {
     /// Serializes choosing a project's group, writing to it, publishing its UUID and answering
     /// pending requests — against other writes (T6-1) and a request's check-and-insert (T6-3).
     publish: Mutex<()>,
+    /// Orders `secrets.lock_changed` against status answers (spec §6.2); taken after the
+    /// vault mutex, never before it.
+    lock_events: Mutex<()>,
     vault: Mutex<Vault>,
     kdbx: PathBuf,
     store: Mutex<Store>,
@@ -102,9 +149,17 @@ pub struct SecretsEngine {
     /// checked and set under it, and it counts the admitted jobs that may unlock the vault.
     gate: Mutex<Gate>,
     last_prune_ms: AtomicI64,
+    /// The service-wide limit on master-password checks (spec §8.5): prove and unlock.
+    limiter: PasswordLimiter,
+    /// `vault.generation()`, refreshed after every vault call: the gate's pre-check before any
+    /// work. The admission itself reads the vault's own, under the vault mutex.
+    generation: AtomicU64,
+    /// Unit tests count the vault sections.
+    #[cfg(test)]
+    vault_calls: std::sync::atomic::AtomicUsize,
     table: Arc<dyn ProcessTable>,
     clock: Arc<dyn Clock>,
-    events: broadcast::Sender<Event>,
+    events: crate::service::events::EventBus,
     kdf: KdfChoice,
     /// Unit tests pause at named points to force interleavings.
     #[cfg(test)]
@@ -165,6 +220,15 @@ fn invalid_value(name: &str) -> HostlerError {
         details: json!({ "name": name, "reason": "invalid_value" }),
         recovery: Some(format!("hostler secret set {name}")),
     }
+}
+
+/// `secrets.prove` without a database: there is no password to check.
+fn no_database_to_prove() -> HostlerError {
+    let mut e = errors::secrets_locked(true);
+    e.message = "no secrets database yet; create one in the hostler app or with: hostler unlock \
+                 --create"
+        .into();
+    e
 }
 
 /// Appends into a buffer allocated once and refuses to grow it: a reallocation would leave an
@@ -259,13 +323,20 @@ impl SecretsEngine {
         store: Store,
         table: Arc<dyn ProcessTable>,
         clock: Arc<dyn Clock>,
-        events: broadcast::Sender<Event>,
+        events: crate::service::events::EventBus,
         kdf: KdfChoice,
     ) -> SecretsEngine {
         let unlocked = vault.state() == LockState::Unlocked;
         let preserved = vault.preserved_files();
+        let generation = vault.generation();
+        let limiter = PasswordLimiter::new(
+            Box::new(EngineWall(clock.clone())),
+            Box::new(SystemMonotonic::new()),
+            gate::backoff_unit_ms(),
+        );
         SecretsEngine {
             publish: Mutex::new(()),
+            lock_events: Mutex::new(()),
             vault: Mutex::new(vault),
             kdbx,
             store: Mutex::new(store),
@@ -274,6 +345,10 @@ impl SecretsEngine {
             closing: AtomicBool::new(false),
             gate: Mutex::new(Gate::default()),
             last_prune_ms: AtomicI64::new(i64::MIN),
+            limiter,
+            generation: AtomicU64::new(generation),
+            #[cfg(test)]
+            vault_calls: std::sync::atomic::AtomicUsize::new(0),
             table,
             clock,
             events,
@@ -309,15 +384,71 @@ impl SecretsEngine {
                 | Request::AccountRemove(_)
                 | Request::AccountCheck { .. }
                 | Request::AccountMaterialize(_)
+                | Request::SecretsProve(_)
+                | Request::SecretReveal { .. }
+                | Request::AccountReveal { .. }
+                | Request::SecretsRemovePreserved { .. }
+                | Request::AccountRequest(_)
+                | Request::AccountRequestWithdraw { .. }
+                | Request::AccountRequests
+                | Request::AccountDecline { .. }
+                | Request::AccountAnswer(_)
+                | Request::RequestsSnapshot
         )
     }
 
-    /// Blocking: the KDF runs here, so callers use the blocking pool.
-    pub fn dispatch(&self, req: Request) -> Result<Reply, HostlerError> {
+    /// `dispatch_as` with no known peer and no grant (the server's own reads, tests).
+    pub fn dispatch(&self, req: Request) -> Result<SecretsAnswer, HostlerError> {
+        self.dispatch_as(req, &Caller::default())
+    }
+
+    /// Blocking: the KDF runs here, so callers use the blocking pool. Only a successful unlock
+    /// or prove answers with a grant. A gated method (spec §8.5) without a live grant is refused
+    /// before any other work; its admission is checked again under the vault mutex, in the
+    /// section that does its work.
+    pub fn dispatch_as(
+        &self,
+        req: Request,
+        caller: &Caller,
+    ) -> Result<SecretsAnswer, HostlerError> {
+        if crate::contract::methods::spec_of(&req).gated {
+            self.precheck(caller.grant.as_ref())?;
+        }
         let _admitted = self.admit(&req)?;
         match req {
-            Request::SecretsStatus => value_of(self.status()),
-            Request::SecretsUnlock(u) => value_of(self.unlock(u)),
+            Request::SecretsUnlock(u) => {
+                let (outcome, generation_at_grant) = self.unlock(u, caller)?;
+                let grant = GrantMeta {
+                    expires_at_ms: outcome.grant.expires_at_ms,
+                    generation_at_grant,
+                };
+                Ok(SecretsAnswer {
+                    reply: value_of(Ok(outcome))?,
+                    grant: Some(grant),
+                })
+            }
+            Request::SecretsProve(p) => {
+                let (answer, grant) = self.prove(p, caller)?;
+                Ok(SecretsAnswer {
+                    reply: value_of(Ok(answer))?,
+                    grant: Some(grant),
+                })
+            }
+            req => self.reply_to(req, caller).map(SecretsAnswer::from),
+        }
+    }
+
+    /// `dispatch`'s reply only.
+    pub fn reply(&self, req: Request) -> Result<Reply, HostlerError> {
+        self.dispatch(req).map(|answer| answer.reply)
+    }
+
+    fn reply_to(&self, req: Request, caller: &Caller) -> Result<Reply, HostlerError> {
+        match req {
+            Request::SecretsStatus => value_of(self.status_answer()),
+            Request::SecretsUnlock(_) | Request::SecretsProve(_) => {
+                unreachable!("answered by dispatch_as")
+            }
             Request::SecretsLock => value_of(self.lock()),
             Request::ProjectResolve(p) => value_of(self.resolve(&p)),
             Request::ProjectList => value_of(self.store()?.projects().map_err(store_error)),
@@ -342,6 +473,24 @@ impl SecretsEngine {
                 value_of(self.account_check(&project, &name))
             }
             Request::AccountMaterialize(m) => self.account_materialize(m).map(Reply::Sensitive),
+            // Contract 5 (P5): the gated methods (spec §8.5) and Task 5's account requests.
+            Request::SecretReveal { project, name } => self
+                .reveal_secret(&project, &name, caller)
+                .map(Reply::Sensitive),
+            Request::AccountReveal { project, name } => self
+                .reveal_account(&project, &name, caller)
+                .map(Reply::Sensitive),
+            Request::SecretsRemovePreserved { path } => {
+                value_of(self.remove_preserved(&path, caller))
+            }
+            Request::AccountRequest(r) => value_of(self.account_request(r)),
+            Request::AccountRequestWithdraw { id, timed_out } => {
+                value_of(self.account_request_withdraw(&id, timed_out))
+            }
+            Request::AccountRequests => value_of(self.account_requests()),
+            Request::AccountDecline { id } => value_of(self.account_decline(&id, caller)),
+            Request::AccountAnswer(a) => value_of(self.account_answer(a, caller)),
+            Request::RequestsSnapshot => value_of(self.requests_snapshot()),
             _ => Err(bad_request("not a secrets method")),
         }
     }
@@ -350,6 +499,9 @@ impl SecretsEngine {
     /// requests and materializations older than 30 days are pruned.
     pub fn tick(&self) {
         let now = self.now();
+        // The same ordering as a decline, a withdraw and an answer (R1-1): a request cannot be
+        // ticked dead while an answer writes its fields. Publish, then store.
+        let _publishing = self.publishing();
         let Ok(store) = self.store() else { return };
         let pending = match store.pending_requests() {
             Ok(pending) => pending,
@@ -371,16 +523,25 @@ impl SecretsEngine {
                 changed.push(info);
             }
         }
+        // Published under the store guard that wrote them (spec §6.2).
+        for info in changed {
+            self.emit(Event::SecretRequestChanged(info));
+        }
+        // Account requests whose requester is gone are withdrawn the same way (P5 Task 5).
+        for info in self.tick_account_requests(&store, now) {
+            self.emit(Event::AccountRequestChanged(info));
+        }
+        // One hourly branch for both histories; the timestamp advances once (R1-3).
         if now.saturating_sub(self.last_prune_ms.load(Ordering::SeqCst)) >= PRUNE_EVERY_MS {
             self.last_prune_ms.store(now, Ordering::SeqCst);
             if let Err(e) = store.prune_secret_history(now - HISTORY_RETENTION_MS) {
                 tracing::warn!("cannot prune the secrets history: {e:#}");
             }
+            if let Err(e) = store.prune_account_requests(now - HISTORY_RETENTION_MS) {
+                tracing::warn!("cannot prune the account request history: {e:#}");
+            }
         }
         drop(store);
-        for info in changed {
-            self.emit(Event::SecretRequestChanged(info));
-        }
     }
 
     /// Whether the database is unlocked, or a vault job (an unlock's KDF among them) is under
@@ -469,12 +630,19 @@ impl SecretsEngine {
     pub fn lock_for_shutdown(&self) {
         if let Ok(mut vault) = self.vault.lock() {
             vault.lock();
+            self.generation.store(vault.generation(), Ordering::SeqCst);
         }
         self.unlocked.store(false, Ordering::SeqCst);
     }
 
     fn now(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// Tests outside this module (the server's): pause at a named point.
+    #[cfg(test)]
+    pub(crate) fn set_test_hook(&self, hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>) {
+        *self.hook.lock().unwrap() = hook;
     }
 
     #[cfg(test)]
@@ -501,7 +669,7 @@ impl SecretsEngine {
     }
 
     fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        self.events.publish(event);
     }
 
     fn store(&self) -> Result<MutexGuard<'_, Store>, HostlerError> {
@@ -521,7 +689,10 @@ impl SecretsEngine {
             self.set_unlocked(false);
             return Err(VaultError::Locked);
         };
+        #[cfg(test)]
+        self.vault_calls.fetch_add(1, Ordering::SeqCst);
         let result = f(&mut vault);
+        self.generation.store(vault.generation(), Ordering::SeqCst);
         let unlocked = vault.state() == LockState::Unlocked;
         let preserved = vault.preserved_files();
         self.at("publish");
@@ -533,12 +704,54 @@ impl SecretsEngine {
         result
     }
 
+    /// The swap and its `secrets.lock_changed` happen under `lock_events` and the store guard,
+    /// which a status answer takes too: the status is captured there, then committed (R-1,
+    /// spec §6.2). Lock order: `lock_events`, the store guard; the bus is a leaf.
     fn set_unlocked(&self, unlocked: bool) {
+        let _events = self.lock_events();
         if self.unlocked.swap(unlocked, Ordering::SeqCst) != unlocked
-            && let Ok(status) = self.status()
+            && let Ok(store) = self.store()
+            && let Ok(status) = self.status_in(&store)
         {
-            self.emit(Event::SecretsLockChanged(status));
+            self.events.publish_snapshot(status);
         }
+    }
+
+    fn lock_events(&self) -> MutexGuard<'_, ()> {
+        self.lock_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A status answer: captured under `lock_events` and the store guard, where its kinds'
+    /// events (the lock state, the requests it counts) are committed; its point is read there
+    /// after the capture (R-1).
+    fn status_answer(&self) -> Result<SecretsStatus, HostlerError> {
+        let _events = self.lock_events();
+        let store = self.store()?;
+        self.at("status_read");
+        let mut status = self.status_in(&store)?;
+        status.as_of_seq = self.events.current_seq();
+        Ok(status)
+    }
+
+    /// `requests.snapshot`: every pending secret and account request, captured under the store
+    /// guard their events are committed under; its point is read there after the capture (R-1,
+    /// spec §6.2).
+    fn requests_snapshot(&self) -> Result<RequestsSnapshot, HostlerError> {
+        let store = self.store()?;
+        let secrets = store
+            .pending_requests()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect();
+        let accounts = self.pending_account_requests(&store)?;
+        Ok(RequestsSnapshot {
+            secrets,
+            accounts,
+            as_of_seq: self.events.current_seq(),
+        })
     }
 
     fn require_unlocked(&self) -> Result<(), HostlerError> {
@@ -549,7 +762,14 @@ impl SecretsEngine {
         }
     }
 
+    /// Tests: the status with a fresh store guard (answers use `status_answer`).
+    #[cfg(test)]
     fn status(&self) -> Result<SecretsStatus, HostlerError> {
+        self.status_in(&*self.store()?)
+    }
+
+    /// `status` with the store guard the caller holds.
+    fn status_in(&self, store: &Store) -> Result<SecretsStatus, HostlerError> {
         let state = if self.unlocked.load(Ordering::SeqCst) {
             LockState::Unlocked
         } else if self.kdbx.exists() {
@@ -563,38 +783,212 @@ impl SecretsEngine {
             .lock()
             .map(|names| names.iter().map(|n| display_path(&dir.join(n))).collect())
             .unwrap_or_default();
-        let store = self.store()?;
         Ok(SecretsStatus {
             state,
             database: display_path(&self.kdbx),
             key_file: store.setting(KEY_FILE_SETTING).map_err(store_error)?,
             pending_requests: store.pending_requests().map_err(store_error)?.len() as u32,
             preserved_files,
+            // `status_answer` and the event fill it.
+            as_of_seq: 0,
         })
     }
 
-    fn unlock(&self, u: Unlock) -> Result<SecretsStatus, HostlerError> {
-        self.at("unlock_admitted");
+    // ---- the person gate (P5, spec §8.5) ----
+
+    /// The gate's first check, before any work: a live grant of the current generation (the
+    /// cached one). `admitted_vault` checks again under the vault mutex.
+    fn precheck(&self, grant: Option<&GrantMeta>) -> Result<(), HostlerError> {
+        gate::admit(grant, self.now(), self.generation.load(Ordering::SeqCst))
+    }
+
+    /// `f` under the vault mutex, admitted first in the same section: the grant is live and of
+    /// the vault's generation now, so `f` never runs under a newer generation than the grant's.
+    fn admitted_vault<T>(
+        &self,
+        grant: Option<&GrantMeta>,
+        f: impl FnOnce(&mut Vault) -> Result<T, VaultError>,
+    ) -> Result<T, HostlerError> {
+        self.with_vault(|v| {
+            // Read with the vault held (review t4-r1 R1-1): a request that waited for the vault
+            // behind other work, or across a wall-clock change, is checked as of now.
+            let now = self.now();
+            gate::admit(grant, now, v.generation()).map_err(VaultError::Rejected)?;
+            f(v)
+        })
+        .map_err(|e| e.to_hostler())
+    }
+
+    /// The admission alone, for a gated method whose work is not the vault's (`heavy.stop`
+    /// takes the vault mutex for the check, then releases it before it stops anything).
+    /// Blocking: the vault mutex may be held by an unlock's KDF.
+    pub fn admit_grant(&self, grant: Option<&GrantMeta>) -> Result<(), HostlerError> {
+        self.precheck(grant)?;
+        self.at("grant_admit");
+        self.admitted_vault(grant, |_| Ok(()))
+    }
+
+    /// Debug builds: `HOSTLER_TEST_PAUSE_AT=<point>:<file>` holds the request at `<point>`
+    /// while `<file>` exists (up to 60 s), after writing `<file>.reached`. Unit tests use `at`.
+    fn pause_at(&self, point: &'static str) {
+        self.at(point);
         #[cfg(debug_assertions)]
-        Self::test_unlock_pause();
+        {
+            let Some(spec) = std::env::var_os("HOSTLER_TEST_PAUSE_AT") else {
+                return;
+            };
+            let spec = spec.to_string_lossy();
+            let Some((at, file)) = spec.split_once(':') else {
+                return;
+            };
+            if at != point {
+                return;
+            }
+            let file = PathBuf::from(file);
+            let mut reached = file.clone().into_os_string();
+            reached.push(".reached");
+            let _ = std::fs::write(&reached, b"");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while file.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// The remembered key file unless the request names one or forgets it.
+    fn key_file_for(
+        &self,
+        given: &Option<String>,
+        forget: bool,
+    ) -> Result<Option<String>, HostlerError> {
         let remembered = self
             .store()?
             .setting(KEY_FILE_SETTING)
             .map_err(store_error)?;
-        let key_file = match (&u.key_file, u.forget_key_file) {
+        Ok(match (given, forget) {
             (Some(path), _) => Some(path.clone()),
             (None, true) => None,
             (None, false) => remembered,
+        })
+    }
+
+    /// One admitted password check (spec §8.5's limit), or the refusal. The store guard is held
+    /// only while the limiter reads and writes its row.
+    fn begin_check(
+        &self,
+        kind: CheckKind,
+        caller: &Caller,
+    ) -> Result<gate::Permit<'_>, HostlerError> {
+        let store = self.store()?;
+        self.limiter
+            .begin(kind, caller.peer_pid, &*store as &dyn LimitRow)
+    }
+
+    fn finish_check(&self, permit: gate::Permit<'_>, outcome: Outcome) {
+        match self.store() {
+            Ok(store) => permit.finish(outcome, Some(&*store as &dyn LimitRow)),
+            Err(_) => permit.finish(outcome, None),
+        }
+    }
+
+    /// How a vault error ends a password check: a wrong key counts; so does `Corrupt`, which a
+    /// wrong key gives a KDBX 3 file now and then; the rest compared no password.
+    fn check_outcome<T>(result: &Result<T, VaultError>) -> Outcome {
+        match result {
+            Ok(_) => Outcome::Success,
+            Err(VaultError::IncorrectKey | VaultError::Corrupt) => Outcome::Failure,
+            Err(_) => Outcome::Neutral,
+        }
+    }
+
+    /// `secrets.prove` (spec §8.5): the master password (with the given or remembered key file)
+    /// opens the database file on disk; nothing changes. Through the limiter. The grant carries
+    /// the generation read with the file, before the check: a lock or unlock during the check
+    /// voids it.
+    fn prove(&self, p: Prove, caller: &Caller) -> Result<(ProofGrant, GrantMeta), HostlerError> {
+        if !self.kdbx.exists() {
+            return Err(no_database_to_prove());
+        }
+        let key_file = self.key_file_for(&p.key_file, false)?;
+        let permit = self.begin_check(CheckKind::Prove, caller)?;
+        let key = match VaultKey::new(&p.password, key_file.as_deref().map(Path::new)) {
+            Ok(key) => key,
+            Err(e) => {
+                self.finish_check(permit, Outcome::Neutral);
+                return Err(e.to_hostler());
+            }
         };
-        let key = VaultKey::new(&u.password, key_file.as_deref().map(Path::new))
-            .map_err(|e| e.to_hostler())?;
+        // The file and the generation in one vault section: never between a save's steps.
+        let read = match self.vault.lock() {
+            Ok(vault) => (std::fs::read(vault.path()), vault.generation()),
+            Err(_) => {
+                self.finish_check(permit, Outcome::Neutral);
+                return Err(errors::secrets_locked(false));
+            }
+        };
+        let (bytes, generation) = match read {
+            (Ok(bytes), generation) => (Zeroizing::new(bytes), generation),
+            (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.finish_check(permit, Outcome::Neutral);
+                return Err(no_database_to_prove());
+            }
+            (Err(e), _) => {
+                self.finish_check(permit, Outcome::Neutral);
+                return Err(VaultError::Io {
+                    what: "read the database",
+                    kind: e.kind(),
+                }
+                .to_hostler());
+            }
+        };
+        self.pause_at("prove_checking");
+        let result = vault::check_key(&bytes, &key);
+        self.finish_check(permit, Self::check_outcome(&result));
+        result.map_err(|e| e.to_hostler())?;
+        let expires_at_ms = self.now().saturating_add(gate::proof_ttl_ms());
+        Ok((
+            ProofGrant { expires_at_ms },
+            GrantMeta {
+                expires_at_ms,
+                generation_at_grant: generation,
+            },
+        ))
+    }
+
+    /// Answers `UnlockOutcome` (contract 5) and the generation after the unlock: a successful
+    /// unlock grants its connection (spec §8.5). An unlock checks a password, so it runs through
+    /// the limiter; a create checks none.
+    fn unlock(&self, u: Unlock, caller: &Caller) -> Result<(UnlockOutcome, u64), HostlerError> {
+        self.at("unlock_admitted");
+        #[cfg(debug_assertions)]
+        Self::test_unlock_pause();
+        let key_file = self.key_file_for(&u.key_file, u.forget_key_file)?;
+        let permit = match u.create {
+            true => None,
+            false => Some(self.begin_check(CheckKind::Unlock, caller)?),
+        };
+        let key = match VaultKey::new(&u.password, key_file.as_deref().map(Path::new)) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(permit) = permit {
+                    self.finish_check(permit, Outcome::Neutral);
+                }
+                return Err(e.to_hostler());
+            }
+        };
+        let generation = AtomicU64::new(0);
         let result = self.with_vault(|v| {
-            if u.create {
+            let result = if u.create {
                 v.create(key, self.kdf)
             } else {
                 v.unlock(key)
-            }
+            };
+            generation.store(v.generation(), Ordering::SeqCst);
+            result
         });
+        if let Some(permit) = permit {
+            self.finish_check(permit, Self::check_outcome(&result));
+        }
         // A NotDurable create left a database with this key at the path.
         if matches!(result, Ok(()) | Err(VaultError::NotDurable)) {
             let store = self.store()?;
@@ -609,7 +1003,15 @@ impl SecretsEngine {
             }
         }
         match result {
-            Ok(()) => self.status(),
+            Ok(()) => Ok((
+                UnlockOutcome {
+                    status: self.status_answer()?,
+                    grant: ProofGrant {
+                        expires_at_ms: self.now().saturating_add(gate::proof_ttl_ms()),
+                    },
+                },
+                generation.load(Ordering::SeqCst),
+            )),
             Err(VaultError::Exists) => Err(bad_request(format!(
                 "a database already exists at {}",
                 display_path(&self.kdbx)
@@ -618,12 +1020,103 @@ impl SecretsEngine {
         }
     }
 
+    /// `secret.reveal` (gated): one secret's value for the person, by the materialize rules
+    /// (shares followed, another project's secret refused, the value rules checked). The value
+    /// is read under the vault mutex that admitted the grant. The log names it, never its value.
+    fn reveal_secret(
+        &self,
+        project: &ProjectRef,
+        name: &str,
+        caller: &Caller,
+    ) -> Result<Zeroizing<String>, HostlerError> {
+        check_name(name)?;
+        let project = self.approved(project)?;
+        self.require_unlocked()?;
+        let names = [name.to_owned()];
+        self.pause_at("reveal_admit");
+        let found = self.find_values(&project, &names, caller.grant.as_ref(), true)?;
+        let mut values = Self::found_values(&project, &names, found)?;
+        let value = values
+            .pop()
+            .ok_or_else(|| internal("the revealed value is missing"))?;
+        let bound = answer_bound(std::slice::from_ref(&value));
+        let mut encoded = encode_answer(&value, bound)?;
+        let text = String::from_utf8(std::mem::take(&mut *encoded))
+            .map_err(|_| internal("cannot encode the revealed secret"))?;
+        tracing::info!(
+            "revealed secret {name} of project {} (peer pid {})",
+            project.name,
+            caller.pid_text()
+        );
+        Ok(Zeroizing::new(text))
+    }
+
+    /// `secrets.remove_preserved` (gated): deletes one kept `hostler.kdbx.prev-*` file. Only a
+    /// path that `secrets.status` lists, a regular file (not a symlink) named as a prev file, in
+    /// the state directory itself; anything else is refused and nothing is deleted. Checked and
+    /// deleted under the vault mutex that admitted the grant (a save makes and removes prev
+    /// files under it too).
+    fn remove_preserved(&self, path: &str, caller: &Caller) -> Result<SecretsStatus, HostlerError> {
+        let refuse = || {
+            bad_request(
+                "not a preserved hostler.kdbx.prev-* file of this service (secrets.status lists                  them); nothing was deleted",
+            )
+        };
+        let given = Path::new(path);
+        let dir = self.kdbx.parent().unwrap_or(Path::new("."));
+        let prefix = format!(
+            "{}.prev-",
+            self.kdbx
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        let removed = self.admitted_vault(caller.grant.as_ref(), |v| {
+            let listed = v.preserved_files();
+            let checked = (|| {
+                let name = given.file_name()?.to_str()?.to_owned();
+                if !name.starts_with(&prefix) || !listed.contains(&name) {
+                    return None;
+                }
+                if display_path(&dir.join(&name)) != path && dir.join(&name) != given {
+                    return None;
+                }
+                let meta = std::fs::symlink_metadata(given).ok()?;
+                if !meta.file_type().is_file() {
+                    return None;
+                }
+                let canonical = std::fs::canonicalize(given).ok()?;
+                let canonical_dir = std::fs::canonicalize(dir).ok()?;
+                (canonical.parent() == Some(canonical_dir.as_path())
+                    && canonical.file_name() == Some(std::ffi::OsStr::new(&name)))
+                .then_some(canonical)
+            })();
+            let Some(canonical) = checked else {
+                return Ok(None);
+            };
+            std::fs::remove_file(&canonical).map_err(|e| VaultError::Io {
+                what: "delete the preserved file",
+                kind: e.kind(),
+            })?;
+            Ok(Some(()))
+        })?;
+        if removed.is_none() {
+            return Err(refuse());
+        }
+        tracing::info!(
+            "deleted a preserved database file {} (peer pid {})",
+            path,
+            caller.pid_text()
+        );
+        self.status_answer()
+    }
+
     fn lock(&self) -> Result<SecretsStatus, HostlerError> {
         let _ = self.with_vault(|v| {
             v.lock();
             Ok(())
         });
-        self.status()
+        self.status_answer()
     }
 
     /// The project of a checkout's common dir, recorded on first sight.
@@ -653,7 +1146,13 @@ impl SecretsEngine {
                 &|d| crate::workspace::dir_identity(Path::new(d)),
                 self.now(),
             )
-            .map(|(project, _)| project)
+            .map(|(project, resolution)| {
+                if resolution != crate::store::ProjectResolution::Existing {
+                    // P5: `projects.changed` is owed (the server publishes it).
+                    self.events.mark_projects_dirty();
+                }
+                project
+            })
             .map_err(store_error)
     }
 
@@ -678,6 +1177,7 @@ impl SecretsEngine {
         store
             .approve_project(&project.id, self.now())
             .map_err(store_error)?;
+        self.events.mark_projects_dirty();
         store
             .project(&project.id)
             .map_err(store_error)?
@@ -829,6 +1329,7 @@ impl SecretsEngine {
             self.store()?
                 .set_project_group(&project.id, Some(&group.uuid().to_string()))
                 .map_err(store_error)?;
+            self.events.mark_projects_dirty();
         }
         result.map_err(|e| e.to_hostler())
     }
@@ -875,10 +1376,10 @@ impl SecretsEngine {
                 answered.push(id);
             }
         }
-        drop(store);
         for info in changed {
             self.emit(Event::SecretRequestChanged(info));
         }
+        drop(store);
         // Projects that have these names shared from this one wait for them too (T6-7).
         for (name, _) in entries {
             for target in self.share_targets(&project.id, name)? {
@@ -932,20 +1433,20 @@ impl SecretsEngine {
                 infos.push(info);
             }
         }
-        drop(store);
         for info in &infos {
             self.emit(Event::SecretRequestChanged(info.clone()));
         }
+        drop(store);
         Ok(infos)
     }
 
-    fn remove(&self, project: &ProjectRef, name: &str) -> Result<Value, HostlerError> {
+    fn remove(&self, project: &ProjectRef, name: &str) -> Result<Removed, HostlerError> {
         check_name(name)?;
         let project = self.approved(project)?;
         self.require_unlocked()?;
         let _publishing = self.publishing();
         let Some(group) = group_of(&self.current(&project)?) else {
-            return Ok(json!({ "removed": false }));
+            return Ok(Removed { removed: false });
         };
         let present = self
             .with_vault(|v| {
@@ -953,12 +1454,12 @@ impl SecretsEngine {
             })
             .map_err(|e| e.to_hostler())?;
         if !present {
-            return Ok(json!({ "removed": false }));
+            return Ok(Removed { removed: false });
         }
         let removed = self
             .with_vault(|v| v.write(|db| Ok(layout::remove(db, group, name))))
             .map_err(|e| e.to_hostler())?;
-        Ok(json!({ "removed": removed }))
+        Ok(Removed { removed })
     }
 
     /// Own or shared, and set.
@@ -1047,8 +1548,8 @@ impl SecretsEngine {
         let info = store
             .insert_request(&r, &project.id, now)
             .map_err(store_error)?;
-        drop(store);
         self.emit(Event::SecretRequestChanged(info.clone()));
+        drop(store);
         Ok(info)
     }
 
@@ -1091,10 +1592,10 @@ impl SecretsEngine {
             .request(id)
             .map_err(store_error)?
             .ok_or_else(|| bad_request("unknown secret request"))?;
-        drop(store);
         if changed {
             self.emit(Event::SecretRequestChanged(info.clone()));
         }
+        drop(store);
         Ok(info)
     }
 
@@ -1162,14 +1663,15 @@ impl SecretsEngine {
                 declined.push(info);
             }
         }
-        drop(store);
+        // Under the store guard (spec §6.2); a declined request never changes again.
         for info in &declined {
             self.emit(Event::SecretRequestChanged(info.clone()));
         }
+        drop(store);
         Ok(declined)
     }
 
-    fn share(&self, s: &Share) -> Result<Value, HostlerError> {
+    fn share(&self, s: &Share) -> Result<ShareOutcome, HostlerError> {
         check_name(&s.name)?;
         let source = self.approved(&s.from)?;
         let target = self
@@ -1237,10 +1739,14 @@ impl SecretsEngine {
                 target.name, s.name
             )));
         }
-        Ok(json!({ "name": s.name, "from": source.id, "to": target.id }))
+        Ok(ShareOutcome {
+            name: s.name.clone(),
+            from: source.id,
+            to: target.id,
+        })
     }
 
-    fn unshare(&self, s: &Share) -> Result<Value, HostlerError> {
+    fn unshare(&self, s: &Share) -> Result<Unshared, HostlerError> {
         check_name(&s.name)?;
         let source = self.resolve(&s.from)?;
         let removed = self
@@ -1253,36 +1759,20 @@ impl SecretsEngine {
                 s.name, source.name
             )));
         }
-        Ok(json!({ "unshared": true }))
+        Ok(Unshared { unshared: true })
     }
 
-    /// The values for a run, encoded straight into a zeroizing string. The recorded command is
-    /// masked with these values first and cut afterwards (L6, L13); nothing is recorded when
-    /// the run is refused.
-    fn materialize(&self, m: Materialize) -> Result<Zeroizing<String>, HostlerError> {
-        if m.names.is_empty() || m.names.len() > MAX_RUN_NAMES {
-            return Err(bad_request(format!(
-                "a run takes 1 to {MAX_RUN_NAMES} secrets"
-            )));
-        }
-        let mut names: Vec<String> = Vec::new();
-        for name in &m.names {
-            check_name(name)?;
-            if !names.contains(name) {
-                names.push(name.clone());
-            }
-        }
-        if m.command.len() > MAX_COMMAND_BYTES {
-            return Err(bad_request(
-                "the command is over 16 KiB; send `<command of N bytes>` instead",
-            ));
-        }
-        if m.run_id.is_empty() {
-            return Err(bad_request("a run needs a run id"));
-        }
-        let project = self.approved(&m.project)?;
-        self.require_unlocked()?;
-        let shares = self.shares_into(&project)?;
+    /// Where each of `names` is found for `project`: its own group, then a share into it, else
+    /// whether another project has it (refused as not in the project). With `gated`, the read
+    /// is admitted with `grant` in the same vault section (spec §8.5).
+    fn find_values(
+        &self,
+        project: &ProjectInfo,
+        names: &[String],
+        grant: Option<&GrantMeta>,
+        gated: bool,
+    ) -> Result<Vec<Found>, HostlerError> {
+        let shares = self.shares_into(project)?;
         let others: Vec<ProjectInfo> = self
             .store()?
             .projects()
@@ -1290,40 +1780,47 @@ impl SecretsEngine {
             .into_iter()
             .filter(|p| p.id != project.id && p.group_uuid.is_some())
             .collect();
-        let own = group_of(&project);
-        let found: Vec<Found> = self
-            .with_vault(|v| {
-                v.read(|db| {
-                    let look = |g: Option<GroupId>, name: &str| match g {
-                        Some(g) => layout::lookup(db, g, name),
-                        None => Lookup::Missing,
-                    };
-                    names
-                        .iter()
-                        .map(|name| match look(own, name) {
-                            Lookup::Value(v) => Found::Value(v),
-                            Lookup::Duplicate => Found::Duplicate,
-                            Lookup::Missing => {
-                                let shared = shares.iter().find(|(_, n)| n == name);
-                                match shared.map(|(from, _)| look(group_of(from), name)) {
-                                    Some(Lookup::Value(v)) => Found::Value(v),
-                                    Some(Lookup::Duplicate) => Found::Duplicate,
-                                    _ => others
-                                        .iter()
-                                        .find(|p| {
-                                            !matches!(look(group_of(p), name), Lookup::Missing)
-                                        })
-                                        .map_or(Found::Missing, |p| {
-                                            Found::Elsewhere(p.name.clone())
-                                        }),
-                                }
+        let own = group_of(project);
+        let read = |v: &mut Vault| {
+            v.read(|db| {
+                let look = |g: Option<GroupId>, name: &str| match g {
+                    Some(g) => layout::lookup(db, g, name),
+                    None => Lookup::Missing,
+                };
+                names
+                    .iter()
+                    .map(|name| match look(own, name) {
+                        Lookup::Value(v) => Found::Value(v),
+                        Lookup::Duplicate => Found::Duplicate,
+                        Lookup::Missing => {
+                            let shared = shares.iter().find(|(_, n)| n == name);
+                            match shared.map(|(from, _)| look(group_of(from), name)) {
+                                Some(Lookup::Value(v)) => Found::Value(v),
+                                Some(Lookup::Duplicate) => Found::Duplicate,
+                                _ => others
+                                    .iter()
+                                    .find(|p| !matches!(look(group_of(p), name), Lookup::Missing))
+                                    .map_or(Found::Missing, |p| Found::Elsewhere(p.name.clone())),
                             }
-                        })
-                        .collect()
-                })
+                        }
+                    })
+                    .collect()
             })
-            .map_err(|e| e.to_hostler())?;
+        };
+        if gated {
+            self.admitted_vault(grant, read)
+        } else {
+            self.with_vault(read).map_err(|e| e.to_hostler())
+        }
+    }
 
+    /// The values, or the first refusal: a value breaking the rules (L19), a duplicate, another
+    /// project's secret, then every missing name.
+    fn found_values(
+        project: &ProjectInfo,
+        names: &[String],
+        found: Vec<Found>,
+    ) -> Result<Vec<MaterializedSecret>, HostlerError> {
         let mut values = Vec::with_capacity(names.len());
         let mut elsewhere = None;
         let mut missing = Vec::new();
@@ -1352,6 +1849,37 @@ impl SecretsEngine {
             e.details["missing"] = json!(missing);
             return Err(e);
         }
+        Ok(values)
+    }
+
+    /// The values for a run, encoded straight into a zeroizing string. The recorded command is
+    /// masked with these values first and cut afterwards (L6, L13); nothing is recorded when
+    /// the run is refused.
+    fn materialize(&self, m: Materialize) -> Result<Zeroizing<String>, HostlerError> {
+        if m.names.is_empty() || m.names.len() > MAX_RUN_NAMES {
+            return Err(bad_request(format!(
+                "a run takes 1 to {MAX_RUN_NAMES} secrets"
+            )));
+        }
+        let mut names: Vec<String> = Vec::new();
+        for name in &m.names {
+            check_name(name)?;
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        if m.command.len() > MAX_COMMAND_BYTES {
+            return Err(bad_request(
+                "the command is over 16 KiB; send `<command of N bytes>` instead",
+            ));
+        }
+        if m.run_id.is_empty() {
+            return Err(bad_request("a run needs a run id"));
+        }
+        let project = self.approved(&m.project)?;
+        self.require_unlocked()?;
+        let found = self.find_values(&project, &names, None, false)?;
+        let values = Self::found_values(&project, &names, found)?;
 
         let mut encoded = encode_answer(&values, answer_bound(&values))?;
         let mask = MaskSet::new(values.iter().map(|v| v.value.expose().as_bytes().to_vec()));
@@ -1389,7 +1917,13 @@ mod tests {
     const BOOT: &str = "b1";
     const PASSWORD: &str = "pass-1234";
 
-    struct TestClock(AtomicI64);
+    pub(super) struct TestClock(AtomicI64);
+
+    impl TestClock {
+        pub(super) fn advance(&self, ms: i64) {
+            self.0.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
 
     impl Clock for TestClock {
         fn now_ms(&self) -> i64 {
@@ -1398,10 +1932,12 @@ mod tests {
     }
 
     pub(super) struct World {
+        /// The engine's wall clock (it stands still unless a test advances it).
+        pub(super) clock: Arc<TestClock>,
         pub(super) engine: Arc<SecretsEngine>,
         pub(super) dir: tempfile::TempDir,
         table: Arc<FakeTable>,
-        events: broadcast::Receiver<Event>,
+        events: crate::service::events::TestEvents,
     }
 
     pub(super) fn world() -> World {
@@ -1415,17 +1951,19 @@ mod tests {
         let mut vault = Vault::new(kdbx.clone());
         hooks(&mut vault, &kdbx);
         let table = Arc::new(FakeTable::new(BOOT));
-        let (tx, events) = broadcast::channel(256);
+        let (tx, events) = crate::service::events::EventBus::channel(256);
+        let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
         let engine = SecretsEngine::new(
             vault,
             kdbx,
             Store::open(&dir.path().join("hostler.db")).unwrap(),
             table.clone(),
-            Arc::new(TestClock(AtomicI64::new(1_000_000))),
+            clock.clone(),
             tx,
             KdfChoice::Fast,
         );
         World {
+            clock,
             engine: Arc::new(engine),
             dir,
             table,
@@ -1439,7 +1977,7 @@ mod tests {
 
     impl World {
         pub(super) fn call(&self, req: Request) -> Result<Value, HostlerError> {
-            match self.engine.dispatch(req)? {
+            match self.engine.reply(req)? {
                 Reply::Value(v) => Ok(v),
                 Reply::Sensitive(_) => panic!("unexpected sensitive reply"),
             }
@@ -1530,15 +2068,13 @@ mod tests {
             names: &[&str],
             command: &str,
         ) -> Result<Vec<MaterializedSecret>, HostlerError> {
-            let reply = self
-                .engine
-                .dispatch(Request::SecretMaterialize(Materialize {
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    project: p.clone(),
-                    names: names.iter().map(|n| (*n).into()).collect(),
-                    command: RawCommand::new(command.into()),
-                    workspace: "/work/app".into(),
-                }))?;
+            let reply = self.engine.reply(Request::SecretMaterialize(Materialize {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                project: p.clone(),
+                names: names.iter().map(|n| (*n).into()).collect(),
+                command: RawCommand::new(command.into()),
+                workspace: "/work/app".into(),
+            }))?;
             match reply {
                 Reply::Sensitive(json) => Ok(serde_json::from_str(&json).unwrap()),
                 Reply::Value(_) => panic!("materialize must answer sensitive"),
@@ -1655,7 +2191,7 @@ mod tests {
         let engine = w.engine.clone();
         let p2 = p.clone();
         let save = std::thread::spawn(move || {
-            engine.dispatch(Request::SecretSet(SecretSet {
+            engine.reply(Request::SecretSet(SecretSet {
                 project: p2,
                 name: "API_KEY".into(),
                 value: SecretValue::new("value-1".into()),
@@ -2008,7 +2544,7 @@ mod tests {
         w.set(&p, "API_KEY", "value-1").unwrap();
         let reply = w
             .engine
-            .dispatch(Request::SecretMaterialize(Materialize {
+            .reply(Request::SecretMaterialize(Materialize {
                 run_id: "run-1".into(),
                 project: p,
                 names: vec!["API_KEY".into(), "API_KEY".into()],
@@ -2233,7 +2769,7 @@ mod tests {
             }
         }));
         let unlock = in_thread(&w, |e| {
-            e.dispatch(Request::SecretsUnlock(Unlock {
+            e.reply(Request::SecretsUnlock(Unlock {
                 password: SecretValue::new(PASSWORD.into()),
                 key_file: None,
                 forget_key_file: false,
@@ -2282,12 +2818,13 @@ mod tests {
         let key_file = w.dir.path().join("key.bin");
         std::fs::write(&key_file, b"0123456789abcdef0123456789abcdef").unwrap();
         let unlock = |key_file: Option<&PathBuf>, forget: bool, create: bool| {
-            w.call_as::<SecretsStatus>(Request::SecretsUnlock(Unlock {
+            w.call_as::<UnlockOutcome>(Request::SecretsUnlock(Unlock {
                 password: SecretValue::new(PASSWORD.into()),
                 key_file: key_file.map(|k| k.display().to_string()),
                 forget_key_file: forget,
                 create,
             }))
+            .map(|outcome| outcome.status)
         };
         let status = unlock(Some(&key_file), false, true).unwrap();
         assert_eq!(status.key_file.as_deref(), Some(key_file.to_str().unwrap()));
@@ -2380,9 +2917,9 @@ mod tests {
             armed.store(true, Ordering::SeqCst);
             held.store(false, Ordering::SeqCst);
             let (pa, pb) = (p.clone(), p.clone());
-            let a = in_thread(&w, move |e| e.dispatch(set_request(&pa, first, "value-1")));
+            let a = in_thread(&w, move |e| e.reply(set_request(&pa, first, "value-1")));
             wait_for(&held);
-            let b = in_thread(&w, move |e| e.dispatch(set_request(&pb, second, "value-2")));
+            let b = in_thread(&w, move |e| e.reply(set_request(&pb, second, "value-2")));
             assert!(a.join().unwrap().is_ok());
             assert!(b.join().unwrap().is_ok());
             let got = w.materialize(&p, &[first, second]).unwrap();
@@ -2411,7 +2948,7 @@ mod tests {
         armed.store(true, Ordering::SeqCst);
         let import = |p: ProjectRef, value: &'static str| {
             move |e: &SecretsEngine| {
-                e.dispatch(Request::SecretImport(SecretImport {
+                e.reply(Request::SecretImport(SecretImport {
                     project: p,
                     entries: vec![ImportEntry {
                         name: "TOKEN".into(),
@@ -2447,10 +2984,10 @@ mod tests {
         }));
         w.drain_events();
         armed.store(true, Ordering::SeqCst);
-        let lock = in_thread(&w, |e| e.dispatch(Request::SecretsLock).map(|_| ()));
+        let lock = in_thread(&w, |e| e.reply(Request::SecretsLock).map(|_| ()));
         wait_for(&held);
         let unlock = in_thread(&w, |e| {
-            e.dispatch(Request::SecretsUnlock(Unlock {
+            e.reply(Request::SecretsUnlock(Unlock {
                 password: SecretValue::new(PASSWORD.into()),
                 key_file: None,
                 forget_key_file: false,
@@ -2490,7 +3027,7 @@ mod tests {
         let requester = w.requester(42);
         let (rid, rp) = (id.clone(), p.clone());
         let request = in_thread(&w, move |e| {
-            e.dispatch(Request::SecretRequest(SecretRequest {
+            e.reply(Request::SecretRequest(SecretRequest {
                 id: rid,
                 project: rp,
                 name: "TOKEN".into(),
@@ -2501,9 +3038,7 @@ mod tests {
         });
         wait_for(&held);
         let sp = p.clone();
-        let set = in_thread(&w, move |e| {
-            e.dispatch(set_request(&sp, "TOKEN", "value-1"))
-        });
+        let set = in_thread(&w, move |e| e.reply(set_request(&sp, "TOKEN", "value-1")));
         request.join().unwrap().unwrap();
         let Reply::Value(out) = set.join().unwrap().unwrap() else {
             panic!("set answers a value");

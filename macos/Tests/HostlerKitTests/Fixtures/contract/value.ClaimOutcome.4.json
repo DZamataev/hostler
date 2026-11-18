@@ -1,0 +1,16 @@
+{
+  "item": {
+    "command": "make test",
+    "detail": "/work/app (PID 42) holds screen and waits for heavy",
+    "ended_at_ms": 2000,
+    "exit_code": null,
+    "granted_at_ms": null,
+    "id": "c1",
+    "kind": "lease",
+    "reason": "deadlock",
+    "resource": "screen",
+    "resource_id": "screen",
+    "workspace_path": "/work/app"
+  },
+  "outcome": "finished"
+}

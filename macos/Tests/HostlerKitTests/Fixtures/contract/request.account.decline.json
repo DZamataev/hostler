@@ -1,0 +1,7 @@
+{
+  "id": 72,
+  "method": "account.decline",
+  "params": {
+    "id": "6f1e6a9a"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "event": {
+    "data": {
+      "as_of_seq": 1,
+      "capacity": 1,
+      "foreign_running": [],
+      "running": [
+        {
+          "child": null,
+          "command": "./gradlew build",
+          "cwd": "/work/app",
+          "enqueued_at_ms": 1000,
+          "granted_at_ms": null,
+          "group": null,
+          "holder": {
+            "boot_id": "boot-1",
+            "pid": 42,
+            "start_time": 500
+          },
+          "id": "running",
+          "kind": "gradle",
+          "source": "hostler",
+          "state": "waiting",
+          "ticket": 3,
+          "workspace_root": null
+        }
+      ],
+      "waiting": []
+    },
+    "type": "queue.changed"
+  },
+  "seq": 1
+}

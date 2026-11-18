@@ -1,0 +1,33 @@
+{
+  "checks": [
+    {
+      "details": {},
+      "fix": null,
+      "id": "service.registered",
+      "message": "the service is registered",
+      "status": "ok"
+    },
+    {
+      "details": {
+        "name": "API_KEY"
+      },
+      "fix": {
+        "command": "hostler secret set API_KEY",
+        "safe": false,
+        "text": "a person sets it",
+        "who": "person"
+      },
+      "id": "secrets.required.API_KEY",
+      "message": "API_KEY is not set",
+      "status": "problem"
+    }
+  ],
+  "fixed": [
+    {
+      "check": "service.registered",
+      "command": "hostler service install",
+      "message": "registered",
+      "result": "fixed"
+    }
+  ]
+}

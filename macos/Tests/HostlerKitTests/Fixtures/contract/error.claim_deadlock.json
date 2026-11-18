@@ -1,0 +1,9 @@
+{
+  "code": "claim_deadlock",
+  "details": {
+    "cycle": "a waits for b",
+    "resource": "screen"
+  },
+  "message": "waiting for screen would never end: a waits for b; this request was refused so the others can finish; if a nested run was started in the background, take every resource in the outer run",
+  "recovery": "hostler status"
+}

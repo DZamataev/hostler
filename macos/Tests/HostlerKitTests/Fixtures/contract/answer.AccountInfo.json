@@ -1,0 +1,18 @@
+{
+  "fields": [
+    "session",
+    "env"
+  ],
+  "holder": {
+    "command": null,
+    "expires_at_ms": 9000,
+    "id": "c1",
+    "kind": "hold",
+    "linked": 2,
+    "pid": 42,
+    "resource": "screen",
+    "since_ms": 1000,
+    "workspace_path": "/work/app"
+  },
+  "name": "qa-user"
+}

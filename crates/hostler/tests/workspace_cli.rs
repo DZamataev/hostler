@@ -322,6 +322,7 @@ fn crafted_root_is_refused() {
     let current = hostler::project::current(&repo).unwrap();
     let resolve = |root: &Path, project: ProjectRef| {
         home.call(Request::WorkspaceResolve(WorkspaceResolve {
+            declared: None,
             project,
             root: hostler::project::display_path(root),
         }))

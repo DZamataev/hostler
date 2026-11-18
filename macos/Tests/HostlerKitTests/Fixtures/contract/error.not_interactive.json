@@ -1,0 +1,6 @@
+{
+  "code": "not_interactive",
+  "details": {},
+  "message": "`hostler unlock` needs a person at a terminal. A person runs this; an agent asks the operator.",
+  "recovery": "hostler unlock"
+}

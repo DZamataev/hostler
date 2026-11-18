@@ -17,6 +17,18 @@ declines; the command above returns the answer. If a value does appear in a conv
 repeat it, quote it, write it to a file or pass it to a command — ask the person to run
 `hostler secret set NAME` again.
 
+## Seeing a value: the app's reveal
+
+A person sees a value in two places only: the macOS app's **Reveal** (the window's Secrets or
+Accounts section, behind the master password) and KeePassXC. The reveal shows a value for 30
+seconds and hides it on a lock, keeps it out of the accessibility tree, asks the window out of
+screen captures, and copies it concealed with the clipboard cleared after 60 seconds if it still
+holds hostler's copy.
+
+An agent never asks a person to reveal a value and paste it back. If an agent needs the value, it
+asks for it by name with `hostler secret request NAME --reason "…"` and uses it through
+`hostler run --secret`; a value that did appear in a conversation is not repeated (see above).
+
 ## Reading the list
 
 ```sh
@@ -289,3 +301,20 @@ by mistake.
 ## The threat model
 
 > hostler protects against accidental exposure and against agents that follow this guide: values never appear in any hostler output, log, error, event, history row, Debug print or panic message, and no command prints a value. It does not protect against a malicious process of your own OS user: such a process can talk to the socket, run `hostler run --secret X -- sh -c 'echo $X | base64'`, or read hostler's memory.
+
+### The master-password gate
+
+The app's gate is a proof of **intent**, not an authentication boundary. It asks for the master
+password before a gated action — a reveal, an account answer or decline, deleting a preserved
+file, stopping a heavy task — and the service admits the resulting grant. It keeps out only those
+who do not know the password: any process of your user can talk to the socket, and
+`hostler run --secret X -- sh -c 'echo $X | base64'` hands an approved project's value to a
+command by design, from the start and without any password. Read the gate as "the person meant
+this", not as protection against a malicious process of the same user.
+
+### The screen
+
+The reveal's protections are best effort: a window marked against screen capture can still be
+photographed, filmed, or captured by a system-level recorder, and a screenshot taken while a
+value is on screen may keep it. Hide the value (or let its 30 seconds pass) before sharing your
+screen, and treat any screenshot of the revealed window as a value.

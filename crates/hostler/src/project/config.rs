@@ -226,6 +226,28 @@ impl ProjectConfig {
     pub fn heavy_commands(&self) -> &[String] {
         &self.heavy
     }
+
+    /// What `workspace.resolve` sends for the service to store (P5): names, purposes, fields
+    /// and app ids, never a value (the file holds none).
+    pub fn declaration(&self) -> crate::contract::projects::ProjectDecl {
+        use crate::contract::projects::{DeclaredAccount, DeclaredApps, ProjectDecl};
+        ProjectDecl {
+            secrets: self.declared(),
+            accounts: self
+                .declared_accounts()
+                .into_iter()
+                .map(|(name, decl)| DeclaredAccount {
+                    name: name.to_owned(),
+                    purpose: decl.purpose.clone(),
+                    fields: decl.fields.clone(),
+                })
+                .collect(),
+            apps: DeclaredApps {
+                android: self.apps.android.clone(),
+                ios: self.apps.ios.clone(),
+            },
+        }
+    }
 }
 
 /// The canonical `hostler.toml` of a config: the tables in schema order, one comment heading

@@ -1,0 +1,132 @@
+[
+  {
+    "action": "listDevices",
+    "command": "hostler devices list --all",
+    "argv": ["hostler", "devices", "list", "--all"]
+  },
+  {
+    "action": "addDevice",
+    "command": "hostler devices add <device> --alias <new>",
+    "argv": ["hostler", "devices", "add", "samsung", "--alias", "kitchen"]
+  },
+  {
+    "action": "renameDevice",
+    "command": "hostler devices rename <alias> <new>",
+    "argv": ["hostler", "devices", "rename", "samsung", "kitchen"]
+  },
+  {
+    "action": "noteDevice",
+    "command": "hostler devices note <alias> \"<note>\"",
+    "argv": ["hostler", "devices", "note", "samsung", "the kitchen phone"]
+  },
+  {
+    "action": "clearNote",
+    "command": "hostler devices note <alias> --clear",
+    "argv": ["hostler", "devices", "note", "samsung", "--clear"]
+  },
+  {
+    "action": "removeDevice",
+    "command": "hostler devices remove <alias>",
+    "argv": ["hostler", "devices", "remove", "samsung"]
+  },
+  {
+    "action": "reserveDevice",
+    "command": "hostler devices reserve <alias>",
+    "argv": ["hostler", "devices", "reserve", "samsung"]
+  },
+  {
+    "action": "unreserveDevice",
+    "command": "hostler devices unreserve <alias>",
+    "argv": ["hostler", "devices", "unreserve", "samsung"]
+  },
+  {
+    "action": "renewHold",
+    "command": "hostler hold renew <claim>",
+    "argv": ["hostler", "hold", "renew", "c1"]
+  },
+  {
+    "action": "releaseClaim",
+    "command": "hostler release <claim> --force --confirmation <token>",
+    "argv": ["hostler", "release", "c1", "--force", "--confirmation", "samsung"]
+  },
+  {
+    "action": "takeOverDevice",
+    "command": "hostler hold device <alias> --force --confirmation <token> --ttl 30",
+    "argv": [
+      "hostler", "hold", "device", "samsung", "--force", "--confirmation", "samsung",
+      "--ttl", "30"
+    ]
+  },
+  {
+    "action": "forgetSessions",
+    "command": "hostler devices forget-sessions <alias>",
+    "argv": ["hostler", "devices", "forget-sessions", "samsung"]
+  },
+  {
+    "action": "runDoctor",
+    "command": "hostler doctor",
+    "argv": ["hostler", "doctor"]
+  },
+  {
+    "action": "withdrawTask",
+    "command": "hostler queue withdraw --id <task>",
+    "argv": ["hostler", "queue", "withdraw", "--id", "b1e67bbf"]
+  },
+  {
+    "action": "stopTask",
+    "command": "hostler queue stop <task> --force --confirmation <token>",
+    "argv": [
+      "hostler", "queue", "stop", "b1e67bbf", "--force", "--confirmation", "b1e67bbf"
+    ]
+  },
+  {
+    "action": "setCapacity",
+    "command": "hostler queue capacity set <capacity>",
+    "argv": ["hostler", "queue", "capacity", "set", "2"]
+  },
+  {
+    "action": "releaseScreen",
+    "command": "hostler release <claim> --force --confirmation <token>",
+    "argv": ["hostler", "release", "c1", "--force", "--confirmation", "screen"]
+  },
+  {
+    "action": "takeOverScreen",
+    "command": "hostler hold screen --force --confirmation <token> --ttl 30",
+    "argv": ["hostler", "hold", "screen", "--force", "--confirmation", "screen", "--ttl", "30"]
+  },
+  {
+    "action": "setSecret",
+    "command": "hostler secret set <name>",
+    "argv": ["hostler", "secret", "set", "API_KEY"]
+  },
+  {
+    "action": "removeSecret",
+    "command": "hostler secret remove <name>",
+    "argv": ["hostler", "secret", "remove", "API_KEY"]
+  },
+  {
+    "action": "shareSecret",
+    "command": "hostler secret share <name> --to <project>",
+    "argv": ["hostler", "secret", "share", "API_KEY", "--to", "other"]
+  },
+  {
+    "action": "unshareSecret",
+    "command": "hostler secret unshare <name> --to <project>",
+    "argv": ["hostler", "secret", "unshare", "API_KEY", "--to", "other"]
+  },
+  {
+    "action": "setAccountField",
+    "command": "hostler account set <name> --field <field>",
+    "argv": ["hostler", "account", "set", "qa-user", "--field", "session"]
+  },
+  {
+    "action": "removeAccount",
+    "command": "hostler account remove <name>",
+    "argv": ["hostler", "account", "remove", "qa-user"]
+  },
+  {
+    "action": "approveProject",
+    "command": "hostler project approve",
+    "argv": ["hostler", "project", "approve"]
+  }
+]

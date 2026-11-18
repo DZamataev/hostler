@@ -1,7 +1,6 @@
 //! The frozen lifecycle protocol: `hello`, `service.status`, `service.shutdown` (plan Task 4/6).
 //! These answers must stay readable by every past and future client.
 
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::client::Client;
@@ -15,16 +14,7 @@ use crate::service::manager::RegistrationState;
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RESTART_RECOVERY: &str = "hostler service restart";
 
-/// The answer to `hello`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HelloReply {
-    pub contract_version: u32,
-    pub service_version: String,
-    /// The service's boot id (additive, P4 Task 9 F-1 r1): a client that may not read its own
-    /// learns it here (`procs::learn_boot_id`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<String>,
-}
+pub use crate::contract::lifecycle::HelloReply;
 
 /// The version this service reports in `hello` and `service.status`. Debug builds honour
 /// `HOSTLER_TEST_SERVICE_VERSION` so tests can run an "older" or "newer" service (P4 Task 4).
@@ -59,6 +49,7 @@ pub fn hello(client_contract: u32, service_contract: u32) -> Result<HelloReply, 
             contract_version: service_contract,
             service_version,
             boot_id: crate::procs::local_boot_id(),
+            instance: None,
         });
     }
     Err(HostlerError {

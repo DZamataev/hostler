@@ -163,6 +163,7 @@ impl Home {
     pub fn workspace(&self, repo: &Path) -> Result<WorkspaceInfo, HostlerError> {
         let current = hostler::project::current(repo)?;
         let request = Request::WorkspaceResolve(WorkspaceResolve {
+            declared: None,
             root: hostler::project::display_path(&current.checkout.workspace_root),
             project: current.project,
         });

@@ -1,0 +1,10 @@
+{
+  "code": "force_required",
+  "details": {
+    "holder_path": "/work/app",
+    "resource": "screen",
+    "token": "screen"
+  },
+  "message": "screen is held by /work/app. To take it over: hostler hold screen --force --confirmation screen. An agent uses --force only with the operator's explicit permission.",
+  "recovery": null
+}

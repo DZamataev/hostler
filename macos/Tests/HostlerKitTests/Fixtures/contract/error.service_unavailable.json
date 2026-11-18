@@ -1,0 +1,8 @@
+{
+  "code": "service_unavailable",
+  "details": {
+    "reason": "stopping"
+  },
+  "message": "the hostler service is stopping",
+  "recovery": "hostler service start"
+}

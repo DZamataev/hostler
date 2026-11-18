@@ -1,0 +1,8 @@
+{
+  "code": "proof_limited",
+  "details": {
+    "retry_after_ms": 4000
+  },
+  "message": "too many wrong master passwords; next try in 4 s. Another process of your user may be guessing (the service log names each wrong password's process)",
+  "recovery": "wait 4 s, then try again"
+}

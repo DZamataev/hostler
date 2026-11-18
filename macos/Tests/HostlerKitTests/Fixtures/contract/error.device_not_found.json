@@ -1,0 +1,8 @@
+{
+  "code": "device_not_found",
+  "details": {
+    "device": "pixel-9"
+  },
+  "message": "no device known to hostler matches pixel-9",
+  "recovery": "hostler devices list --all"
+}

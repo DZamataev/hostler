@@ -13,18 +13,20 @@ use interprocess::local_socket::{ListenerOptions, Name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::sync::{Mutex, MutexGuard, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, MutexGuard, broadcast, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use zeroize::Zeroizing;
 
+use super::events::{EventBus, LineBytes, Outbound, PendingEvents, Published};
 use super::lifecycle;
 use crate::claims::engine::{ClaimsEngine, heavy_view, no_heavy, resolve_workspace};
 use crate::contract::accounts::AccountInfo;
 use crate::contract::claims::{Overview, ResourceId, errors as claims_errors};
-use crate::contract::heavy::{HeavyAcquire, ServiceStatus};
+use crate::contract::heavy::{HeavyAcquire, QueueStopOutcome, ServiceStatus};
+use crate::contract::projects::ProjectsSnapshot;
 use crate::contract::secrets::{ProjectInfo, SecretsStatus};
 use crate::contract::wire::{ClientFrame, Event, Request, ServerFrame, sensitive_request};
 use crate::contract::{ErrorCode, HostlerError};
@@ -32,7 +34,8 @@ use crate::devices::agent_device;
 use crate::devices::service::DevicesService;
 use crate::heavy::engine::HeavyEngine;
 use crate::paths::SocketName;
-use crate::secrets::engine::{Reply as SecretsReply, SecretsEngine};
+use crate::secrets::engine::{Caller, Reply as SecretsReply, SecretsAnswer, SecretsEngine};
+use crate::secrets::gate::GrantMeta;
 
 /// The largest frame either side sends or accepts; a longer incoming line closes the connection.
 /// The engine's admission limits keep every answer and snapshot below it.
@@ -140,9 +143,20 @@ struct Shared {
     devices: Arc<DevicesService>,
     /// Every secrets job and its reply; a stop drains them before the vault is locked.
     jobs: TaskTracker,
-    events: broadcast::Sender<Event>,
+    events: EventBus,
     contract_version: u32,
     shutdown: watch::Sender<bool>,
+    /// This run's id (spec §6.2), in `hello` and `service.status`.
+    instance: String,
+    /// The service's own binary, canonicalized (spec §9.7).
+    exe: Option<String>,
+}
+
+/// `std::env::current_exe()`, canonicalized, as the CLI displays paths.
+fn own_exe() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    Some(crate::project::display_path(&exe))
 }
 
 pub fn socket_name(socket: &SocketName) -> std::io::Result<Name<'_>> {
@@ -187,7 +201,7 @@ pub async fn serve(
     claims: ClaimsEngine,
     secrets: SecretsEngine,
     devices: Arc<DevicesService>,
-    events: broadcast::Sender<Event>,
+    events: EventBus,
     shutdown: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let mut stopping = shutdown.subscribe();
@@ -203,7 +217,11 @@ pub async fn serve(
         events,
         contract_version: lifecycle::service_contract_version(),
         shutdown,
+        instance: uuid::Uuid::new_v4().to_string(),
+        exe: own_exe(),
     });
+    // The first `projects.changed` compares against the projects as they are at start.
+    claims_lock(&shared).await.remember_projects();
     // Task 7: the boot shutdown rule's one engine question, under the claims lock (P2-14);
     // no answer within the bound keeps the device running.
     devices.boots().set_in_use({
@@ -234,7 +252,10 @@ pub async fn serve(
         tokio::spawn(async move {
             loop {
                 match claims_events.recv().await {
-                    Ok(Event::ClaimsChanged(snapshot)) => shared.devices.on_claims(&snapshot).await,
+                    Ok(Published {
+                        event: Event::ClaimsChanged(snapshot),
+                        ..
+                    }) => shared.devices.on_claims(&snapshot).await,
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // A lost snapshot: read the current one (Task 8 rebuilds its windows).
@@ -391,6 +412,42 @@ fn peer_is_current_user(_stream: &Stream) -> bool {
     true
 }
 
+/// The connecting process's pid, read once at accept, for log lines only (spec §8.5, R2-5):
+/// macOS `getsockopt(SOL_LOCAL, LOCAL_PEERPID)`, Linux `SO_PEERCRED`; none on Windows or when
+/// the OS does not say.
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &Stream) -> Option<u32> {
+    use std::os::fd::{AsFd, AsRawFd};
+    #[allow(irrefutable_let_patterns)]
+    let Stream::UdSocket(socket) = stream else {
+        return None;
+    };
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: a valid socket fd, and `pid`/`len` point to a pid_t-sized buffer and its size.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && pid > 0).then_some(pid as u32)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn peer_pid(stream: &Stream) -> Option<u32> {
+    let pid = stream.peer_creds().ok()?.pid()?;
+    (pid > 0).then_some(pid as u32)
+}
+
+#[cfg(windows)]
+fn peer_pid(_stream: &Stream) -> Option<u32> {
+    None
+}
+
 /// What the reader hands the writer task.
 enum Out {
     Line(String),
@@ -403,26 +460,155 @@ enum Out {
 /// One connection: a reader and a writer that run independently, so a large pushed snapshot
 /// never blocks reading the client's next request (and the reverse).
 async fn connection(stream: Stream, shared: Arc<Shared>) {
+    let peer = peer_pid(&stream);
     let (recv, send) = tokio::io::split(stream);
     let reader = FramedRead::new(recv, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
     let writer = FramedWrite::new(send, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
-    let (tx, rx) = mpsc::channel(16);
-    tokio::join!(read_loop(reader, tx, &shared), write_loop(writer, rx));
+    let queue = Arc::new(WriterQueue::default());
+    tokio::join!(
+        read_loop(reader, queue.clone(), &shared, peer),
+        write_loop(writer, queue)
+    );
 }
 
+/// How many event lines the writer's queue holds; past it events wait in `PendingEvents`,
+/// where they are coalesced (spec §6.2).
+const EVENT_SLOTS: usize = 16;
+
+/// A line for the writer with its bytes of a budget (none for a control line) and, for an
+/// event line, its slot; both are released once it is written or dropped.
+struct Queued {
+    out: Out,
+    _bytes: LineBytes,
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// One connection's outbound lines (R-2, R-3): replies first, then events. Queueing a line
+/// never waits; the budgets (`Outbound::replies`, `Outbound::events`, `EVENT_SLOTS`) are taken
+/// before. So a reply never waits behind event lines, and a control line (the shutdown reply,
+/// a `resync`) never waits at all.
+struct WriterQueue {
+    lanes: std::sync::Mutex<Lanes>,
+    ready: tokio::sync::Notify,
+    /// Pending events and event lines here (`EVENT_BYTES`).
+    events_budget: Outbound,
+    /// Replies here, sensitive answers included (`REPLY_RESERVE`).
+    replies_budget: Outbound,
+    /// Event lines here: at most `EVENT_SLOTS`.
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for WriterQueue {
+    fn default() -> WriterQueue {
+        WriterQueue {
+            lanes: std::sync::Mutex::default(),
+            ready: tokio::sync::Notify::new(),
+            events_budget: Outbound::events(),
+            replies_budget: Outbound::replies(),
+            slots: Arc::new(tokio::sync::Semaphore::new(EVENT_SLOTS)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Lanes {
+    replies: std::collections::VecDeque<Queued>,
+    events: std::collections::VecDeque<Queued>,
+    /// The reader is done: the writer drains what is queued, then ends.
+    finished: bool,
+    /// The writer is gone (a write failed): nothing more is taken.
+    broken: bool,
+}
+
+impl WriterQueue {
+    fn lanes(&self) -> std::sync::MutexGuard<'_, Lanes> {
+        self.lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `false` once the writer is gone.
+    fn push_reply(&self, line: Queued) -> bool {
+        let mut lanes = self.lanes();
+        if lanes.broken {
+            return false;
+        }
+        lanes.replies.push_back(line);
+        drop(lanes);
+        self.ready.notify_one();
+        true
+    }
+
+    /// `false` once the writer is gone.
+    fn push_event(&self, line: Queued) -> bool {
+        let mut lanes = self.lanes();
+        if lanes.broken {
+            return false;
+        }
+        lanes.events.push_back(line);
+        drop(lanes);
+        self.ready.notify_one();
+        true
+    }
+
+    fn finish(&self) {
+        self.lanes().finished = true;
+        self.ready.notify_one();
+    }
+
+    fn break_off(&self) {
+        let mut lanes = self.lanes();
+        lanes.broken = true;
+        lanes.replies.clear();
+        lanes.events.clear();
+    }
+
+    /// The next line for the socket, replies first; `None` once the reader is done and
+    /// everything was taken.
+    async fn next(&self) -> Option<Queued> {
+        loop {
+            {
+                let mut lanes = self.lanes();
+                if let Some(line) = lanes
+                    .replies
+                    .pop_front()
+                    .or_else(|| lanes.events.pop_front())
+                {
+                    return Some(line);
+                }
+                if lanes.finished || lanes.broken {
+                    return None;
+                }
+            }
+            // A notification sent since the check is stored, so none is lost.
+            self.ready.notified().await;
+        }
+    }
+}
+
+/// The writer: one line at a time, replies first; a line's bytes and slot go back once it is
+/// written.
 async fn write_loop(
     mut writer: FramedWrite<WriteHalf<Stream>, LinesCodec>,
-    mut rx: mpsc::Receiver<Out>,
+    queue: Arc<WriterQueue>,
 ) {
-    while let Some(out) = rx.recv().await {
+    while let Some(line) = queue.next().await {
+        // Held until the line is written, dropped at the end of this turn.
+        let Queued {
+            out,
+            _bytes: bytes,
+            _slot: slot,
+        } = line;
         let (sent, flushed) = match out {
             Out::Line(line) => (writer.send(line).await, None),
             Out::Flushed(line, done) => (writer.send(line).await, Some(done)),
             Out::Sensitive(line, done) => (writer.send(line.as_str()).await, Some(done)),
         };
         if sent.is_err() {
+            queue.break_off();
             return;
         }
+        drop((bytes, slot));
         if let Some(done) = flushed {
             let _ = done.send(());
         }
@@ -431,12 +617,59 @@ async fn write_loop(
 
 struct ConnState {
     hello_ok: bool,
-    events: Option<broadcast::Receiver<Event>>,
+    events: Option<broadcast::Receiver<Published>>,
+    /// The proof this connection holds (spec §8.5): installed after a successful
+    /// `secrets.prove` or `secrets.unlock` that answered one, cleared by a failed one, dropped
+    /// with the connection. Every gated method is admitted against it.
+    grant: Option<GrantMeta>,
+    /// The peer's pid, read at accept; log lines only (R2-5).
+    peer_pid: Option<u32>,
+}
+
+impl ConnState {
+    #[cfg(test)]
+    fn new() -> ConnState {
+        ConnState::with_peer(None)
+    }
+
+    fn with_peer(peer_pid: Option<u32>) -> ConnState {
+        ConnState {
+            hello_ok: false,
+            events: None,
+            grant: None,
+            peer_pid,
+        }
+    }
+
+    fn caller(&self) -> Caller {
+        Caller {
+            peer_pid: self.peer_pid,
+            grant: self.grant,
+        }
+    }
+}
+
+/// R2-3: a prove or unlock that succeeded with a grant installs it; one that failed clears
+/// the connection's grant; anything else leaves it.
+fn apply_grant(
+    grant: &mut Option<GrantMeta>,
+    grants: bool,
+    succeeded: bool,
+    answered: Option<GrantMeta>,
+) {
+    if !grants {
+        return;
+    }
+    match (succeeded, answered) {
+        (true, Some(meta)) => *grant = Some(meta),
+        (true, None) => {}
+        (false, _) => *grant = None,
+    }
 }
 
 async fn next_event(
-    events: &mut Option<broadcast::Receiver<Event>>,
-) -> Result<Event, broadcast::error::RecvError> {
+    events: &mut Option<broadcast::Receiver<Published>>,
+) -> Result<Published, broadcast::error::RecvError> {
     match events {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -445,15 +678,27 @@ async fn next_event(
 
 async fn read_loop(
     mut reader: FramedRead<ReadHalf<Stream>, LinesCodec>,
-    tx: mpsc::Sender<Out>,
+    queue: Arc<WriterQueue>,
     shared: &Shared,
+    peer: Option<u32>,
 ) {
-    let mut conn = ConnState {
-        hello_ok: false,
-        events: None,
-    };
-    // Snapshots are coalesced: only the newest one waits for the writer.
-    let mut pending_event: Option<String> = None;
+    read_requests(&mut reader, &queue, shared, peer).await;
+    // The writer drains what is queued (a stop's reply included), then ends.
+    queue.finish();
+}
+
+async fn read_requests(
+    reader: &mut FramedRead<ReadHalf<Stream>, LinesCodec>,
+    queue: &WriterQueue,
+    shared: &Shared,
+    peer: Option<u32>,
+) {
+    let mut conn = ConnState::with_peer(peer);
+    // Spec §6.2: the newest snapshot per kind, the newest state per request, every record;
+    // whatever cannot be delivered becomes one `resync`. Pending events and event lines in the
+    // writer's queue share `Outbound::events()`; replies have their own reserve (R-2).
+    let replies_budget = &queue.replies_budget;
+    let mut pending = PendingEvents::with_budget(queue.events_budget.clone());
     loop {
         tokio::select! {
             line = reader.next() => {
@@ -468,11 +713,15 @@ async fn read_loop(
                 };
                 match reply {
                     Reply::Frame(frame) => {
-                        if tx.send(Out::Line(encode_reply(&frame))).await.is_err() {
+                        let line = encode_reply(&frame);
+                        // Waits only for earlier replies to be written, never for events.
+                        let bytes = replies_budget.take(line.len()).await;
+                        let queued = Queued { out: Out::Line(line), _bytes: Some(bytes), _slot: None };
+                        if !queue.push_reply(queued) {
                             return;
                         }
                     }
-                    Reply::Secrets(out, token) => {
+                    Reply::Secrets(out, token, _) => {
                         // A stop's drain waits for this reply at most STOP_REPLY_FLUSH, queueing
                         // and writing together (T6-5); past it the token goes, the reply still
                         // queues (a slow reader loses nothing; a stop drops it, erased).
@@ -483,45 +732,63 @@ async fn read_loop(
                             SecretsOut::Frame(frame) => Out::Flushed(encode_reply(&frame), done),
                             SecretsOut::Sensitive(line) => Out::Sensitive(line, done),
                         };
-                        let mut send = std::pin::pin!(tx.send(out));
-                        let sent = match tokio::time::timeout_at(deadline, &mut send).await {
-                            Ok(sent) => sent,
+                        let len = match &out {
+                            Out::Line(line) | Out::Flushed(line, _) => line.len(),
+                            Out::Sensitive(line, _) => line.len(),
+                        };
+                        // The reply reserve holds the largest answer: this waits only for
+                        // earlier replies, never for events (R-2).
+                        let mut room = std::pin::pin!(replies_budget.take(len));
+                        let bytes = match tokio::time::timeout_at(deadline, &mut room).await {
+                            Ok(bytes) => bytes,
                             Err(_) => {
                                 token.take();
-                                send.await
+                                room.await
                             }
                         };
-                        if sent.is_err() {
+                        let queued = Queued { out, _bytes: Some(bytes), _slot: None };
+                        if !queue.push_reply(queued) {
                             return;
                         }
                         let _ = tokio::time::timeout_at(deadline, flushed).await;
                         drop(token);
                     }
                     Reply::Stop(frame) => {
-                        // One deadline for queueing and writing the reply: a client that stopped
-                        // reading (its queue full of snapshots) cannot hold up the stop.
+                        // R-3: a control line, queued at once (no budget to wait for); the
+                        // writer owns it from here. The deadline bounds only how long the stop
+                        // waits for it to be written: a client that stopped reading cannot hold
+                        // up the stop, and the reply stays queued for the writer meanwhile.
                         let (done, flushed) = oneshot::channel();
                         let line = encode_reply(&frame);
-                        let _ = tokio::time::timeout(STOP_REPLY_FLUSH, async {
-                            if tx.send(Out::Flushed(line, done)).await.is_ok() {
-                                let _ = flushed.await;
-                            }
-                        })
-                        .await;
+                        debug_assert!(line.len() <= crate::service::events::CONTROL_RESERVE / 4);
+                        let queued = Queued { out: Out::Flushed(line, done), _bytes: None, _slot: None };
+                        if queue.push_reply(queued) {
+                            let _ = tokio::time::timeout(STOP_REPLY_FLUSH, flushed).await;
+                        }
                         let _ = shared.shutdown.send(true);
                         return;
                     }
                 }
             }
             received = next_event(&mut conn.events) => match received {
-                Ok(event) => pending_event = encode_event(&event).or(pending_event),
-                // A slow reader missed snapshots; the next change brings it up to date.
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(published) => pending.push(&published, shared.events.current_seq()),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    pending.lagged(shared.events.current_seq());
+                }
                 Err(broadcast::error::RecvError::Closed) => conn.events = None,
             },
-            permit = tx.reserve(), if pending_event.is_some() => {
-                let Ok(permit) = permit else { return };
-                permit.send(Out::Line(pending_event.take().expect("guarded by the branch condition")));
+            slot = queue.slots.clone().acquire_owned(), if !pending.is_empty() => {
+                let slot = slot.expect("the slots are never closed");
+                let (line, bytes, written) =
+                    pending.pop().expect("guarded by the branch condition");
+                // A resync's writer says when it is written (one resync until then).
+                let out = match written {
+                    Some(done) => Out::Flushed(line, done),
+                    None => Out::Line(line),
+                };
+                if !queue.push_event(Queued { out, _bytes: bytes, _slot: Some(slot) }) {
+                    return;
+                }
             }
         }
     }
@@ -531,8 +798,9 @@ enum Reply {
     Frame(ServerFrame),
     /// The reply to an accepted `service.shutdown`: written, then the service stops.
     Stop(ServerFrame),
-    /// A secrets reply; the token keeps a stop waiting until it is written.
-    Secrets(SecretsOut, TaskTrackerToken),
+    /// A secrets reply; the token keeps a stop waiting until it is written. The grant is the
+    /// one a successful prove or unlock answered (R2-3), for `handle_request` to install.
+    Secrets(SecretsOut, TaskTrackerToken, Option<GrantMeta>),
 }
 
 enum SecretsOut {
@@ -569,27 +837,6 @@ fn encode_reply(frame: &ServerFrame) -> String {
                 },
             };
             serde_json::to_string(&error).expect("a small error frame always encodes")
-        }
-    }
-}
-
-/// An event line, or `None` (logged) when it cannot be sent within the frame limit.
-fn encode_event(event: &Event) -> Option<String> {
-    let frame = ServerFrame::Event {
-        event: event.clone(),
-    };
-    match serde_json::to_string(&frame) {
-        Ok(line) if line.len() <= MAX_FRAME_BYTES => Some(line),
-        Ok(line) => {
-            tracing::error!(
-                "dropped a {}-byte queue event over the frame limit",
-                line.len()
-            );
-            None
-        }
-        Err(e) => {
-            tracing::error!("cannot encode a queue event: {e}");
-            None
         }
     }
 }
@@ -659,17 +906,26 @@ fn sensitive_line(id: u64, json: &str) -> Zeroizing<String> {
 
 /// Runs a secrets request on the blocking pool (the KDF never runs on the runtime, and never
 /// under the heavy engine's lock).
-async fn secrets_reply(id: u64, request: Request, shared: &Shared) -> Reply {
+async fn secrets_reply(id: u64, request: Request, shared: &Shared, caller: Caller) -> Reply {
     let token = shared.jobs.token();
     let secrets = shared.secrets.clone();
     let job = shared
         .jobs
-        .spawn_blocking(move || secrets.dispatch(request));
+        .spawn_blocking(move || secrets.dispatch_as(request, &caller));
+    let mut grant = None;
     let out = match job.await {
-        Ok(Ok(SecretsReply::Value(result))) => {
-            SecretsOut::Frame(ServerFrame::Response { id, result })
+        Ok(Ok(SecretsAnswer {
+            reply,
+            grant: answered,
+        })) => {
+            grant = answered;
+            match reply {
+                SecretsReply::Value(result) => {
+                    SecretsOut::Frame(ServerFrame::Response { id, result })
+                }
+                SecretsReply::Sensitive(json) => SecretsOut::Sensitive(sensitive_line(id, &json)),
+            }
         }
-        Ok(Ok(SecretsReply::Sensitive(json))) => SecretsOut::Sensitive(sensitive_line(id, &json)),
         Ok(Err(error)) => SecretsOut::Frame(ServerFrame::Error { id, error }),
         Err(_) => SecretsOut::Frame(ServerFrame::Error {
             id,
@@ -681,7 +937,7 @@ async fn secrets_reply(id: u64, request: Request, shared: &Shared) -> Reply {
             },
         }),
     };
-    Reply::Secrets(out, token)
+    Reply::Secrets(out, token, grant)
 }
 
 /// One secrets dispatch on the blocking pool, its answer decoded (never a sensitive one).
@@ -695,12 +951,24 @@ async fn secrets_value<T: serde::de::DeserializeOwned>(
         .spawn_blocking(move || secrets.dispatch(request))
         .await
         .map_err(|_| internal_error("the secrets job failed"))??;
-    match reply {
+    match reply.reply {
         SecretsReply::Value(value) => {
             serde_json::from_value(value).map_err(|_| internal_error("unreadable secrets answer"))
         }
         SecretsReply::Sensitive(_) => Err(internal_error("unexpected sensitive answer")),
     }
+}
+
+/// The person gate's admission for a gated method served outside the secrets engine
+/// (`heavy.stop`): a live grant of the vault's current generation, checked under the vault
+/// mutex, which is released when this returns (spec §8.5).
+async fn admit_grant(shared: &Shared, grant: Option<GrantMeta>) -> Result<(), HostlerError> {
+    let secrets = shared.secrets.clone();
+    shared
+        .jobs
+        .spawn_blocking(move || secrets.admit_grant(grant.as_ref()))
+        .await
+        .map_err(|_| internal_error("the secrets job failed"))?
 }
 
 fn internal_error(message: &str) -> HostlerError {
@@ -727,7 +995,13 @@ async fn account_reply(id: u64, request: Request, shared: &Shared) -> Reply {
     let resolved = secrets_value::<ProjectInfo>(shared, Request::ProjectResolve(project.clone()));
     let project = match resolved.await {
         Ok(project) => project,
-        Err(e) => return Reply::Secrets(SecretsOut::Frame(response::<Value>(id, Err(e))), token),
+        Err(e) => {
+            return Reply::Secrets(
+                SecretsOut::Frame(response::<Value>(id, Err(e))),
+                token,
+                None,
+            );
+        }
     };
     let account = |name: &str| ResourceId::account(&project.id, name);
     let result = match request {
@@ -738,14 +1012,25 @@ async fn account_reply(id: u64, request: Request, shared: &Shared) -> Reply {
                 &m.requester,
             );
             match held {
-                Ok(()) => return secrets_reply(id, Request::AccountMaterialize(m), shared).await,
+                Ok(()) => {
+                    return secrets_reply(
+                        id,
+                        Request::AccountMaterialize(m),
+                        shared,
+                        Caller::default(),
+                    )
+                    .await;
+                }
                 Err(e) => Err(e),
             }
         }
         Request::AccountRemove(r) => {
             let holder = claims_lock(shared).await.holder_of(&account(&r.name));
             match holder {
-                None => return secrets_reply(id, Request::AccountRemove(r), shared).await,
+                None => {
+                    return secrets_reply(id, Request::AccountRemove(r), shared, Caller::default())
+                        .await;
+                }
                 Some(h) => Err(claims_errors::resource_in_use(
                     &h.resource,
                     &h.workspace_path,
@@ -773,7 +1058,7 @@ async fn account_reply(id: u64, request: Request, shared: &Shared) -> Reply {
             Err(e) => Err(e),
         },
     };
-    Reply::Secrets(SecretsOut::Frame(response(id, result)), token)
+    Reply::Secrets(SecretsOut::Frame(response(id, result)), token, None)
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Value, HostlerError> {
@@ -786,7 +1071,15 @@ async fn handle_line(line: &str, conn: &mut ConnState, shared: &Shared) -> Optio
         Err(e) => return Some(Reply::Frame(unreadable(line, &e))),
     };
     let id = frame.id;
-    let (reply, took, waits) = timed(handle_request(id, frame.request, conn, shared)).await;
+    let (reply, took, waits) = timed(async {
+        let reply = handle_request(id, frame.request, conn, shared).await;
+        // A project, a workspace or a declaration changed: `projects.changed` (spec §6.3).
+        if shared.events.take_projects_dirty() {
+            publish_projects(shared).await;
+        }
+        reply
+    })
+    .await;
     if let Some(text) = slow_line(
         &format!("request {}", method_of(line)),
         took,
@@ -808,7 +1101,11 @@ async fn handle_request(
         Request::Hello {
             contract_version, ..
         } => {
-            let result = lifecycle::hello(contract_version, shared.contract_version);
+            let result =
+                lifecycle::hello(contract_version, shared.contract_version).map(|mut r| {
+                    r.instance = Some(shared.instance.clone());
+                    r
+                });
             conn.hello_ok = result.is_ok();
             conn.events = conn.hello_ok.then(|| shared.events.subscribe());
             response(id, result)
@@ -898,7 +1195,10 @@ async fn handle_request(
                         None => tracing::warn!("stopping without the claims engine's answer"),
                     }
                     shared.secrets.begin_shutdown();
-                    Reply::Stop(response(id, Ok(json!({ "stopping": true }))))
+                    Reply::Stop(response(
+                        id,
+                        Ok(crate::contract::heavy::ShutdownAccepted { stopping: true }),
+                    ))
                 }
                 Err(e) => {
                     reopen();
@@ -916,8 +1216,30 @@ async fn handle_request(
             return Some(account_reply(id, versioned, shared).await);
         }
         versioned if SecretsEngine::handles(&versioned) => {
-            return Some(secrets_reply(id, versioned, shared).await);
+            let grants = matches!(
+                versioned,
+                Request::SecretsProve(_) | Request::SecretsUnlock(_)
+            );
+            let reply = secrets_reply(id, versioned, shared, conn.caller()).await;
+            if let Reply::Secrets(out, _, answered) = &reply {
+                let succeeded = !matches!(out, SecretsOut::Frame(ServerFrame::Error { .. }));
+                apply_grant(&mut conn.grant, grants, succeeded, *answered);
+            }
+            return Some(reply);
         }
+        Request::ProjectsSnapshot => response(id, projects_snapshot(shared).await),
+        // Gated (spec §8.5): the admission first, under the vault mutex, on the blocking pool
+        // (an unlock's KDF may hold the vault); the mutex is released before anything stops.
+        Request::HeavyStop {
+            id: entry,
+            confirmation,
+        } => match admit_grant(shared, conn.grant).await {
+            Err(e) => response::<Value>(id, Err(e)),
+            Ok(()) => response(
+                id,
+                heavy_stop(shared, &entry, &confirmation, conn.peer_pid).await,
+            ),
+        },
         versioned if handles_claims(&versioned) => claims_reply(id, versioned, shared).await,
         versioned if handles_devices(&versioned) => devices_reply(id, versioned, shared).await,
         Request::HeavyAcquire(req) => heavy_acquire(id, req, shared).await,
@@ -931,7 +1253,8 @@ async fn handle_request(
             };
             match allowed {
                 Err(e) => response::<Value>(id, Err(e)),
-                Ok(()) => dispatch(id, Request::HeavyStarted(s), &mut *heavy_lock(shared).await),
+                // P5 T6-R1-1: the report is checked against the connection's peer.
+                Ok(()) => response(id, heavy_lock(shared).await.started(s, conn.peer_pid)),
             }
         }
         versioned => dispatch(id, versioned, &mut *heavy_lock(shared).await),
@@ -944,6 +1267,37 @@ async fn handle_request(
 /// (T6-R2-3): a heavy snapshot; then the admission under the claims lock (bounded); then the
 /// acquire under the heavy lock; then the nesting under a short claims lock. A run that slips in
 /// between gets its row, and a takeover's commit re-discovers it.
+/// `heavy.stop` after the gate (spec §11.1, P5 Task 6): the entry is marked `stopping` under
+/// the heavy lock; its run is stopped and verified outside it, on the blocking pool; the result
+/// is recorded under the lock again. The stop runs to its end even when the requester goes.
+async fn heavy_stop(
+    shared: &Shared,
+    entry: &str,
+    confirmation: &str,
+    peer_pid: Option<u32>,
+) -> Result<QueueStopOutcome, HostlerError> {
+    let service = std::process::id();
+    let target = heavy_lock(shared)
+        .await
+        .begin_stop(entry, confirmation, peer_pid, &|t| {
+            crate::procs::stop::refuses_self_target(service, t)
+        })?;
+    let grace = crate::procs::stop::takeover_grace();
+    let stopping = target.clone();
+    let run = tokio::task::spawn_blocking(move || {
+        crate::procs::stop::pause_at("heavy_stop");
+        crate::procs::stop::stop_run(&stopping, grace)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        crate::procs::stop::RunStop::failed(
+            &target,
+            crate::procs::stop::StopError::Unknown("the stop failed".into()),
+        )
+    });
+    heavy_lock(shared).await.finish_stop(entry, &run)
+}
+
 async fn heavy_acquire(id: u64, req: HeavyAcquire, shared: &Shared) -> ServerFrame {
     let snapshot = heavy_lock(shared).await.snapshot();
     let view = snapshot
@@ -1084,16 +1438,9 @@ async fn devices_reply(id: u64, request: Request, shared: &Shared) -> ServerFram
                 None
             };
             // CRB-4: a read that failed or came late is said, never answered as fresh.
-            let shown = devices.show(&device).and_then(|detail| {
-                let mut value = serde_json::to_value(detail)
-                    .map_err(|e| crate::contract::secrets::errors::bad_request(format!("{e}")))?;
-                if let (Some(reason), Some(map)) = (unknown, value.as_object_mut()) {
-                    map.insert(
-                        crate::contract::devices::SESSIONS_UNKNOWN_KEY.into(),
-                        Value::String(reason),
-                    );
-                }
-                Ok(value)
+            let shown = devices.show(&device).map(|mut detail| {
+                detail.sessions_unknown = unknown;
+                detail
             });
             response(id, shown)
         }
@@ -1131,7 +1478,7 @@ async fn devices_reply(id: u64, request: Request, shared: &Shared) -> ServerFram
                 // The device `begin_remove` marked and the engine was asked about (P3bT5-5).
                 devices
                     .remove(&resource, person, in_use)
-                    .map(|()| json!({ "removed": resource })),
+                    .map(|()| crate::contract::devices::DeviceRemoved { removed: resource }),
             )
         }
         Request::DevicesInstalls { device, query } => {
@@ -1273,7 +1620,7 @@ async fn claims_reply(id: u64, request: Request, shared: &Shared) -> ServerFrame
             id,
             claims
                 .seize_progress(&p.plan_id, &p.requester)
-                .map(|expires_at_ms| json!({ "expires_at_ms": expires_at_ms })),
+                .map(|expires_at_ms| crate::contract::claims::SeizeProgressReply { expires_at_ms }),
         ),
         _ => unreachable!("handles_claims routes only these"),
     }
@@ -1291,7 +1638,7 @@ async fn overview(shared: &Shared) -> Result<Overview, HostlerError> {
         .await
         // A panicked or cancelled secrets job (CR-B-8).
         .map_err(|_| internal_error("the secrets job failed"))??;
-    let secrets: SecretsStatus = match status {
+    let secrets: SecretsStatus = match status.reply {
         SecretsReply::Value(value) => serde_json::from_value(value).map_err(|_| HostlerError {
             code: ErrorCode::Internal,
             message: "cannot read the secrets status".into(),
@@ -1318,14 +1665,28 @@ async fn status(shared: &Shared) -> Result<ServiceStatus, HostlerError> {
         waiting_heavy: snapshot.waiting.len() as u32,
         secrets_unlocked: Some(shared.secrets.is_unlocked()),
         boot_id: crate::procs::local_boot_id(),
+        instance: Some(shared.instance.clone()),
+        exe: shared.exe.clone(),
     })
+}
+
+/// `projects.snapshot`: read under the claims lock, where `projects.changed` is published
+/// (spec §6.2).
+async fn projects_snapshot(shared: &Shared) -> Result<ProjectsSnapshot, HostlerError> {
+    let claims = claims_lock(shared).await;
+    claims.projects_snapshot()
+}
+
+/// Publishes `projects.changed` under the claims lock when the projects differ from the last
+/// published ones.
+async fn publish_projects(shared: &Shared) {
+    claims_lock(shared).await.publish_projects();
 }
 
 fn dispatch(id: u64, request: Request, engine: &mut HeavyEngine) -> ServerFrame {
     match request {
         Request::HeavyAcquire(req) => response(id, engine.acquire(req)),
         Request::HeavyAttach { id: entry } => response(id, engine.attach(&entry)),
-        Request::HeavyStarted(s) => response(id, engine.started(s)),
         Request::HeavyRelease(r) => response(id, engine.release(r)),
         Request::HeavyWithdraw {
             id: entry,
@@ -1457,6 +1818,11 @@ mod tests {
 
     /// A service core with in-memory stores; `running` seeds a running heavy entry.
     fn shared(dir: &std::path::Path, running: bool) -> Shared {
+        shared_with(dir, running, 16)
+    }
+
+    /// `shared` with the broadcast channel's capacity.
+    fn shared_with(dir: &std::path::Path, running: bool, capacity: usize) -> Shared {
         use std::sync::atomic::{AtomicI64, Ordering};
 
         use crate::contract::heavy::HeavyAcquire;
@@ -1494,7 +1860,7 @@ mod tests {
             heavy_store.mark_running(&req.id, 0).unwrap();
         }
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let (events, _) = broadcast::channel(16);
+        let events = EventBus::new(capacity);
         let kdbx = dir.join("hostler.kdbx");
         Shared {
             engine: Mutex::new(HeavyEngine::new(
@@ -1531,15 +1897,14 @@ mod tests {
             events,
             contract_version: lifecycle::service_contract_version(),
             shutdown: watch::channel(false).0,
+            instance: "test-instance".into(),
+            exe: None,
         }
     }
 
     /// A connection that said hello.
     async fn greeted(shared: &Shared) -> ConnState {
-        let mut conn = ConnState {
-            hello_ok: false,
-            events: None,
-        };
+        let mut conn = ConnState::new();
         let hello = format!(
             r#"{{"id":1,"method":"hello","params":{{"contract_version":{},"client":"t"}}}}"#,
             shared.contract_version
@@ -1635,10 +2000,7 @@ mod tests {
             error.message
         );
         // Still behind the hello, as every versioned method.
-        let mut fresh = ConnState {
-            hello_ok: false,
-            events: None,
-        };
+        let mut fresh = ConnState::new();
         let line = r#"{"id":2,"method":"devices.list","params":{"all":false}}"#;
         let error = error_of(line, &mut fresh, &shared).await;
         assert_eq!(error.code, ErrorCode::ContractMismatch);
@@ -1671,12 +2033,9 @@ mod tests {
         let shutdown = r#"{"id":5,"method":"service.shutdown","params":{"if_idle":true}}"#;
         for running in [true, false] {
             let shared = shared(dir.path(), running);
-            let mut conn = ConnState {
-                hello_ok: false,
-                events: None,
-            };
+            let mut conn = ConnState::new();
             let reply = handle_line(shutdown, &mut conn, &shared).await.unwrap();
-            let status = shared.secrets.dispatch(Request::SecretsStatus);
+            let status = shared.secrets.reply(Request::SecretsStatus);
             if running {
                 assert!(matches!(reply, Reply::Frame(ServerFrame::Error { .. })));
                 assert!(status.is_ok(), "a refused stop must not close admission");
@@ -1699,10 +2058,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let shared = shared(dir.path(), false);
-        let mut conn = ConnState {
-            hello_ok: false,
-            events: None,
-        };
+        let mut conn = ConnState::new();
         let hello = format!(
             r#"{{"id":1,"method":"hello","params":{{"contract_version":{},"client":"t"}}}}"#,
             shared.contract_version
@@ -1817,6 +2173,7 @@ mod tests {
                 workspace: "/work/app".into(),
             }),
             Request::WorkspaceResolve(WorkspaceResolve {
+                declared: None,
                 project: project.clone(),
                 root: "/work/app".into(),
             }),
@@ -1891,5 +2248,838 @@ mod tests {
         assert_eq!(routed.len(), 18);
         assert_eq!(accounts.len(), 5);
         assert!(accounts.iter().all(SecretsEngine::handles));
+    }
+
+    // ---- P5 Task 1: event delivery (spec §6.2) ----
+
+    use crate::contract::secrets::{RequestState, SecretRequestInfo};
+    use crate::contract::wire::ResyncReason;
+
+    /// A connection's read loop over a real local socket; the test is its writer: it takes
+    /// lines from the connection's `WriterQueue` only when it reads (`next`, `drain`). `stall`
+    /// holds every event slot, so the backlog forms exactly as behind a stalled socket (kernel
+    /// buffer sizes play no part).
+    struct Piped {
+        /// The client's side, kept open for the connection's life.
+        send: WriteHalf<Stream>,
+        queue: Arc<WriterQueue>,
+        /// The event slots the test holds while stalled.
+        held: Option<tokio::sync::OwnedSemaphorePermit>,
+        reader: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+        _server_send: WriteHalf<Stream>,
+    }
+
+    fn line_of(queued: Queued) -> String {
+        match queued.out {
+            Out::Line(line) | Out::Flushed(line, _) => line,
+            Out::Sensitive(line, _) => line.to_string(),
+        }
+    }
+
+    /// Waits for `ready` (a failure bound only: the condition is the handshake).
+    async fn until(what: &str, ready: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    impl Piped {
+        async fn new(shared: Arc<Shared>) -> Piped {
+            use tokio::io::AsyncWriteExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let socket = SocketName::File(dir.path().join("t.sock"));
+            let listener = bind(&socket).unwrap();
+            let client = Stream::connect(socket_name(&socket).unwrap())
+                .await
+                .unwrap();
+            let server = listener.accept().await.unwrap();
+            let (recv, server_send) = tokio::io::split(server);
+            let reader = FramedRead::new(recv, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
+            let queue = Arc::new(WriterQueue::default());
+            let reader = tokio::spawn({
+                let queue = queue.clone();
+                async move { read_loop(reader, queue, &shared, None).await }
+            });
+            let (_client_recv, mut send) = tokio::io::split(client);
+            let hello = format!(
+                "{{\"id\":1,\"method\":\"hello\",\"params\":{{\"contract_version\":{},\"client\":\"t\"}}}}\n",
+                crate::contract::CONTRACT_VERSION
+            );
+            send.write_all(hello.as_bytes()).await.unwrap();
+            let mut piped = Piped {
+                send,
+                queue,
+                held: None,
+                reader,
+                _dir: dir,
+                _server_send: server_send,
+            };
+            let reply = piped.next().await.expect("the hello reply");
+            assert!(reply.contains("\"result\""), "{reply}");
+            piped
+        }
+
+        async fn request(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            self.send.write_all(line.as_bytes()).await.unwrap();
+            self.send.write_all(b"\n").await.unwrap();
+        }
+
+        /// The next line the writer would take, or `None` after 500 ms without one.
+        async fn next(&mut self) -> Option<String> {
+            tokio::time::timeout(Duration::from_millis(500), self.queue.next())
+                .await
+                .ok()
+                .flatten()
+                .map(line_of)
+        }
+
+        /// The writer is stalled: the test holds every event slot (none may be in use yet).
+        async fn stall(&mut self) {
+            let all = self
+                .queue
+                .slots
+                .clone()
+                .try_acquire_many_owned(EVENT_SLOTS as u32)
+                .expect("no event line is queued before the stall");
+            self.held = Some(all);
+        }
+
+        fn replies_queued(&self) -> usize {
+            self.queue.lanes().replies.len()
+        }
+
+        /// The writer resumes: every event line, in order, until 500 ms pass without one.
+        async fn drain(&mut self) -> Vec<(u64, Event)> {
+            self.held = None;
+            let mut got = Vec::new();
+            while let Some(line) = self.next().await {
+                match serde_json::from_str(&line).unwrap() {
+                    ServerFrame::Event { event, seq } => got.push((seq, event)),
+                    other => panic!("not an event: {other:?}"),
+                }
+            }
+            got
+        }
+    }
+
+    fn request_event(id: &str, n: u32) -> Event {
+        Event::SecretRequestChanged(SecretRequestInfo {
+            id: id.into(),
+            project_id: "p1".into(),
+            project_name: "app".into(),
+            name: "API_KEY".into(),
+            reason: format!("change {n}"),
+            state: RequestState::Pending,
+            requester_pid: 42,
+            created_at_ms: i64::from(n),
+            answered_at_ms: None,
+        })
+    }
+
+    fn devices_event(n: i64) -> Event {
+        let mut snapshot = crate::contract::devices::fixtures::snapshot();
+        snapshot.at_ms = n;
+        Event::DevicesChanged(Box::new(snapshot))
+    }
+
+    fn seizure_event(n: u32) -> Event {
+        let mut seizure = crate::contract::claims::fixtures::seizure();
+        seizure.id = format!("s{n}");
+        Event::ClaimsSeized(seizure)
+    }
+
+    /// Publishes and lets the read loop take the event (no lag).
+    async fn publish(shared: &Shared, event: Event) -> u64 {
+        let seq = shared.events.publish_test(event);
+        tokio::task::yield_now().await;
+        seq
+    }
+
+    #[tokio::test]
+    async fn slow_reader_gets_newest_per_key_in_seq_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut piped = Piped::new(shared.clone()).await;
+        piped.stall().await;
+        // 40 changes to 5 request ids among 100 device snapshots, then 3 seizures.
+        let mut last_request = std::collections::HashMap::new();
+        let mut last_devices = 0;
+        let (mut changes, mut snapshots) = (0u32, 0u32);
+        for n in 0..140u32 {
+            if n % 7 < 2 {
+                let id = format!("r{}", changes % 5);
+                let seq = publish(&shared, request_event(&id, n)).await;
+                last_request.insert(id, (seq, n));
+                changes += 1;
+            } else {
+                last_devices = publish(&shared, devices_event(i64::from(n))).await;
+                snapshots += 1;
+            }
+        }
+        assert_eq!((changes, snapshots), (40, 100));
+        let mut seizures = Vec::new();
+        for n in 0..3 {
+            seizures.push(publish(&shared, seizure_event(n)).await);
+        }
+        let got = piped.drain().await;
+        let seqs: Vec<u64> = got.iter().map(|(s, _)| *s).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        let mut want: Vec<u64> = last_request.values().map(|(s, _)| *s).collect();
+        want.push(last_devices);
+        want.extend(&seizures);
+        want.sort();
+        assert_eq!(seqs, want);
+        assert_eq!(got.len(), 5 + 1 + 3);
+        for (seq, event) in &got {
+            match event {
+                Event::SecretRequestChanged(info) => {
+                    assert_eq!(last_request[&info.id].0, *seq);
+                    assert_eq!(info.reason, format!("change {}", last_request[&info.id].1));
+                }
+                Event::DevicesChanged(s) => assert_eq!(s.as_of_seq, *seq),
+                Event::ClaimsSeized(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn records_are_never_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut piped = Piped::new(shared.clone()).await;
+        piped.stall().await;
+        let mut seqs = Vec::new();
+        for n in 0..3 {
+            seqs.push(publish(&shared, seizure_event(n)).await);
+        }
+        let got = piped.drain().await;
+        assert_eq!(got.iter().map(|(s, _)| *s).collect::<Vec<_>>(), seqs);
+        assert!(got.iter().all(|(_, e)| matches!(e, Event::ClaimsSeized(_))));
+    }
+
+    #[tokio::test]
+    async fn lag_sends_one_resync_then_later_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared_with(dir.path(), false, 4));
+        let mut piped = Piped::new(shared.clone()).await;
+        // The connection's task does not run between these (one thread): its receiver lags.
+        for n in 0..20 {
+            shared
+                .events
+                .publish_test(request_event(&format!("r{n}"), n));
+        }
+        let held_through = shared.events.current_seq();
+        let got = piped.drain().await;
+        assert_eq!(
+            got,
+            [(
+                held_through,
+                Event::Resync {
+                    reason: ResyncReason::Lagged
+                }
+            )]
+        );
+        let e = publish(&shared, request_event("e", 99)).await;
+        let got = piped.drain().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, e);
+        assert!(matches!(&got[0].1, Event::SecretRequestChanged(i) if i.id == "e"));
+    }
+
+    #[tokio::test]
+    async fn overflow_sends_one_resync_then_later_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut piped = Piped::new(shared.clone()).await;
+        piped.stall().await;
+        let mut last = 0;
+        for n in 0..300 {
+            last = publish(&shared, request_event(&format!("r{n}"), n)).await;
+        }
+        let got = piped.drain().await;
+        assert_eq!(
+            got,
+            [(
+                last,
+                Event::Resync {
+                    reason: ResyncReason::Overflow
+                }
+            )]
+        );
+        let e = publish(&shared, request_event("e", 999)).await;
+        let got = piped.drain().await;
+        assert_eq!(got.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [e]);
+    }
+
+    #[tokio::test]
+    async fn oversized_event_sends_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut piped = Piped::new(shared.clone()).await;
+        let mut big = crate::contract::devices::fixtures::snapshot();
+        big.unmapped_sessions = vec!["x".repeat(MAX_FRAME_BYTES)];
+        let dropped = publish(&shared, Event::DevicesChanged(Box::new(big))).await;
+        let got = piped.drain().await;
+        assert_eq!(
+            got,
+            [(
+                dropped,
+                Event::Resync {
+                    reason: ResyncReason::Oversized
+                }
+            )]
+        );
+        let e = publish(&shared, request_event("e", 1)).await;
+        let got = piped.drain().await;
+        assert_eq!(got.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [e]);
+    }
+
+    /// A `queue.snapshot` between two queue events A < B: `A.seq <= as_of_seq < B.seq`.
+    #[tokio::test]
+    async fn as_of_seq_orders_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), false);
+        let mut events = shared.events.subscribe();
+        let mut conn = greeted(&shared).await;
+        let set = |n: u8| {
+            format!(r#"{{"id":5,"method":"queue.set_capacity","params":{{"capacity":{n}}}}}"#)
+        };
+        result_of(&set(2), &mut conn, &shared).await;
+        let snapshot = result_of(r#"{"id":6,"method":"queue.snapshot"}"#, &mut conn, &shared).await;
+        result_of(&set(3), &mut conn, &shared).await;
+        let queue_seqs: Vec<u64> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|p| matches!(p.event, Event::QueueChanged(_)))
+            .map(|p| p.seq)
+            .collect();
+        let (a, b) = (
+            queue_seqs[queue_seqs.len() - 2],
+            queue_seqs[queue_seqs.len() - 1],
+        );
+        let as_of = snapshot["as_of_seq"].as_u64().unwrap();
+        assert!(a <= as_of && as_of < b, "{a} <= {as_of} < {b}");
+        assert_eq!(snapshot["capacity"], 2);
+    }
+
+    /// R2-3: a successful prove/unlock with a grant installs it; a failed one clears it;
+    /// other methods never touch it.
+    #[test]
+    fn grant_plumbing() {
+        let meta = GrantMeta {
+            expires_at_ms: 5_000,
+            generation_at_grant: 3,
+        };
+        let other = GrantMeta {
+            expires_at_ms: 9_000,
+            generation_at_grant: 4,
+        };
+        let mut grant = None;
+        apply_grant(&mut grant, true, true, Some(meta));
+        assert_eq!(grant, Some(meta));
+        apply_grant(&mut grant, true, true, None);
+        assert_eq!(grant, Some(meta));
+        apply_grant(&mut grant, false, true, Some(other));
+        assert_eq!(grant, Some(meta), "not a prove or unlock");
+        apply_grant(&mut grant, false, false, None);
+        assert_eq!(grant, Some(meta));
+        apply_grant(&mut grant, true, false, Some(other));
+        assert_eq!(grant, None);
+    }
+
+    /// The plumbing end to end: a successful unlock grants its connection; a wrong unlock on
+    /// it clears the grant; another connection never has one.
+    #[tokio::test]
+    async fn unlock_installs_and_failure_clears_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), false);
+        let mut conn = greeted(&shared).await;
+        let mut other = greeted(&shared).await;
+        let unlock = |password: &str, create: bool| {
+            format!(
+                r#"{{"id":7,"method":"secrets.unlock","params":{{"password":"{password}","key_file":null,"forget_key_file":false,"create":{create}}}}}"#
+            )
+        };
+        let reply = handle_line(&unlock("master-pass-1", true), &mut conn, &shared)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply,
+            Reply::Secrets(SecretsOut::Frame(ServerFrame::Response { .. }), _, Some(_))
+        ));
+        let grant = conn
+            .grant
+            .expect("a successful unlock grants its connection");
+        assert_eq!(
+            grant.expires_at_ms,
+            1_000 + crate::secrets::gate::PROOF_TTL_MS
+        );
+        // The create was the vault's first generation change (P5 Task 4).
+        assert_eq!(grant.generation_at_grant, 1);
+        assert_eq!(other.grant, None);
+        handle_line(r#"{"id":8,"method":"secrets.lock"}"#, &mut conn, &shared)
+            .await
+            .unwrap();
+        assert!(conn.grant.is_some(), "a lock is not a prove or unlock");
+        let reply = handle_line(&unlock("wrong-pass-1", false), &mut conn, &shared)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply,
+            Reply::Secrets(SecretsOut::Frame(ServerFrame::Error { .. }), _, None)
+        ));
+        assert_eq!(conn.grant, None);
+        let _ = handle_line(&unlock("wrong-pass-1", false), &mut other, &shared).await;
+        assert_eq!(other.grant, None);
+    }
+
+    /// Contract 5's stubs answer `not_available_yet` until their tasks fill them; a gated one
+    /// (Task 4) answers `proof_required` first without a grant. Task 5 fills `account.requests`.
+    #[tokio::test]
+    async fn p5_stubs_answer_not_available_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), false);
+        let mut conn = greeted(&shared).await;
+        for (method, params) in [
+            (
+                "secret.reveal",
+                r#"{"project":{"common_dir":"/w/.git","name":"w"},"name":"API_KEY"}"#,
+            ),
+            (
+                "account.reveal",
+                r#"{"project":{"common_dir":"/w/.git","name":"w"},"name":"qa"}"#,
+            ),
+            (
+                "secrets.remove_preserved",
+                r#"{"path":"/x/hostler.kdbx.prev-1"}"#,
+            ),
+            ("account.decline", r#"{"id":"r1"}"#),
+            ("heavy.stop", r#"{"id":"e1","confirmation":"e1"}"#),
+        ] {
+            let line = format!(r#"{{"id":9,"method":"{method}","params":{params}}}"#);
+            let error = match handle_line(&line, &mut conn, &shared).await.unwrap() {
+                Reply::Frame(ServerFrame::Error { error, .. })
+                | Reply::Secrets(SecretsOut::Frame(ServerFrame::Error { error, .. }), _, _) => {
+                    error
+                }
+                _ => panic!("{method}: not an error"),
+            };
+            assert_eq!(error.code, ErrorCode::ProofRequired, "{method}");
+        }
+        for (method, params) in [("account.requests", "null")] {
+            let line = if params == "null" {
+                format!(r#"{{"id":9,"method":"{method}"}}"#)
+            } else {
+                format!(r#"{{"id":9,"method":"{method}","params":{params}}}"#)
+            };
+            let result = match handle_line(&line, &mut conn, &shared).await.unwrap() {
+                Reply::Frame(ServerFrame::Response { result, .. })
+                | Reply::Secrets(SecretsOut::Frame(ServerFrame::Response { result, .. }), _, _) => {
+                    result
+                }
+                _ => panic!("{method}: not an answer"),
+            };
+            assert_eq!(result, json!([]), "{method}");
+        }
+        let requests = match handle_line(
+            r#"{"id":10,"method":"requests.snapshot"}"#,
+            &mut conn,
+            &shared,
+        )
+        .await
+        .unwrap()
+        {
+            Reply::Secrets(SecretsOut::Frame(ServerFrame::Response { result, .. }), _, _) => result,
+            _ => panic!("requests.snapshot: not an answer"),
+        };
+        assert_eq!(requests["secrets"], json!([]));
+        assert_eq!(requests["accounts"], json!([]));
+        assert!(requests["as_of_seq"].is_u64());
+    }
+
+    /// C-A1, R-1. First, deterministically: a status read blocked inside its capture (holding
+    /// the secrets store guard) stops no other engine: the queue and the projects publish
+    /// meanwhile, and the read's point, taken once it resumes, comes after their events. Then
+    /// two engines (the heavy queue and the secrets lock state) publish concurrently while two
+    /// readers take snapshot answers: a client applying spec §6.2's rule discards the held
+    /// events of a snapshot's kind numbered `<= as_of_seq`, and each snapshot equals the state
+    /// after the last of them, so no discarded event is missing from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshots_name_exact_points_across_engines() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc as std_mpsc;
+
+        use crate::contract::heavy::QueueSnapshot;
+        use crate::contract::secrets::{LockState, SecretsStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared_with(dir.path(), false, 1 << 16));
+        let mut rx = shared.events.subscribe();
+        let secrets = shared.secrets.clone();
+        let unlock = move |create: bool| {
+            secrets
+                .reply(Request::SecretsUnlock(crate::contract::secrets::Unlock {
+                    password: crate::secrets::value::SecretValue::new("master-pass-1".into()),
+                    key_file: None,
+                    forget_key_file: false,
+                    create,
+                }))
+                .map(|_| ())
+                .unwrap();
+        };
+        tokio::task::spawn_blocking({
+            let unlock = unlock.clone();
+            move || unlock(true)
+        })
+        .await
+        .unwrap();
+        let status = |shared: &Shared| -> SecretsStatus {
+            match shared.secrets.reply(Request::SecretsStatus).unwrap() {
+                SecretsReply::Value(v) => serde_json::from_value(v).unwrap(),
+                SecretsReply::Sensitive(_) => unreachable!(),
+            }
+        };
+
+        // 1. Deterministic (R-1): a status read blocked inside its capture.
+        let (inside_tx, inside) = std_mpsc::channel();
+        let (release, release_rx) = std_mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let paused = Arc::new(AtomicBool::new(false));
+        shared.secrets.set_test_hook(Some(Arc::new({
+            let paused = paused.clone();
+            move |at| {
+                if at == "status_read" && !paused.swap(true, Ordering::SeqCst) {
+                    inside_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }
+        })));
+        let reader = tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            move || status(&shared)
+        });
+        // Handshake: the read is inside its capture, holding the store guard.
+        tokio::task::spawn_blocking(move || inside.recv().unwrap())
+            .await
+            .unwrap();
+        // Two other engines commit meanwhile (a bound only for a hang: they must not wait).
+        let others = tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            move || {
+                shared.engine.blocking_lock().set_capacity(2).unwrap();
+                shared.claims.blocking_lock().publish_projects();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), others)
+            .await
+            .expect("another engine waited for the blocked capture")
+            .unwrap();
+        let committed: Vec<Published> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let queue_seq = committed
+            .iter()
+            .find(|p| matches!(p.event, Event::QueueChanged(_)))
+            .expect("the queue event, broadcast while the read was blocked")
+            .seq;
+        let projects_seq = committed
+            .iter()
+            .find(|p| matches!(p.event, Event::ProjectsChanged(_)))
+            .expect("the projects event, broadcast while the read was blocked")
+            .seq;
+        assert!(!reader.is_finished(), "the read is still blocked");
+        release.send(()).unwrap();
+        let read = reader.await.unwrap();
+        shared.secrets.set_test_hook(None);
+        assert!(
+            read.as_of_seq >= queue_seq.max(projects_seq),
+            "the read's point ({}) is taken after it resumes",
+            read.as_of_seq
+        );
+
+        // 2. Concurrent: changes on both engines, snapshot answers read meanwhile.
+        let queue_writer = tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            move || {
+                for n in 0..200u8 {
+                    shared
+                        .engine
+                        .blocking_lock()
+                        .set_capacity(1 + n % 3)
+                        .unwrap();
+                }
+            }
+        });
+        let lock_writer = tokio::task::spawn_blocking({
+            let shared = shared.clone();
+            let unlock = unlock.clone();
+            move || {
+                for _ in 0..25 {
+                    shared.secrets.reply(Request::SecretsLock).unwrap();
+                    unlock(false);
+                }
+            }
+        });
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut queue: Vec<QueueSnapshot> = Vec::new();
+                    let mut locks: Vec<SecretsStatus> = Vec::new();
+                    for _ in 0..150 {
+                        queue.push(shared.engine.blocking_lock().snapshot().unwrap());
+                        locks.push(status(&shared));
+                    }
+                    (queue, locks)
+                })
+            })
+            .collect();
+        queue_writer.await.unwrap();
+        lock_writer.await.unwrap();
+        let mut queue_reads = Vec::new();
+        let mut lock_reads = Vec::new();
+        for reader in readers {
+            let (q, l) = reader.await.unwrap();
+            queue_reads.extend(q);
+            lock_reads.extend(l);
+        }
+        let events: Vec<Published> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let queue_events: Vec<(u64, u8)> = events
+            .iter()
+            .filter_map(|p| match &p.event {
+                Event::QueueChanged(s) => Some((p.seq, s.capacity)),
+                _ => None,
+            })
+            .collect();
+        let lock_events: Vec<(u64, LockState)> = events
+            .iter()
+            .filter_map(|p| match &p.event {
+                Event::SecretsLockChanged(s) => Some((p.seq, s.state)),
+                _ => None,
+            })
+            .collect();
+        assert!(queue_events.len() >= 100 && lock_events.len() >= 40);
+        // The state after the last event numbered `<= as_of`, as the client rebuilds it.
+        fn after<S: Copy>(events: &[(u64, S)], as_of: u64) -> Option<S> {
+            events
+                .iter()
+                .rev()
+                .find(|(seq, _)| *seq <= as_of)
+                .map(|(_, s)| *s)
+        }
+        for read in &queue_reads {
+            if let Some(capacity) = after(&queue_events, read.as_of_seq) {
+                assert_eq!(read.capacity, capacity, "queue read at {}", read.as_of_seq);
+            }
+        }
+        for read in &lock_reads {
+            if let Some(state) = after(&lock_events, read.as_of_seq) {
+                assert_eq!(read.state, state, "status read at {}", read.as_of_seq);
+            }
+        }
+    }
+
+    /// C-A2, R-2, R-4. Behind a stalled writer, waiting events and event lines in the
+    /// writer's queue never hold more than `EVENT_BYTES`; past it the events become one
+    /// `resync`; a reply meanwhile is queued in its own reserve and written first.
+    #[tokio::test]
+    async fn outbound_bytes_are_bounded_with_the_writer_queue() {
+        use crate::service::events::EVENT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut piped = Piped::new(shared.clone()).await;
+        let big = |n: u32| {
+            let mut seizure = crate::contract::claims::fixtures::seizure();
+            seizure.id = format!("s{n}");
+            seizure.from_workspace_path = "x".repeat(3 << 20);
+            Event::ClaimsSeized(seizure)
+        };
+        // 20 records of 3 MiB; nobody writes: the writer's 16 slots alone would take 48 MiB.
+        let mut last = 0;
+        for n in 0..20 {
+            last = publish(&shared, big(n)).await;
+        }
+        // Handshake: the reader has taken every record (the budget is as full as it gets).
+        until("the records are queued", || {
+            piped.queue.events_budget.in_use() >= 7 * (3 << 20)
+        })
+        .await;
+        piped.request(r#"{"id":7,"method":"queue.snapshot"}"#).await;
+        until("the reply is queued", || piped.replies_queued() == 1).await;
+        assert!(piped.queue.events_budget.in_use() <= EVENT_BYTES);
+        // The reply is written first, then the event lines.
+        let reply = piped.next().await.unwrap();
+        assert!(
+            reply.starts_with("{\"id\":7,\"result\":"),
+            "{}",
+            &reply[..40]
+        );
+        let lines = piped.drain().await;
+        let records: Vec<u64> = lines
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::ClaimsSeized(_)))
+            .map(|(seq, _)| *seq)
+            .collect();
+        assert_eq!(records.len(), 7, "as many as fit in EVENT_BYTES");
+        let resyncs: Vec<&(u64, Event)> = lines
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Resync { .. }))
+            .collect();
+        assert_eq!(resyncs.len(), 1, "exactly one resync");
+        // It stands for the first record that did not fit, and, unwritten, for the rest too.
+        assert_eq!(
+            *resyncs[0],
+            (
+                records.iter().max().unwrap() + 1,
+                Event::Resync {
+                    reason: ResyncReason::Overflow
+                }
+            )
+        );
+        assert!(resyncs[0].0 < last);
+        assert_eq!(lines.last().unwrap(), resyncs[0]);
+        assert_eq!(
+            piped.queue.events_budget.in_use(),
+            0,
+            "every byte given back"
+        );
+        assert_eq!(piped.queue.replies_budget.in_use(), 0);
+    }
+
+    /// R-2: event lines own every event byte and slot (the writer is stalled); a large
+    /// sensitive answer (3.6 MB of values) is still queued at once, from the reply reserve; an
+    /// event meanwhile becomes the one `resync`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_sensitive_reply_never_waits_behind_events() {
+        use crate::contract::secrets::{
+            ImportEntry, Materialize, ProjectRef, SecretImport, Unlock,
+        };
+        use crate::secrets::value::{RawCommand, SecretValue};
+        use crate::service::events::EVENT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let project = ProjectRef {
+            common_dir: repo.join(".git").display().to_string(),
+            name: "app".into(),
+        };
+        let shared = Arc::new(shared(dir.path(), false));
+        let names: Vec<String> = (0..60).map(|n| format!("BIG_{n:02}")).collect();
+        tokio::task::spawn_blocking({
+            let (shared, project, names) = (shared.clone(), project.clone(), names.clone());
+            move || {
+                let call = |r| shared.secrets.reply(r).map(|_| ()).unwrap();
+                call(Request::SecretsUnlock(Unlock {
+                    password: SecretValue::new("master-pass-1".into()),
+                    key_file: None,
+                    forget_key_file: false,
+                    create: true,
+                }));
+                call(Request::ProjectApprove(project.clone()));
+                call(Request::SecretImport(SecretImport {
+                    project,
+                    entries: names
+                        .iter()
+                        .map(|name| ImportEntry {
+                            name: name.clone(),
+                            value: SecretValue::new("v".repeat(60_000)),
+                        })
+                        .collect(),
+                    overwrite: false,
+                }));
+            }
+        })
+        .await
+        .unwrap();
+        // The approval's `projects.changed` is not this test's business.
+        shared.events.take_projects_dirty();
+        let mut piped = Piped::new(shared.clone()).await;
+        piped.stall().await;
+        // One small event waits in the backlog, holding bytes of the events' share.
+        publish(&shared, request_event("f", 1)).await;
+        until("f waits in the backlog", || {
+            piped.queue.events_budget.in_use() > 0
+        })
+        .await;
+        // Writer-owned event lines hold the rest of the events' bytes, and every slot.
+        let budget = &piped.queue.events_budget;
+        let owned = budget.try_take(budget.available()).unwrap();
+        assert_eq!(budget.in_use(), EVENT_BYTES);
+        let materialize = serde_json::to_string(&serde_json::json!({
+            "id": 9,
+            "method": "secret.materialize",
+            "params": Materialize {
+                run_id: "run-1".into(),
+                project,
+                names,
+                command: RawCommand::new("make".into()),
+                workspace: repo.display().to_string(),
+            },
+        }))
+        .unwrap();
+        piped.request(&materialize).await;
+        // Queued without any event byte or slot coming back.
+        until("the sensitive answer is queued", || {
+            piped.replies_queued() == 1
+        })
+        .await;
+        let answer = piped.next().await.unwrap();
+        assert!(answer.starts_with("{\"id\":9,\"result\":"));
+        assert!(answer.len() > 3_600_000, "{} bytes", answer.len());
+        // An event with no room: the backlog (f) becomes the one resync, giving f's bytes back.
+        let e = publish(&shared, request_event("e", 2)).await;
+        until("the backlog became one resync", || {
+            piped.queue.events_budget.in_use() < EVENT_BYTES
+        })
+        .await;
+        drop(owned);
+        assert_eq!(
+            piped.drain().await,
+            [(
+                e,
+                Event::Resync {
+                    reason: ResyncReason::Overflow
+                }
+            )]
+        );
+    }
+
+    /// R-3: the shutdown reply is a control line: with every event and reply byte owned by the
+    /// writer's queue and nothing written, it is queued at once, the stop goes ahead, and the
+    /// reply stays queued for the writer (never dropped).
+    #[tokio::test]
+    async fn the_shutdown_reply_is_never_dropped() {
+        use crate::service::events::{EVENT_BYTES, REPLY_RESERVE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(shared(dir.path(), false));
+        let mut stopping = shared.shutdown.subscribe();
+        let mut piped = Piped::new(shared.clone()).await;
+        piped.stall().await;
+        let _events = piped.queue.events_budget.try_take(EVENT_BYTES).unwrap();
+        let _replies = piped.queue.replies_budget.try_take(REPLY_RESERVE).unwrap();
+        piped
+            .request(r#"{"id":5,"method":"service.shutdown","params":{"if_idle":true}}"#)
+            .await;
+        until("the stop reply is queued", || piped.replies_queued() == 1).await;
+        // The stop goes ahead after its flush deadline (nobody writes here).
+        tokio::time::timeout(Duration::from_secs(30), stopping.wait_for(|stop| *stop))
+            .await
+            .expect("the stop goes ahead")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut piped.reader)
+            .await
+            .expect("the reader ends")
+            .unwrap();
+        // Still queued for the writer, which drains it before it ends.
+        let reply = piped.next().await.expect("the stop reply is still queued");
+        assert_eq!(reply, r#"{"id":5,"result":{"stopping":true}}"#);
+        assert_eq!(piped.next().await, None, "then the writer ends");
     }
 }

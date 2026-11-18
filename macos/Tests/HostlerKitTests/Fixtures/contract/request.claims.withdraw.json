@@ -1,0 +1,8 @@
+{
+  "id": 37,
+  "method": "claims.withdraw",
+  "params": {
+    "request_id": "r1",
+    "timed_out": true
+  }
+}

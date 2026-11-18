@@ -1,0 +1,9 @@
+{
+  "id": 39,
+  "method": "claims.set_command",
+  "params": {
+    "claim_id": "c1",
+    "command": "login ***",
+    "workspace_id": "ws-1"
+  }
+}

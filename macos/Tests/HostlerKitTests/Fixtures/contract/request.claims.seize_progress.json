@@ -1,0 +1,12 @@
+{
+  "id": 47,
+  "method": "claims.seize_progress",
+  "params": {
+    "plan_id": "p1",
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 77,
+      "start_time": 500
+    }
+  }
+}

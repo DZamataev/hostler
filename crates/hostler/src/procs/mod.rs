@@ -3,14 +3,13 @@
 //! A process is alive only while the exact `{pid, boot_id, start_time}` exists. Every value comes
 //! from a stable per-OS source; none is derived from the current wall clock.
 
-use serde::{Deserialize, Serialize};
-
 #[cfg(test)]
 pub(crate) mod fake;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod stop;
 #[cfg(windows)]
 mod windows;
 
@@ -24,38 +23,7 @@ use windows as os;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("hostler supports Linux, macOS and Windows only");
 
-/// `pid`, `boot_id`, `start_time`. An **empty** `boot_id` means "this machine's current boot":
-/// a client that may not read the boot id (an agent sandbox denies `sysctl
-/// kern.bootsessionuuid`, P4 Task 9 F-1) and has not yet learned it from the service sends it
-/// empty, since a client on the service's local socket always runs in the service's boot. The
-/// service fills in its own boot id as it reads the identity (`set_local_boot_id`), so every
-/// identity it keeps, reaps or binds has a real one; a client learns the service's from `hello`
-/// or `service.status` (`learn_boot_id`) before it persists or compares anything. An empty boot
-/// id never reaches a liveness comparison (`same_boot`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ProcessIdentity {
-    pub pid: u32,
-    pub boot_id: String,
-    pub start_time: u64,
-}
-
-impl<'de> Deserialize<'de> for ProcessIdentity {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            pid: u32,
-            #[serde(default)]
-            boot_id: String,
-            start_time: u64,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(ProcessIdentity {
-            pid: wire.pid,
-            boot_id: local_boot(wire.boot_id),
-            start_time: wire.start_time,
-        })
-    }
-}
+pub use crate::contract::process::{ProcessIdentity, RunGroup};
 
 /// This machine's boot id as this process knows it: read by the service itself, or learned by a
 /// client from the service (F-1 r1). What an empty `boot_id` stands for.
@@ -92,7 +60,7 @@ fn own_boot_id_readable() -> bool {
 }
 
 /// `boot_id`, or the local boot id for an empty one (in the service; a client keeps it empty).
-fn local_boot(boot_id: String) -> String {
+pub(crate) fn local_boot(boot_id: String) -> String {
     fill_boot(boot_id, LOCAL_BOOT_ID.get().map(String::as_str))
 }
 
@@ -113,58 +81,6 @@ pub fn same_boot(a: &str, b: &str) -> bool {
         "an empty boot id reached a liveness comparison ({a:?} vs {b:?})"
     );
     !a.is_empty() && a == b
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunGroup {
-    UnixGroup {
-        pgid: u32,
-        boot_id: String,
-    },
-    WindowsJob {
-        name: String,
-        boot_id: String,
-        /// The Windows logon session the job was made in (P3a Task 6); absent in P1-era JSON.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session: Option<u32>,
-    },
-}
-
-impl<'de> Deserialize<'de> for RunGroup {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "snake_case")]
-        enum Wire {
-            UnixGroup {
-                pgid: u32,
-                #[serde(default)]
-                boot_id: String,
-            },
-            WindowsJob {
-                name: String,
-                #[serde(default)]
-                boot_id: String,
-                #[serde(default)]
-                session: Option<u32>,
-            },
-        }
-        Ok(match Wire::deserialize(deserializer)? {
-            Wire::UnixGroup { pgid, boot_id } => RunGroup::UnixGroup {
-                pgid,
-                boot_id: local_boot(boot_id),
-            },
-            Wire::WindowsJob {
-                name,
-                boot_id,
-                session,
-            } => RunGroup::WindowsJob {
-                name,
-                boot_id: local_boot(boot_id),
-                session,
-            },
-        })
-    }
 }
 
 impl RunGroup {
@@ -461,7 +377,7 @@ pub fn current_session() -> Option<u32> {
 pub(crate) use windows::terminate_job_from;
 #[cfg(all(windows, test))]
 pub(crate) use windows::test_job::test_job;
-/// Windows termination for takeovers (`cli::takeover::RunGroupStopper`).
+/// Windows termination for stops (`procs::stop::RunGroupStopper`).
 #[cfg(windows)]
 pub use windows::{KillOutcome, terminate_job, terminate_process};
 

@@ -1,0 +1,6 @@
+{
+  "code": "unlock_failed",
+  "details": {},
+  "message": "wrong master password or key file",
+  "recovery": "hostler unlock"
+}

@@ -1,0 +1,9 @@
+{
+  "code": "device_not_registered",
+  "details": {
+    "device": "SERIAL0001",
+    "physical": true
+  },
+  "message": "SERIAL0001 is not a registered device",
+  "recovery": "ask the operator to register it: hostler devices add SERIAL0001 (a person types the model)"
+}

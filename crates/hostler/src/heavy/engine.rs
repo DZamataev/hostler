@@ -2,18 +2,19 @@
 //! behind one mutex. Every decision reads the store fresh, so a restarted service continues
 //! exactly where the last one committed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::broadcast;
 
 use super::queue;
+use crate::contract::claims::StopTarget;
 use crate::contract::heavy::{
     AcquireOutcome, HeavyAcquire, HeavyEntry, HeavyHistoryItem, HeavyOutcome, HeavyRelease,
-    HeavyStarted, HeavyState, HistoryQuery, QueueSnapshot,
+    HeavyStarted, HeavyState, HistoryQuery, QueueSnapshot, QueueStopOutcome,
 };
-use crate::contract::wire::Event;
 use crate::contract::{ErrorCode, HostlerError};
+use crate::procs::stop::RunStop;
 use crate::procs::{self, Liveness, ProcessTable, RunGroup};
 use crate::store::Store;
 
@@ -161,11 +162,38 @@ pub struct HeavyEngine {
     table: Arc<dyn ProcessTable>,
     clock: Arc<dyn Clock>,
     foreign: Box<dyn ForeignHeavySource>,
-    events: broadcast::Sender<Event>,
+    events: crate::service::events::EventBus,
     last_snapshot: Option<QueueSnapshot>,
     last_prune_ms: Option<i64>,
     /// Set by an accepted shutdown: no slot is granted any more; entries stay persisted.
     stopping: bool,
+    /// P5 (spec §11.1): the `heavy.stop`s in progress, by entry id, each with the exit code its
+    /// holder's release reported meanwhile. In memory only: a restart abandons them.
+    stops: HashMap<String, Option<i32>>,
+    /// Whether a pid is a member of a run group now (`procs::in_group`); unit tests, whose pids
+    /// are fake, put their own.
+    member: fn(u32, &RunGroup) -> bool,
+}
+
+/// P5 (spec §11.1): a `Stopping` entry is the stop's alone.
+fn being_stopped(id: &str) -> HostlerError {
+    HostlerError {
+        code: ErrorCode::BadRequest,
+        message: format!("heavy entry {id}: the task is being stopped"),
+        details: json!({ "id": id }),
+        recovery: Some("hostler queue".into()),
+    }
+}
+
+/// P5 (spec §11.1): nothing starts under a task being stopped (a nested `run --heavy`, or its
+/// own command when the stop came before it started).
+fn stopping_taken_over(id: &str) -> HostlerError {
+    HostlerError {
+        code: ErrorCode::TakenOver,
+        message: format!("heavy task {id} is being stopped; nothing may start under it now"),
+        details: json!({ "id": id }),
+        recovery: Some("hostler queue".into()),
+    }
 }
 
 fn internal(e: anyhow::Error) -> HostlerError {
@@ -212,7 +240,7 @@ impl HeavyEngine {
         table: Arc<dyn ProcessTable>,
         clock: Arc<dyn Clock>,
         foreign: Box<dyn ForeignHeavySource>,
-        events: broadcast::Sender<Event>,
+        events: crate::service::events::EventBus,
     ) -> Self {
         HeavyEngine {
             store,
@@ -223,7 +251,30 @@ impl HeavyEngine {
             last_snapshot: None,
             last_prune_ms: None,
             stopping: false,
+            stops: HashMap::new(),
+            member: procs::in_group,
         }
+        .abandoning_stops()
+    }
+
+    /// Spec §11.1: a stop the last service run did not finish is abandoned; its entry runs
+    /// again, and the usual reaping records `reaped` once its processes are gone (never
+    /// `stopped`: this service did not verify the stop).
+    fn abandoning_stops(self) -> Self {
+        let entries = match self.store.entries() {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!("cannot read the heavy queue for unfinished stops: {e:#}");
+                return self;
+            }
+        };
+        for e in entries.iter().filter(|e| e.state == HeavyState::Stopping) {
+            match self.store.unmark_stopping(&e.id) {
+                Ok(_) => tracing::warn!("abandoned an unfinished stop of {}", e.id),
+                Err(err) => tracing::error!("cannot abandon the stop of {}: {err:#}", e.id),
+            }
+        }
+        self
     }
 
     /// Idempotent by `req.id`: a known id answers its current state and never re-enqueues.
@@ -250,10 +301,12 @@ impl HeavyEngine {
             return Ok(outcome);
         }
         self.tick();
-        if let Some(token) = &req.reentrant_token
-            && self.is_reentrant(token, req.holder.pid)?
-        {
-            return Ok(AcquireOutcome::Reentrant);
+        if let Some(token) = &req.reentrant_token {
+            match self.nested_in(token, req.holder.pid)? {
+                Some(HeavyState::Running) => return Ok(AcquireOutcome::Reentrant),
+                Some(HeavyState::Stopping) => return Err(stopping_taken_over(token)),
+                _ => {}
+            }
         }
         let entries = self.store.entries().map_err(internal)?;
         if entries.len() >= MAX_LIVE_ENTRIES {
@@ -296,7 +349,9 @@ impl HeavyEngine {
         self.known(id)?.ok_or_else(|| unknown_entry(id))
     }
 
-    pub fn started(&mut self, s: HeavyStarted) -> Result<(), HostlerError> {
+    /// `heavy.started` from the connection whose peer is `peer_pid` (where the OS gives one).
+    /// A new report's command must be the run it claims (P5 T6-R1-1), see `check_started`.
+    pub fn started(&mut self, s: HeavyStarted, peer_pid: Option<u32>) -> Result<(), HostlerError> {
         check_json_len("child.boot_id", &s.child.boot_id, MAX_IDENTITY_BYTES)?;
         check_group(&s.group)?;
         // Definitive: only a live, granted entry may start its command.
@@ -305,6 +360,10 @@ impl HeavyEngine {
                 "heavy entry {} has not been granted a slot",
                 s.id
             ))),
+            // P5 (spec §11.1): the stop came first; the command must not start.
+            Some(e) if e.state == HeavyState::Stopping && e.child.is_none() => {
+                Err(stopping_taken_over(&s.id))
+            }
             Some(e) if e.child.is_some() => {
                 // A retry of the same report is fine; a different child is not.
                 if e.child.as_ref() == Some(&s.child) && e.group.as_ref() == Some(&s.group) {
@@ -316,7 +375,8 @@ impl HeavyEngine {
                     )))
                 }
             }
-            Some(_) => {
+            Some(e) => {
+                self.check_started(&e.holder, &s, peer_pid)?;
                 self.store
                     .set_started(&s.id, &s.child, &s.group)
                     .map_err(internal)?;
@@ -342,12 +402,87 @@ impl HeavyEngine {
         }
     }
 
+    /// P5 T6-R1-1: the run a granted entry reports is what a person-approved `heavy.stop` will
+    /// signal later, so it is checked when it arrives. The command must be live with the
+    /// reported identity (pid, boot, start time); it must be a child of the entry's live
+    /// holder, and the report must come from that holder (the connection's peer, where the OS
+    /// gives one; elsewhere the holder's live identity stands in); the group must be of the
+    /// command's boot, led by the command on Unix (`pgid == child.pid`), and contain it now.
+    fn check_started(
+        &self,
+        holder: &procs::ProcessIdentity,
+        s: &HeavyStarted,
+        peer_pid: Option<u32>,
+    ) -> Result<(), HostlerError> {
+        let table = self.table.as_ref();
+        let refuse = |why: String| {
+            Err(HostlerError {
+                code: ErrorCode::BadRequest,
+                message: format!("heavy entry {}: {why}", s.id),
+                details: json!({ "id": s.id }),
+                recovery: None,
+            })
+        };
+        let child = &s.child;
+        if procs::liveness(child, table) != Liveness::Alive {
+            return refuse(format!(
+                "its command {} is not running with the reported identity",
+                child.pid
+            ));
+        }
+        if procs::liveness(holder, table) != Liveness::Alive {
+            return refuse(format!("its holder {} is not running", holder.pid));
+        }
+        if let Some(peer) = peer_pid
+            && peer != holder.pid
+        {
+            return refuse(format!(
+                "the report comes from process {peer}, not from the entry's holder {}",
+                holder.pid
+            ));
+        }
+        if table.info(child.pid).and_then(|i| i.parent) != Some(holder.pid) {
+            return refuse(format!(
+                "its command {} is not a child of the entry's holder {}",
+                child.pid, holder.pid
+            ));
+        }
+        let (group_boot, leader) = match &s.group {
+            RunGroup::UnixGroup { pgid, boot_id } => (boot_id, Some(*pgid)),
+            RunGroup::WindowsJob { boot_id, .. } => (boot_id, None),
+        };
+        if !procs::same_boot(group_boot, &child.boot_id) {
+            return refuse("its group is of another boot than its command".into());
+        }
+        if let Some(pgid) = leader
+            && pgid != child.pid
+        {
+            return refuse(format!(
+                "its process group {pgid} is not led by its command {}",
+                child.pid
+            ));
+        }
+        if !(self.member)(child.pid, &s.group) {
+            return refuse(format!(
+                "its command {} is not in the reported group",
+                child.pid
+            ));
+        }
+        Ok(())
+    }
+
     pub fn release(&mut self, r: HeavyRelease) -> Result<(), HostlerError> {
         if !matches!(r.outcome, HeavyOutcome::Ok | HeavyOutcome::Failed) {
             return Err(bad_request(format!(
                 "a release reports ok or failed, not {:?}",
                 r.outcome
             )));
+        }
+        // P5 (spec §11.1): during a stop the holder's release is accepted and its exit code
+        // kept for the `stopped` line; the stop records the entry.
+        if let Some(code) = self.stops.get_mut(&r.id) {
+            *code = r.exit_code;
+            return Ok(());
         }
         self.store
             .finish(&r.id, r.exit_code, r.outcome, self.clock.now_ms())
@@ -356,12 +491,137 @@ impl HeavyEngine {
         Ok(())
     }
 
+    /// `heavy.stop`, its first step under the heavy lock (spec §11.1): the confirmation, a
+    /// running hostler entry, and `is_self` (R2-9: a target that contains the service is
+    /// refused) are checked before anything changes; then the entry is `stopping`, persisted.
+    /// Returns the run the caller stops, outside this lock, and hands to `finish_stop`. The
+    /// requester's peer pid goes to the log only (R2-5).
+    pub fn begin_stop(
+        &mut self,
+        id: &str,
+        confirmation: &str,
+        peer_pid: Option<u32>,
+        is_self: &dyn Fn(&StopTarget) -> bool,
+    ) -> Result<StopTarget, HostlerError> {
+        if confirmation != id {
+            return Err(HostlerError {
+                code: ErrorCode::BadRequest,
+                message: "type the task's id to confirm".into(),
+                details: json!({ "id": id }),
+                recovery: Some(format!(
+                    "hostler queue stop {id} --force --confirmation {id}"
+                )),
+            });
+        }
+        if self.foreign.running().iter().any(|e| e.id == id) {
+            return Err(HostlerError {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "heavy task {id} is rn-looky's; rn-looky's tasks are never stopped by hostler"
+                ),
+                details: json!({ "id": id }),
+                recovery: None,
+            });
+        }
+        let Some(entry) = self.store.entry(id).map_err(internal)? else {
+            return Err(match self.store.history_item(id).map_err(internal)? {
+                Some(_) => HostlerError {
+                    code: ErrorCode::BadRequest,
+                    message: format!("heavy task {id} has already finished"),
+                    details: json!({ "id": id }),
+                    recovery: Some("hostler queue history".into()),
+                },
+                None => unknown_entry(id),
+            });
+        };
+        match entry.state {
+            HeavyState::Waiting => {
+                return Err(HostlerError {
+                    code: ErrorCode::BadRequest,
+                    message: format!("heavy task {id} is waiting, not running"),
+                    details: json!({ "id": id }),
+                    recovery: Some(format!("hostler queue withdraw --id {id}")),
+                });
+            }
+            HeavyState::Stopping => return Err(being_stopped(id)),
+            HeavyState::Running => {}
+        }
+        let target = StopTarget::RunGroup {
+            claim_id: format!("heavy:{id}"),
+            holder: entry.holder,
+            child: entry.child,
+            group: entry.group,
+        };
+        if is_self(&target) {
+            return Err(HostlerError {
+                code: ErrorCode::BadRequest,
+                message: "refusing to stop the hostler service itself".into(),
+                details: json!({ "id": id }),
+                recovery: None,
+            });
+        }
+        if !self.store.mark_stopping(id).map_err(internal)? {
+            return Err(internal(anyhow::anyhow!(
+                "heavy entry {id} was not running when it was marked stopping"
+            )));
+        }
+        self.stops.insert(id.to_owned(), None);
+        let peer = peer_pid.map_or_else(|| "unknown".into(), |pid| pid.to_string());
+        tracing::info!("stopping heavy task {id} for peer pid {peer}");
+        self.tick();
+        Ok(target)
+    }
+
+    /// `heavy.stop`, its last step under the heavy lock: a verified stop that signalled the
+    /// task finishes the entry as `stopped` with the exit code its holder reported meanwhile
+    /// (else none) and frees the slot. When everything was already gone before any signal, the
+    /// task ended on its own: it is recorded `reaped` (P5-L10). Otherwise the entry runs again,
+    /// keeps its slot, and the answer is `stop_failed`.
+    pub fn finish_stop(
+        &mut self,
+        id: &str,
+        run: &RunStop,
+    ) -> Result<QueueStopOutcome, HostlerError> {
+        let exit_code = self.stops.remove(id).flatten();
+        if !run.gone {
+            if let Some(e) = &run.error {
+                tracing::warn!("could not stop heavy task {id}: {e:?}; it keeps its slot");
+            } else {
+                tracing::warn!("heavy task {id} still runs after its stop; it keeps its slot");
+            }
+            self.store.unmark_stopping(id).map_err(internal)?;
+            self.tick();
+            return Err(crate::contract::heavy::errors::stop_failed(id, &run.alive));
+        }
+        let entry = self.store.entry(id).map_err(internal)?;
+        let outcome = if run.signalled {
+            tracing::info!("stopped heavy task {id}");
+            HeavyOutcome::Stopped
+        } else {
+            tracing::info!("heavy task {id} had already ended before its stop signalled it");
+            HeavyOutcome::Reaped
+        };
+        self.store
+            .finish(id, exit_code, outcome, self.clock.now_ms())
+            .map_err(internal)?;
+        self.tick();
+        let pids = entry
+            .map(|e| vec![e.child.as_ref().unwrap_or(&e.holder).pid])
+            .unwrap_or_default();
+        Ok(QueueStopOutcome {
+            id: id.to_owned(),
+            stopped: run.signalled,
+            pids,
+        })
+    }
+
     /// Withdraws a request that has not started a command: waiting, or granted with no child yet
     /// (a grant racing the client's timeout or Ctrl+C).
     pub fn withdraw(&mut self, id: &str, timed_out: bool) -> Result<(), HostlerError> {
         match self.store.entry(id).map_err(internal)? {
             None if self.store.history_item(id).map_err(internal)?.is_some() => Ok(()),
             None => Err(unknown_entry(id)),
+            Some(e) if e.state == HeavyState::Stopping => Err(being_stopped(id)),
             Some(e) if e.child.is_some() => Err(HostlerError {
                 code: ErrorCode::BadRequest,
                 message: format!("heavy entry {id} is already running a command"),
@@ -383,11 +643,19 @@ impl HeavyEngine {
         }
     }
 
-    /// Frees the slot (outcome `Stopped`); the process itself is left alone.
+    /// Frees the slot (outcome `ForceReleased`, P5-L10); the process itself is left alone.
     pub fn force_release(&mut self, id: &str) -> Result<(), HostlerError> {
+        if self
+            .store
+            .entry(id)
+            .map_err(internal)?
+            .is_some_and(|e| e.state == HeavyState::Stopping)
+        {
+            return Err(being_stopped(id));
+        }
         let finished = self
             .store
-            .finish(id, None, HeavyOutcome::Stopped, self.clock.now_ms())
+            .finish(id, None, HeavyOutcome::ForceReleased, self.clock.now_ms())
             .map_err(internal)?;
         if !finished && self.store.history_item(id).map_err(internal)?.is_none() {
             return Err(unknown_entry(id));
@@ -421,9 +689,13 @@ impl HeavyEngine {
         Ok(Vec::new())
     }
 
+    /// Captured under the heavy lock (`&self`); its point is read under the same lock, where
+    /// every queue event is committed (spec §6.2, R-1).
     pub fn snapshot(&self) -> Result<QueueSnapshot, HostlerError> {
         let entries = self.store.entries().map_err(internal)?;
-        self.snapshot_of(entries, self.foreign.running())
+        let mut snapshot = self.snapshot_of(entries, self.foreign.running())?;
+        snapshot.as_of_seq = self.events.current_seq();
+        Ok(snapshot)
     }
 
     pub fn history(&self, q: HistoryQuery) -> Result<Vec<HeavyHistoryItem>, HostlerError> {
@@ -468,13 +740,14 @@ impl HeavyEngine {
             self.store.prune_history(now - HISTORY_RETENTION_MS)?;
             self.last_prune_ms = Some(now);
         }
+        // Captured under the heavy lock, then committed there (R-1); sent only when it changed.
+        // No receivers is fine: nobody is listening.
         let snapshot = self
             .snapshot_of(self.store.entries()?, foreign)
             .map_err(|e| anyhow::anyhow!(e.message))?;
         if self.last_snapshot.as_ref() != Some(&snapshot) {
-            // No receivers is fine: nobody is listening.
-            let _ = self.events.send(Event::QueueChanged(snapshot.clone()));
-            self.last_snapshot = Some(snapshot);
+            self.last_snapshot = Some(snapshot.clone());
+            self.events.publish_snapshot(snapshot);
         }
         // Debug builds: a tick holds the engine lock, so a slow one delays every request.
         #[cfg(debug_assertions)]
@@ -499,10 +772,7 @@ impl HeavyEngine {
     }
 
     fn free_slots(&self, entries: &[HeavyEntry]) -> Result<usize, HostlerError> {
-        let running = entries
-            .iter()
-            .filter(|e| e.state == HeavyState::Running)
-            .count();
+        let running = entries.iter().filter(|e| e.state.occupies_slot()).count();
         if self.stopping {
             return Ok(0);
         }
@@ -512,21 +782,22 @@ impl HeavyEngine {
             .saturating_sub(self.foreign.running().len()))
     }
 
-    /// True when `token` names a running entry whose live holder or child is an ancestor of
-    /// `pid`: a heavy command started inside a heavy command already owns the slot.
-    fn is_reentrant(&self, token: &str, pid: u32) -> Result<bool, HostlerError> {
+    /// The state of the slot-holding entry `token` names when its live holder or child is an
+    /// ancestor of `pid`: a heavy command started inside a running one already owns the slot
+    /// (P5: inside a stopping one, nothing may start). `None` otherwise.
+    fn nested_in(&self, token: &str, pid: u32) -> Result<Option<HeavyState>, HostlerError> {
         let Some(entry) = self.store.entry(token).map_err(internal)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        if entry.state != HeavyState::Running {
-            return Ok(false);
+        if !entry.state.occupies_slot() {
+            return Ok(None);
         }
         let table = self.table.as_ref();
         let ancestors = procs::ancestors(pid, table);
         let owns = |id: &procs::ProcessIdentity| {
             ancestors.contains(&id.pid) && procs::liveness(id, table) == Liveness::Alive
         };
-        Ok(owns(&entry.holder) || entry.child.as_ref().is_some_and(owns))
+        Ok((owns(&entry.holder) || entry.child.as_ref().is_some_and(owns)).then_some(entry.state))
     }
 
     /// The current answer for a known id: live entry or history item.
@@ -534,7 +805,7 @@ impl HeavyEngine {
         if let Some(entry) = self.store.entry(id).map_err(internal)? {
             let entry = clamp_display(entry);
             return Ok(Some(match entry.state {
-                HeavyState::Running => AcquireOutcome::Granted { entry },
+                HeavyState::Running | HeavyState::Stopping => AcquireOutcome::Granted { entry },
                 HeavyState::Waiting => {
                     let entries = self.store.entries().map_err(internal)?;
                     let (position, of) = queue::position(&entries, id).unwrap_or((1, 1));
@@ -564,7 +835,7 @@ impl HeavyEngine {
         let (running, waiting) = entries
             .into_iter()
             .map(clamp_display)
-            .partition(|e| e.state == HeavyState::Running);
+            .partition(|e| e.state.occupies_slot());
         Ok(QueueSnapshot {
             capacity: self.store.capacity().map_err(internal)?,
             running,
@@ -575,6 +846,8 @@ impl HeavyEngine {
                 .take(MAX_LIVE_ENTRIES)
                 .map(clamp_foreign)
                 .collect(),
+            // The tick's comparison sees 0; `snapshot()` and `publish` fill it.
+            as_of_seq: 0,
         })
     }
 }
@@ -586,7 +859,9 @@ mod tests {
 
     use super::*;
     use crate::contract::heavy::EntrySource;
+    use crate::contract::wire::Event;
     use crate::procs::fake::FakeTable;
+    use crate::procs::stop::StopError;
     use crate::procs::{ProcessIdentity, RunGroup};
 
     const BOOT: &str = "b1";
@@ -613,14 +888,14 @@ mod tests {
         table: Arc<FakeTable>,
         clock: Arc<FakeClock>,
         foreign: FakeForeign,
-        events: broadcast::Receiver<Event>,
+        events: crate::service::events::TestEvents,
     }
 
     fn world() -> World {
         let table = Arc::new(FakeTable::new(BOOT));
         let clock = Arc::new(FakeClock(AtomicI64::new(1_000)));
         let foreign = FakeForeign::default();
-        let (tx, events) = broadcast::channel(64);
+        let (tx, events) = crate::service::events::EventBus::channel(64);
         let engine = HeavyEngine::new(
             Store::open_in_memory().unwrap(),
             table.clone(),
@@ -628,6 +903,9 @@ mod tests {
             Box::new(foreign.clone()),
             tx,
         );
+        // Fake pids: a command leads its own group (the gate launcher does).
+        let mut engine = engine;
+        engine.member = leads_its_group;
         World {
             engine,
             table,
@@ -635,6 +913,10 @@ mod tests {
             foreign,
             events,
         }
+    }
+
+    fn leads_its_group(pid: u32, group: &RunGroup) -> bool {
+        matches!(group, RunGroup::UnixGroup { pgid, .. } if *pgid == pid)
     }
 
     fn identity(pid: u32) -> ProcessIdentity {
@@ -676,6 +958,483 @@ mod tests {
             exit_code: Some(0),
             outcome: HeavyOutcome::Ok,
         }
+    }
+
+    /// P5 R2-4: a `Stopping` entry holds its slot, is listed as running, is never reaped,
+    /// withdrawn or force-released, and answers as granted.
+    #[test]
+    fn stopping_occupies_a_slot() {
+        let mut w = world();
+        let (a, b) = (w.request(10, None), w.request(20, None));
+        assert!(matches!(w.acquire(&a), AcquireOutcome::Granted { .. }));
+        w.engine
+            .store
+            .set_entry_state(&a.id, HeavyState::Stopping)
+            .unwrap();
+        assert!(matches!(w.acquire(&b), AcquireOutcome::Queued { .. }));
+        w.engine.tick();
+        assert_eq!(w.state(&b.id), Some(HeavyState::Waiting));
+        let snapshot = w.engine.snapshot().unwrap();
+        assert_eq!(snapshot.running.len(), 1);
+        assert_eq!(snapshot.running[0].state, HeavyState::Stopping);
+        assert_eq!(snapshot.waiting[0].id, b.id);
+        for refused in [
+            w.engine.withdraw(&a.id, false).unwrap_err(),
+            w.engine.force_release(&a.id).unwrap_err(),
+        ] {
+            assert_eq!(refused.code, ErrorCode::BadRequest);
+            assert!(
+                refused.message.ends_with("the task is being stopped"),
+                "{}",
+                refused.message
+            );
+        }
+        // Its holder is gone: still not reaped, the stop decides.
+        w.table.remove(10);
+        w.engine.tick();
+        assert_eq!(w.state(&a.id), Some(HeavyState::Stopping));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Waiting));
+        assert!(matches!(
+            w.engine.attach(&a.id).unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+        // `no_wait` sees no free slot.
+        let mut c = w.request(30, None);
+        c.no_wait = true;
+        assert!(matches!(w.acquire(&c), AcquireOutcome::Busy { .. }));
+    }
+
+    fn not_the_service(_: &StopTarget) -> bool {
+        false
+    }
+
+    fn verified() -> RunStop {
+        RunStop {
+            signalled: true,
+            gone: true,
+            alive: Vec::new(),
+            error: None,
+        }
+    }
+
+    impl World {
+        /// `req`'s granted entry starts child `pid` leading group `pid`.
+        fn start(&mut self, req: &HeavyAcquire, pid: u32) -> RunGroup {
+            self.table
+                .insert(pid, Some(req.holder.pid), Some(u64::from(pid) * 10));
+            let group = RunGroup::UnixGroup {
+                pgid: pid,
+                boot_id: BOOT.into(),
+            };
+            self.engine
+                .started(
+                    HeavyStarted {
+                        id: req.id.clone(),
+                        child: identity(pid),
+                        group: group.clone(),
+                    },
+                    None,
+                )
+                .unwrap();
+            group
+        }
+
+        fn stop(&mut self, id: &str) -> Result<StopTarget, HostlerError> {
+            self.engine.begin_stop(id, id, Some(4242), &not_the_service)
+        }
+
+        fn outcome(&self, id: &str) -> Option<(HeavyOutcome, Option<i32>)> {
+            self.engine
+                .store
+                .history_item(id)
+                .unwrap()
+                .map(|i| (i.outcome, i.exit_code))
+        }
+    }
+
+    /// P5 T6-R1-1: a report that names anything but the holder's own live command, leading
+    /// its own group, is refused and stores nothing.
+    #[test]
+    fn started_metadata_is_checked() {
+        let mut w = world();
+        let a = w.request(10, None);
+        w.acquire(&a);
+        w.table.insert(11, Some(10), Some(110));
+        w.table.insert(30, Some(1), Some(300));
+        let group = |pgid: u32, boot: &str| RunGroup::UnixGroup {
+            pgid,
+            boot_id: boot.into(),
+        };
+        let report = |child: ProcessIdentity, group: RunGroup| HeavyStarted {
+            id: a.id.clone(),
+            child,
+            group,
+        };
+        let refused = |w: &mut World, s: HeavyStarted, peer: Option<u32>, why: &str| {
+            let e = w.engine.started(s, peer).unwrap_err();
+            assert_eq!(e.code, ErrorCode::BadRequest);
+            assert_eq!(e.message, format!("heavy entry {}: {why}", a.id));
+            assert_eq!(w.engine.store.entry(&a.id).unwrap().unwrap().child, None);
+        };
+        // A process that is not running, or not with that start time.
+        refused(
+            &mut w,
+            report(identity(12), group(12, BOOT)),
+            None,
+            "its command 12 is not running with the reported identity",
+        );
+        let stale = ProcessIdentity {
+            start_time: 1,
+            ..identity(11)
+        };
+        refused(
+            &mut w,
+            report(stale, group(11, BOOT)),
+            None,
+            "its command 11 is not running with the reported identity",
+        );
+        // Another live process, not the holder's child.
+        refused(
+            &mut w,
+            report(identity(30), group(30, BOOT)),
+            None,
+            "its command 30 is not a child of the entry's holder 10",
+        );
+        // From another connection's process than the holder.
+        refused(
+            &mut w,
+            report(identity(11), group(11, BOOT)),
+            Some(99),
+            "the report comes from process 99, not from the entry's holder 10",
+        );
+        // A group the command does not lead (another live process's group), or of another boot.
+        refused(
+            &mut w,
+            report(identity(11), group(30, BOOT)),
+            None,
+            "its process group 30 is not led by its command 11",
+        );
+        refused(
+            &mut w,
+            report(identity(11), group(11, "another boot")),
+            None,
+            "its group is of another boot than its command",
+        );
+        // Not a member of it now.
+        w.engine.member = |_, _| false;
+        refused(
+            &mut w,
+            report(identity(11), group(11, BOOT)),
+            Some(10),
+            "its command 11 is not in the reported group",
+        );
+        w.engine.member = leads_its_group;
+        // The holder gone.
+        w.table.remove(10);
+        refused(
+            &mut w,
+            report(identity(11), group(11, BOOT)),
+            None,
+            "its holder 10 is not running",
+        );
+        w.table.insert(10, None, Some(100));
+        // The real report, from the holder's own connection.
+        w.engine
+            .started(report(identity(11), group(11, BOOT)), Some(10))
+            .unwrap();
+        assert_eq!(
+            w.engine.store.entry(&a.id).unwrap().unwrap().child,
+            Some(identity(11))
+        );
+    }
+
+    /// Spec §11.1: each refusal comes before anything is marked.
+    #[test]
+    fn stop_refusals_mark_nothing() {
+        let mut w = world();
+        let (a, b) = (w.request(10, None), w.request(20, None));
+        w.acquire(&a);
+        w.acquire(&b);
+        w.start(&a, 11);
+        let refused = |e: HostlerError, message: &str| {
+            assert_eq!(e.code, ErrorCode::BadRequest, "{}", e.message);
+            assert_eq!(e.message, message);
+            e
+        };
+        refused(
+            w.engine
+                .begin_stop(&a.id, "nope", None, &not_the_service)
+                .unwrap_err(),
+            "type the task's id to confirm",
+        );
+        let e = refused(
+            w.stop(&b.id).unwrap_err(),
+            &format!("heavy task {} is waiting, not running", b.id),
+        );
+        assert_eq!(
+            e.recovery,
+            Some(format!("hostler queue withdraw --id {}", b.id))
+        );
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert_eq!(w.stop(&unknown).unwrap_err().code, ErrorCode::UnknownEntry);
+        let mut looky = w.engine.store.entry(&a.id).unwrap().unwrap();
+        looky.id = "looky:7".into();
+        looky.source = EntrySource::RnLookyLedger;
+        w.foreign.0.lock().unwrap().push(looky);
+        refused(
+            w.stop("looky:7").unwrap_err(),
+            "heavy task looky:7 is rn-looky's; rn-looky's tasks are never stopped by hostler",
+        );
+        // R2-9: the target the check sees is the entry's run.
+        let seen = std::cell::RefCell::new(None);
+        let e = w
+            .engine
+            .begin_stop(&a.id, &a.id, None, &|t: &StopTarget| {
+                *seen.borrow_mut() = Some(t.clone());
+                true
+            })
+            .unwrap_err();
+        refused(e, "refusing to stop the hostler service itself");
+        assert_eq!(
+            seen.into_inner(),
+            Some(StopTarget::RunGroup {
+                claim_id: format!("heavy:{}", a.id),
+                holder: identity(10),
+                child: Some(identity(11)),
+                group: Some(RunGroup::UnixGroup {
+                    pgid: 11,
+                    boot_id: BOOT.into()
+                }),
+            })
+        );
+        assert_eq!(w.state(&a.id), Some(HeavyState::Running));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Waiting));
+        // A finished task.
+        w.engine.release(release(&a.id)).unwrap();
+        refused(
+            w.stop(&a.id).unwrap_err(),
+            &format!("heavy task {} has already finished", a.id),
+        );
+    }
+
+    /// R2-4: while it stops, the entry holds its slot and answers every other change with a
+    /// refusal; its holder's release is kept for the `stopped` line.
+    #[test]
+    fn stop_lifecycle() {
+        let mut w = world();
+        let (a, b) = (w.request(10, None), w.request(20, None));
+        w.acquire(&a);
+        w.acquire(&b);
+        let group = w.start(&a, 11);
+        let target = w.stop(&a.id).unwrap();
+        assert_eq!(
+            target,
+            StopTarget::RunGroup {
+                claim_id: format!("heavy:{}", a.id),
+                holder: identity(10),
+                child: Some(identity(11)),
+                group: Some(group),
+            }
+        );
+        assert_eq!(w.state(&a.id), Some(HeavyState::Stopping));
+        let snapshot = w.engine.snapshot().unwrap();
+        assert_eq!(snapshot.running[0].state, HeavyState::Stopping);
+        for refused in [
+            w.stop(&a.id).unwrap_err(),
+            w.engine.withdraw(&a.id, false).unwrap_err(),
+            w.engine.force_release(&a.id).unwrap_err(),
+        ] {
+            assert_eq!(refused.code, ErrorCode::BadRequest);
+            assert_eq!(
+                refused.message,
+                format!("heavy entry {}: the task is being stopped", a.id)
+            );
+        }
+        // A nested `run --heavy` inside it.
+        let mut nested = w.request(12, Some(11));
+        nested.reentrant_token = Some(a.id.clone());
+        let e = w.engine.acquire(nested.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::TakenOver);
+        assert_eq!(
+            e.message,
+            format!(
+                "heavy task {} is being stopped; nothing may start under it now",
+                a.id
+            )
+        );
+        assert_eq!(w.engine.store.entry(&nested.id).unwrap(), None);
+        // Its processes end; it is not reaped, its slot is not granted.
+        w.table.remove(11);
+        w.engine.tick();
+        assert_eq!(w.state(&a.id), Some(HeavyState::Stopping));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Waiting));
+        // Its holder reports the exit; the entry stays until the stop records it.
+        w.engine
+            .release(HeavyRelease {
+                id: a.id.clone(),
+                exit_code: Some(143),
+                outcome: HeavyOutcome::Failed,
+            })
+            .unwrap();
+        assert_eq!(w.state(&a.id), Some(HeavyState::Stopping));
+        assert_eq!(w.outcome(&a.id), None);
+        w.table.remove(10);
+        let outcome = w.engine.finish_stop(&a.id, &verified()).unwrap();
+        assert_eq!(
+            outcome,
+            QueueStopOutcome {
+                id: a.id.clone(),
+                stopped: true,
+                pids: vec![11],
+            }
+        );
+        assert_eq!(w.outcome(&a.id), Some((HeavyOutcome::Stopped, Some(143))));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Running));
+        // A late release changes nothing.
+        w.engine.release(release(&a.id)).unwrap();
+        assert_eq!(w.outcome(&a.id), Some((HeavyOutcome::Stopped, Some(143))));
+    }
+
+    /// Granted, its command not started: the holder is the target, and the command may not
+    /// start during the stop.
+    #[test]
+    fn a_stop_before_the_command_started_keeps_it_from_starting() {
+        let mut w = world();
+        let a = w.request(10, None);
+        w.acquire(&a);
+        let target = w.stop(&a.id).unwrap();
+        assert_eq!(
+            target,
+            StopTarget::RunGroup {
+                claim_id: format!("heavy:{}", a.id),
+                holder: identity(10),
+                child: None,
+                group: None,
+            }
+        );
+        w.table.insert(11, Some(10), Some(110));
+        let e = w
+            .engine
+            .started(
+                HeavyStarted {
+                    id: a.id.clone(),
+                    child: identity(11),
+                    group: RunGroup::UnixGroup {
+                        pgid: 11,
+                        boot_id: BOOT.into(),
+                    },
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::TakenOver);
+        assert_eq!(w.engine.store.entry(&a.id).unwrap().unwrap().child, None);
+        let outcome = w.engine.finish_stop(&a.id, &verified()).unwrap();
+        assert_eq!(outcome.pids, vec![10]);
+        assert_eq!(w.outcome(&a.id), Some((HeavyOutcome::Stopped, None)));
+    }
+
+    /// P5-L10: a stop that found everything already gone signalled nothing; the task ended on
+    /// its own and is recorded `reaped` (its holder's exit code kept), never `stopped`. A
+    /// force-release records `force_released`.
+    #[test]
+    fn only_a_signalled_stop_records_stopped() {
+        let mut w = world();
+        let (a, b) = (w.request(10, None), w.request(20, None));
+        w.acquire(&a);
+        w.acquire(&b);
+        w.start(&a, 11);
+        w.stop(&a.id).unwrap();
+        w.engine
+            .release(HeavyRelease {
+                id: a.id.clone(),
+                exit_code: Some(0),
+                outcome: HeavyOutcome::Ok,
+            })
+            .unwrap();
+        let ended = RunStop {
+            signalled: false,
+            ..verified()
+        };
+        let outcome = w.engine.finish_stop(&a.id, &ended).unwrap();
+        assert_eq!(
+            outcome,
+            QueueStopOutcome {
+                id: a.id.clone(),
+                stopped: false,
+                pids: vec![11],
+            }
+        );
+        assert_eq!(w.outcome(&a.id), Some((HeavyOutcome::Reaped, Some(0))));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Running));
+        w.engine.force_release(&b.id).unwrap();
+        assert_eq!(w.outcome(&b.id), Some((HeavyOutcome::ForceReleased, None)));
+    }
+
+    /// A stop that could not verify: the entry runs again, keeps its slot, and can be stopped
+    /// again; nothing is recorded.
+    #[test]
+    fn a_failed_stop_keeps_the_slot() {
+        let mut w = world();
+        let (a, b) = (w.request(10, None), w.request(20, None));
+        w.acquire(&a);
+        w.acquire(&b);
+        w.start(&a, 11);
+        w.stop(&a.id).unwrap();
+        // A release during it is not kept past it.
+        w.engine
+            .release(HeavyRelease {
+                id: a.id.clone(),
+                exit_code: Some(1),
+                outcome: HeavyOutcome::Failed,
+            })
+            .unwrap();
+        let failed = RunStop {
+            signalled: false,
+            gone: false,
+            alive: vec![10, 11],
+            error: Some(StopError::PermissionDenied("no".into())),
+        };
+        let e = w.engine.finish_stop(&a.id, &failed).unwrap_err();
+        assert_eq!(e.code, ErrorCode::StopFailed);
+        assert_eq!(e.details["pids"], json!([10, 11]));
+        assert_eq!(w.state(&a.id), Some(HeavyState::Running));
+        assert_eq!(w.state(&b.id), Some(HeavyState::Waiting));
+        assert_eq!(w.outcome(&a.id), None);
+        w.stop(&a.id).unwrap();
+        w.engine.finish_stop(&a.id, &verified()).unwrap();
+        assert_eq!(w.outcome(&a.id), Some((HeavyOutcome::Stopped, None)));
+    }
+
+    /// A restart abandons a stop: the entry runs again, and once its processes are gone it is
+    /// reaped, never recorded as stopped.
+    #[test]
+    fn restart_abandons_a_stop() {
+        let mut w = world();
+        let a = w.request(10, None);
+        w.acquire(&a);
+        w.start(&a, 11);
+        w.stop(&a.id).unwrap();
+        let World {
+            engine,
+            table,
+            clock,
+            ..
+        } = w;
+        let HeavyEngine { store, .. } = engine;
+        let (tx, _events) = crate::service::events::EventBus::channel(64);
+        let mut engine = HeavyEngine::new(store, table.clone(), clock, Box::new(NoForeign), tx);
+        let entry = engine.store.entry(&a.id).unwrap().unwrap();
+        assert_eq!(entry.state, HeavyState::Running);
+        // Its holder's release now finishes it as usual: no stop is in progress.
+        assert!(engine.stops.is_empty());
+        table.remove(10);
+        table.remove(11);
+        engine.tick();
+        assert_eq!(
+            engine.store.history_item(&a.id).unwrap().unwrap().outcome,
+            HeavyOutcome::Reaped
+        );
     }
 
     #[test]
@@ -852,11 +1611,14 @@ mod tests {
             boot_id: BOOT.into(),
         };
         w.engine
-            .started(HeavyStarted {
-                id: a.id.clone(),
-                child: identity(11),
-                group: group.clone(),
-            })
+            .started(
+                HeavyStarted {
+                    id: a.id.clone(),
+                    child: identity(11),
+                    group: group.clone(),
+                },
+                None,
+            )
             .unwrap();
         w.acquire(&b);
         w.table.set_group_alive(&group, true);
@@ -928,16 +1690,7 @@ mod tests {
         assert_eq!(item.finished_at_ms, 5_000);
         // Idempotent; a running entry with a child is not withdrawn.
         w.engine.withdraw(&b.id, true).unwrap();
-        w.engine
-            .started(HeavyStarted {
-                id: a.id.clone(),
-                child: identity(10),
-                group: RunGroup::UnixGroup {
-                    pgid: 10,
-                    boot_id: BOOT.into(),
-                },
-            })
-            .unwrap();
+        w.start(&a, 11);
         assert_eq!(
             w.engine.withdraw(&a.id, false).unwrap_err().code,
             ErrorCode::BadRequest
@@ -1102,7 +1855,7 @@ mod tests {
             },
         };
         assert_eq!(
-            w.engine.started(oversize_job).unwrap_err().code,
+            w.engine.started(oversize_job, None).unwrap_err().code,
             ErrorCode::BadRequest
         );
     }
@@ -1156,10 +1909,13 @@ mod tests {
         let a = w.request(10, None);
         w.acquire(&a);
         w.table.insert(11, Some(10), Some(110));
-        w.engine.started(started_for(&a.id, 11)).unwrap();
-        w.engine.started(started_for(&a.id, 11)).unwrap();
+        w.engine.started(started_for(&a.id, 11), None).unwrap();
+        w.engine.started(started_for(&a.id, 11), None).unwrap();
         assert_eq!(
-            w.engine.started(started_for(&a.id, 12)).unwrap_err().code,
+            w.engine
+                .started(started_for(&a.id, 12), None)
+                .unwrap_err()
+                .code,
             ErrorCode::BadRequest
         );
         let entry = w.engine.store.entry(&a.id).unwrap().unwrap();
@@ -1175,7 +1931,7 @@ mod tests {
         w.acquire(&a);
         w.table.insert(11, Some(10), Some(110));
         let s = started_for(&a.id, 11);
-        w.engine.started(s.clone()).unwrap();
+        w.engine.started(s.clone(), None).unwrap();
         assert_eq!(w.table.held("heavy"), vec![s.group.clone()]);
         w.engine.tick();
         assert_eq!(w.table.held("heavy"), vec![s.group.clone()]);
@@ -1196,7 +1952,7 @@ mod tests {
             (HeavyOutcome::TimedOut, |w, id| {
                 w.engine.withdraw(id, true).unwrap()
             }),
-            (HeavyOutcome::Stopped, |w, id| {
+            (HeavyOutcome::ForceReleased, |w, id| {
                 w.engine.force_release(id).unwrap()
             }),
             (HeavyOutcome::Reaped, |w, id| {
@@ -1212,7 +1968,7 @@ mod tests {
             finish(&mut w, &req.id);
             let err = w
                 .engine
-                .started(started_for(&req.id, pid + 50))
+                .started(started_for(&req.id, pid + 50), None)
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::Withdrawn, "{outcome:?}");
             assert_eq!(err.details["outcome"], json!(outcome), "{outcome:?}");
@@ -1225,7 +1981,10 @@ mod tests {
         let mut w = world();
         let id = uuid::Uuid::new_v4().to_string();
         assert_eq!(
-            w.engine.started(started_for(&id, 11)).unwrap_err().code,
+            w.engine
+                .started(started_for(&id, 11), None)
+                .unwrap_err()
+                .code,
             ErrorCode::UnknownEntry
         );
     }

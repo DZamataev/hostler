@@ -1,0 +1,29 @@
+{
+  "id": 44,
+  "method": "claims.seize_begin",
+  "params": {
+    "confirmation": "screen",
+    "request": {
+      "id": "6f1e6a9a-2d0f-4b7c-9a41-6f0f2f7c1a11",
+      "no_wait": false,
+      "purpose": {
+        "command": "make test",
+        "kind": "lease"
+      },
+      "reentrant_tokens": [
+        "c0"
+      ],
+      "requester": {
+        "boot_id": "boot-1",
+        "pid": 42,
+        "start_time": 500
+      },
+      "selector": {
+        "by": "exact",
+        "resource": "screen"
+      },
+      "workspace_id": "ws-1"
+    },
+    "resource": "screen"
+  }
+}

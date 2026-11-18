@@ -1,0 +1,8 @@
+{
+  "code": "tool_missing",
+  "details": {
+    "tool": "adb"
+  },
+  "message": "hostler cannot find adb",
+  "recovery": "hostler devices tools --detect, or set ANDROID_HOME"
+}

@@ -250,8 +250,12 @@ async fn wait_for_answer(
             _ = poll.tick() => true,
             event = next_event(&mut waiter.client) => match event {
                 Some(Event::SecretRequestChanged(_) | Event::SecretsLockChanged(_)) => events_count,
+                // Something was not delivered: ask again (spec §6.2).
+                Some(Event::Resync { .. }) => events_count,
                 Some(
-                    Event::QueueChanged(_)
+                    Event::ProjectsChanged(_)
+                    | Event::AccountRequestChanged(_)
+                    | Event::QueueChanged(_)
                     | Event::ClaimsChanged(_)
                     | Event::ClaimsSeized(_)
                     | Event::DevicesChanged(_)

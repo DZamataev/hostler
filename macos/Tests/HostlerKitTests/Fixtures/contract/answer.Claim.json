@@ -1,0 +1,38 @@
+{
+  "binding": {
+    "expires_at_ms": 9000,
+    "kind": "ttl",
+    "ttl_ms": 1800000
+  },
+  "child": {
+    "boot_id": "boot-1",
+    "pid": 43,
+    "start_time": 500
+  },
+  "command": "make test",
+  "granted_at_ms": 1000,
+  "group": {
+    "boot_id": "boot-1",
+    "kind": "unix_group",
+    "pgid": 42
+  },
+  "holder": {
+    "boot_id": "boot-1",
+    "pid": 42,
+    "start_time": 500
+  },
+  "id": "c1",
+  "kind": "lease",
+  "parent": "h1",
+  "resource": {
+    "attributes": {},
+    "available": true,
+    "display": "screen",
+    "id": "screen",
+    "kind": "screen"
+  },
+  "workspace": {
+    "id": "ws-1",
+    "path": "/work/app"
+  }
+}

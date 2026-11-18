@@ -1,0 +1,33 @@
+{
+  "entry": {
+    "child": {
+      "boot_id": "boot-1",
+      "pid": 43,
+      "start_time": 500
+    },
+    "command": "./gradlew build",
+    "cwd": "/work/app",
+    "enqueued_at_ms": 1000,
+    "granted_at_ms": 1100,
+    "group": {
+      "boot_id": "boot-1",
+      "kind": "windows_job",
+      "name": "hostler-h1",
+      "session": 2
+    },
+    "holder": {
+      "boot_id": "boot-1",
+      "pid": 42,
+      "start_time": 500
+    },
+    "id": "h1",
+    "kind": "gradle",
+    "source": "hostler",
+    "state": "waiting",
+    "ticket": 3,
+    "workspace_root": "/work/app"
+  },
+  "of": 3,
+  "outcome": "queued",
+  "position": 2
+}

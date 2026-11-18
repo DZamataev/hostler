@@ -1,0 +1,15 @@
+{
+  "answered_at_ms": null,
+  "created_at_ms": 1000,
+  "fields": [
+    "session",
+    "env"
+  ],
+  "id": "6f1e6a9b",
+  "name": "qa-user",
+  "project_id": "p1",
+  "project_name": "app",
+  "reason": "the e2e tests",
+  "requester_pid": 42,
+  "state": "pending"
+}

@@ -1,0 +1,15 @@
+{
+  "grant": {
+    "expires_at_ms": 121000
+  },
+  "status": {
+    "as_of_seq": 14,
+    "database": "/state/hostler.kdbx",
+    "key_file": "/keys/hostler.keyx",
+    "pending_requests": 1,
+    "preserved_files": [
+      "/state/hostler.kdbx.prev-1"
+    ],
+    "state": "unlocked"
+  }
+}

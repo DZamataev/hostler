@@ -45,7 +45,8 @@ const CLAIM_COLUMNS: &str = "SELECT id, resource, kind, parent, workspace_id, ho
 const REQUEST_COLUMNS: &str = "SELECT id, ticket, selector_json, workspace_id, requester_json, \
                                purpose_json, created_at_ms FROM claim_requests";
 const HISTORY_COLUMNS: &str = "SELECT id, resource, kind, workspace_path, command, granted_at_ms, \
-                               ended_at_ms, reason, exit_code, detail FROM claim_history";
+                               ended_at_ms, reason, exit_code, detail, resource_id \
+                               FROM claim_history";
 
 impl Store {
     /// L28: the enclosing lease (its claim id) or heavy entry (`heavy:<id>`) of a claim request
@@ -319,9 +320,9 @@ impl Store {
         // LEFT JOIN: a claim must reach history even if its workspace row is somehow gone.
         let moved = tx.execute(
             "INSERT INTO claim_history (id, resource, kind, workspace_path, command, granted_at_ms, \
-             ended_at_ms, reason, exit_code, detail) \
+             ended_at_ms, reason, exit_code, detail, resource_id) \
              SELECT c.id, c.resource, c.kind, COALESCE(w.path, c.workspace_id), c.command, \
-             c.granted_at_ms, ?1, ?2, ?3, ?5 FROM claims c \
+             c.granted_at_ms, ?1, ?2, ?3, ?5, c.resource FROM claims c \
              LEFT JOIN workspaces w ON w.id = c.workspace_id WHERE c.id = ?4",
             params![now_ms, reason_str(reason), exit_code, id, detail],
         )?;
@@ -356,19 +357,21 @@ impl Store {
             Purpose::Hold { .. } => None,
         };
         let workspace_path = workspace_path(&tx, &pending.workspace_id)?;
+        let resource = selector_resource(&pending.selector);
         tx.execute(
             "INSERT INTO claim_history (id, resource, kind, workspace_path, command, granted_at_ms, \
-             ended_at_ms, reason, exit_code, detail) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, \
-             NULL, ?8)",
+             ended_at_ms, reason, exit_code, detail, resource_id) VALUES (?1, ?2, ?3, ?4, ?5, NULL, \
+             ?6, ?7, NULL, ?8, ?9)",
             params![
                 id,
-                selector_resource(&pending.selector),
+                resource,
                 kind_str(kind),
                 workspace_path,
                 command,
                 now_ms,
                 reason_str(reason),
-                detail
+                detail,
+                stable_resource_id(&resource)
             ],
         )
         .context("cannot record the ended request")?;
@@ -562,9 +565,11 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<ClaimRow> {
 fn history_from_row(row: &rusqlite::Row<'_>) -> anyhow::Result<ClaimHistoryItem> {
     let kind: String = row.get(2)?;
     let reason: String = row.get(7)?;
+    let resource_id: Option<String> = row.get(10)?;
     Ok(ClaimHistoryItem {
         id: row.get(0)?,
         resource: row.get(1)?,
+        resource_id: resource_id.map(ResourceId),
         kind: parse_kind(&kind)?,
         workspace_path: row.get(3)?,
         command: row.get(4)?,
@@ -585,6 +590,13 @@ fn workspace_path(conn: &Connection, workspace_id: &str) -> anyhow::Result<Strin
         )
         .optional()?;
     Ok(path.unwrap_or_else(|| workspace_id.to_owned()))
+}
+
+/// The stable id of a recorded resource string: `Some` for a real resource id, `None` for a
+/// selector that never got a resource (`any:lease`) — P5-L16.
+fn stable_resource_id(resource: &str) -> Option<String> {
+    let id = ResourceId(resource.to_owned());
+    id.kind().map(|_| resource.to_owned())
 }
 
 fn selector_resource(selector: &Selector) -> String {
@@ -900,6 +912,8 @@ mod tests {
         let item = store.history_item_of("c1").unwrap().unwrap();
         assert_eq!(item.id, "c1");
         assert_eq!(item.resource, "screen");
+        // P5-L16: the stable id, so a rename never loses the row.
+        assert_eq!(item.resource_id, Some(ResourceId::screen()));
         assert_eq!(item.kind, ClaimKind::Lease);
         assert_eq!(item.workspace_path, "/work/app");
         assert_eq!(item.command.as_deref(), Some("make test --quiet"));

@@ -1,5 +1,6 @@
 //! The SQLite store behind the heavy queue (plan Task 5).
 
+mod account_requests;
 mod claims;
 mod devices;
 mod schema;
@@ -157,6 +158,23 @@ impl Store {
         }
     }
 
+    /// Tests only (P5 Task 1): forces a live entry's state; Task 6's stop writes `stopping`
+    /// through its own step.
+    #[cfg(test)]
+    pub(crate) fn set_entry_state(&self, id: &str, state: HeavyState) -> anyhow::Result<()> {
+        let raw = match state {
+            HeavyState::Waiting => "waiting",
+            HeavyState::Running => "running",
+            HeavyState::Stopping => "stopping",
+        };
+        let changed = self.conn.execute(
+            "UPDATE heavy_entries SET state = ?1 WHERE id = ?2",
+            params![raw, id],
+        )?;
+        anyhow::ensure!(changed == 1, "heavy entry {id} is not live");
+        Ok(())
+    }
+
     pub fn mark_running(&self, id: &str, now_ms: i64) -> anyhow::Result<()> {
         let changed = self.conn.execute(
             "UPDATE heavy_entries SET state = 'running', granted_at_ms = ?1 WHERE id = ?2",
@@ -164,6 +182,26 @@ impl Store {
         )?;
         anyhow::ensure!(changed == 1, "heavy entry {id} is not queued");
         Ok(())
+    }
+
+    /// P5 Task 6 (spec §11.1): a running entry becomes `stopping`; false when it is not
+    /// running (waiting, already stopping, or gone).
+    pub fn mark_stopping(&self, id: &str) -> anyhow::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE heavy_entries SET state = 'stopping' WHERE id = ?1 AND state = 'running'",
+            [id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// A stopping entry goes back to `running` (its stop failed, or a restart abandoned it);
+    /// false when it is not stopping.
+    pub fn unmark_stopping(&self, id: &str) -> anyhow::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE heavy_entries SET state = 'running' WHERE id = ?1 AND state = 'stopping'",
+            [id],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn set_started(
@@ -305,6 +343,7 @@ fn parse_state(raw: &str) -> anyhow::Result<HeavyState> {
     match raw {
         "waiting" => Ok(HeavyState::Waiting),
         "running" => Ok(HeavyState::Running),
+        "stopping" => Ok(HeavyState::Stopping),
         other => anyhow::bail!("unknown heavy entry state {other:?}"),
     }
 }
@@ -317,6 +356,7 @@ fn outcome_str(outcome: HeavyOutcome) -> &'static str {
         HeavyOutcome::TimedOut => "timed_out",
         HeavyOutcome::Stopped => "stopped",
         HeavyOutcome::Reaped => "reaped",
+        HeavyOutcome::ForceReleased => "force_released",
     }
 }
 
@@ -328,6 +368,7 @@ fn parse_outcome(raw: &str) -> anyhow::Result<HeavyOutcome> {
         "timed_out" => Ok(HeavyOutcome::TimedOut),
         "stopped" => Ok(HeavyOutcome::Stopped),
         "reaped" => Ok(HeavyOutcome::Reaped),
+        "force_released" => Ok(HeavyOutcome::ForceReleased),
         other => anyhow::bail!("unknown heavy outcome {other:?}"),
     }
 }
@@ -433,6 +474,26 @@ mod tests {
         assert_eq!(store.history(&HistoryQuery::default()).unwrap().len(), 1);
 
         assert!(!store.finish("a", Some(0), HeavyOutcome::Ok, 4).unwrap());
+    }
+
+    /// P5 R2-4: a row written with `stopping` loads back (the v5 CHECK admits it).
+    #[test]
+    fn stopping_row_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_waiting(&acquire("a"), 100).unwrap();
+        store.mark_running("a", 200).unwrap();
+        store.set_entry_state("a", HeavyState::Stopping).unwrap();
+        let entry = store.entry("a").unwrap().unwrap();
+        assert_eq!(entry.state, HeavyState::Stopping);
+        assert_eq!(entry.granted_at_ms, Some(200));
+        assert_eq!(store.entries().unwrap()[0].state, HeavyState::Stopping);
+        let raw: String = store
+            .conn
+            .query_row("SELECT state FROM heavy_entries WHERE id = 'a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(raw, "stopping");
     }
 
     #[test]
@@ -548,7 +609,7 @@ mod tests {
         };
         let message = format!("{err:#}");
         assert!(
-            message.contains("version 99") && message.contains("version 4"),
+            message.contains("version 99") && message.contains("version 6"),
             "unexpected error: {message}"
         );
     }

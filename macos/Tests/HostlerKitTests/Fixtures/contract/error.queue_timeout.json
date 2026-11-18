@@ -1,0 +1,6 @@
+{
+  "code": "queue_timeout",
+  "details": {},
+  "message": "gave up after 60 min in the heavy queue",
+  "recovery": "hostler queue"
+}

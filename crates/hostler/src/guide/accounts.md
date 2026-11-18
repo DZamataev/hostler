@@ -49,9 +49,48 @@ hostler run --screen --account qa-user -- ./ui-login
 
 The account must exist, the project must be approved and the database unlocked, or the run refuses
 with exit 78 before the command starts (`account_missing`, `secrets_locked`,
-`project_not_approved`). Ask the operator to create a missing account: there is no `account
-request` in this version — account requests come with hostler's desktop app. Until then a person
-sets an account with `hostler account set`.
+`project_not_approved`). Ask the operator for a missing account with `hostler account request`
+below; never ask for a field's value in chat.
+
+## Asking for an account
+
+```sh
+hostler account request qa-user --field session --field env --reason "<why you need it>" \
+    [--max-wait MIN] [--json]
+hostler account requests [--json]
+```
+
+- Request field **names**, never values. `--reason` is required (1–500 bytes, one line); it is
+  shown to the person, so control characters are replaced with `�`.
+- `--max-wait` is minutes; fractions are fine (`0.5`), `0` means no limit. The default is **10**
+  minutes. The first status line appears at once, then every 30 seconds and on every change.
+- The waiter re-sends the same request id every 5 seconds, on every `accounts.*` event and after a
+  reconnect. An already-set account answers `stored` at once.
+- A person answers in the hostler app (one card, every field stored in one save) or with
+  `hostler account set qa-user --field FIELD` per field. A request is answered once all its
+  fields are set. A person can also decline it with `hostler account decline <id>`.
+- `hostler account requests` lists the pending requests machine-wide: an 8-character id, project,
+  name, fields, age and the sanitized reason. Use `--json` instead of parsing text.
+
+The states are `pending`, `stored`, `declined`, `withdrawn` (the requester died or Ctrl+C) and
+`timed_out`. Exit codes:
+
+| Exit | Meaning |
+|---|---|
+| **0** | The fields are stored now; the request is answered. |
+| **1** | A person declined the request, or the command failed (locked or unapproved project at the first call, a lost service after 10 s of reconnecting). |
+| **75** | The `--max-wait` deadline passed, or an operator (or the reaper, for a dead requester) withdrew the request. |
+| **130** | Ctrl+C; the request was withdrawn. |
+| **2** | Usage error (a missing `--reason`, an invalid name or field, a bad `--max-wait`). |
+
+With `--json`, the final answer is one `Envelope<AccountRequestInfo>` on stdout; status and stop
+lines stay on stderr. `account request` and `account requests` are agent-facing; `account set`
+(whose value is typed at a hidden prompt) and `account decline` are person commands. `decline`
+asks for the master password at a hidden prompt and passes the person gate (spec §8.5). There is
+no command that prints an account's values.
+
+`account decline` is the app's Decline button in the terminal; the app's card is the usual
+answer. Without the app, a person sets the fields one by one.
 
 The command sees:
 

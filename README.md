@@ -5,8 +5,8 @@ compete for things it has only one of — CPU during a native build, a test phon
 test account. hostler hands those resources out in turn instead of letting the agents race.
 
 **Status: pre-release.** The machine-wide heavy queue, per-project secrets, claims on the screen,
-test accounts and devices (Android everywhere, iOS on macOS) are implemented. The desktop
-app follows.
+test accounts and devices (Android everywhere, iOS on macOS) are implemented, and the macOS app
+is here. Its signature is ad-hoc for now.
 
 ## Install from source
 
@@ -15,6 +15,50 @@ cargo install --path crates/hostler
 ```
 
 The binary is `hostler`; it needs no daemon setup — clients start the per-user service on demand.
+
+## The macOS app
+
+A native menu-bar app (SwiftUI and AppKit) shows hostler at a glance and is where a person answers
+what the agents ask:
+
+- the **status item's popover**: the connection, the secrets database with Unlock or Lock, the
+  pending secret and account requests, the heavy queue and the devices in short, and the commands
+  to open the window, Settings or Quit;
+- the **window**: every device, the heavy queue, the screen, the accounts, the secrets and the
+  registered projects, with their claims and health;
+- **notifications** for a new device, a pending request, a stuck heavy task and a takeover, each
+  of which a person turns on or off in Settings.
+
+The app is a **client of the service**, over the same socket as the CLI. It never starts the
+service by itself: with the service not running it says so and shows the command to type, and
+only the popover's **Start** button runs the registered service's start — and only on the default
+home, never for a custom `HOSTLER_HOME`. Everything that changes a value passes the same person
+gate as the CLI: the master password, a proof of intent, not a boundary against other programs
+of the same user (see `hostler guide secrets`).
+
+Requirements: **macOS 14.2 or later**. The app is **ad-hoc signed** (no Developer ID and no
+notarization yet), so Gatekeeper may ask you to confirm the first launch; a later release adds
+the signature.
+
+```sh
+scripts/macos.sh build     # the Debug app and its hosted tests
+scripts/macos.sh app       # the Release app, copied to tmp/app/Hostler.app
+scripts/macos.sh install   # the same, copied to /Applications (needed for Open at login)
+```
+
+`Open at login` needs the copy in `/Applications`; from anywhere else the toggle is disabled and
+says so. Install the service once so the app finds it:
+
+```sh
+cargo install --path crates/hostler   # if it is not installed yet
+hostler service install
+open tmp/app/Hostler.app              # or /Applications/Hostler.app after install
+```
+
+The interface is **English and Russian**, following the system language (System Settings ›
+General › Language & Region › Applications to choose one for hostler alone). CLI output, method
+names and the contract stay English. `macos/SMOKE_TEST.md` is the manual checklist for the
+AppKit parts and the whole app.
 
 ## Set a project up
 

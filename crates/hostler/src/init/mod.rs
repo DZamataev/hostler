@@ -1397,7 +1397,7 @@ mod tests {
             true,
             false,
             RegistrationState::Current,
-            &running(5, "9.9.9", Some(false)),
+            &running(6, "9.9.9", Some(false)),
             false,
         );
         assert!(
@@ -1472,7 +1472,7 @@ mod tests {
                     true,
                     false,
                     registration,
-                    &running(5, "9.9.9", Some(false)),
+                    &running(6, "9.9.9", Some(false)),
                     false
                 ),
                 Decision::Done(
@@ -1485,7 +1485,7 @@ mod tests {
                     true,
                     false,
                     registration,
-                    &running(5, "dev", Some(false)),
+                    &running(6, "dev", Some(false)),
                     false
                 ),
                 Decision::Done(

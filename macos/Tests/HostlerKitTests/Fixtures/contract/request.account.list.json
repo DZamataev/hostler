@@ -1,0 +1,10 @@
+{
+  "id": 49,
+  "method": "account.list",
+  "params": {
+    "project": {
+      "common_dir": "/work/app/.git",
+      "name": "app"
+    }
+  }
+}

@@ -7,7 +7,7 @@ use crate::contract::heavy::{HeavyEntry, HeavyState};
 pub fn grantable(capacity: u8, entries: &[HeavyEntry], foreign_running: usize) -> Vec<String> {
     let running = entries
         .iter()
-        .filter(|entry| entry.state == HeavyState::Running)
+        .filter(|entry| entry.state.occupies_slot())
         .count();
     let free = usize::from(capacity)
         .saturating_sub(running)
@@ -38,9 +38,11 @@ pub fn position(entries: &[HeavyEntry], id: &str) -> Option<(u32, u32)> {
 }
 
 /// The ids of entries whose holder, child and run group are all gone.
+/// A `Stopping` entry is never reaped: its stop decides (spec §11.1).
 pub fn dead_entries(entries: &[HeavyEntry], live: &dyn Fn(&HeavyEntry) -> bool) -> Vec<String> {
     entries
         .iter()
+        .filter(|entry| entry.state != HeavyState::Stopping)
         .filter(|entry| !live(entry))
         .map(|entry| entry.id.clone())
         .collect()

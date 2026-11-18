@@ -1,0 +1,9 @@
+{
+  "event": {
+    "data": {
+      "reason": "lagged"
+    },
+    "type": "resync"
+  },
+  "seq": 9
+}

@@ -244,6 +244,42 @@ impl Store {
         Ok(requests + materializations)
     }
 
+    /// The service-wide limit on password checks (spec §8.5, P5 Task 4): `(failures,
+    /// last_failure_at_ms)` as stored, unsanitized; `None` before the first check.
+    pub fn password_limit(&self) -> anyhow::Result<Option<(i64, Option<i64>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT failures, last_failure_at_ms FROM password_limit WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_password_limit(
+        &self,
+        failures: i64,
+        last_failure_at_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO password_limit (id, failures, last_failure_at_ms) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET failures = ?1, last_failure_at_ms = ?2",
+                params![failures, last_failure_at_ms],
+            )
+            .context("cannot record the password limit")?;
+        Ok(())
+    }
+
+    /// Tests: a store whose writes fail (SQLite `query_only`), reads still answer.
+    #[cfg(test)]
+    pub fn set_query_only(&self, on: bool) {
+        self.conn
+            .pragma_update(None, "query_only", on)
+            .expect("PRAGMA query_only");
+    }
+
     pub fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         super::setting(&self.conn, key)
     }
@@ -380,7 +416,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, crate::store::schema::SCHEMA_VERSION);
         let history = store.history(&HistoryQuery::default()).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, "old");

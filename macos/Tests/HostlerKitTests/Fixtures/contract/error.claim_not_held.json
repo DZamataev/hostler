@@ -1,0 +1,8 @@
+{
+  "code": "claim_not_held",
+  "details": {
+    "claim_id": "c1"
+  },
+  "message": "claim c1 is not held by this workspace",
+  "recovery": "hostler status"
+}

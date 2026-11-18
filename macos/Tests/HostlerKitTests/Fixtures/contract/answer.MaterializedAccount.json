@@ -1,0 +1,13 @@
+{
+  "fields": [
+    {
+      "name": "session",
+      "value": "fixture-value-3"
+    },
+    {
+      "name": "env",
+      "value": "fixture-value-4"
+    }
+  ],
+  "name": "qa-user"
+}

@@ -1,0 +1,23 @@
+{
+  "id": 45,
+  "method": "claims.seize_commit",
+  "params": {
+    "evidence": [
+      {
+        "kind": "gone",
+        "target": 0
+      },
+      {
+        "kind": "job_gone",
+        "session": 2,
+        "target": 1
+      }
+    ],
+    "plan_id": "p1",
+    "requester": {
+      "boot_id": "boot-1",
+      "pid": 77,
+      "start_time": 500
+    }
+  }
+}
